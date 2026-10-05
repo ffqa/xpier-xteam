@@ -21,6 +21,9 @@
   （`_ensure_xteam_readme` 只调用未定义、`stale` 只读未定义、`tracker.last_active()`
   方法名凭记忆写错 —— 真实是 `last_active_at`）。检查器自身用**注入已知 bug**
   验证过三层都能拦住，正常代码上零误报。
+- **`smoke.sh --no-e2e`**：只跑前两层。没有它，CI 上验证包可用性的唯一办法是
+  `--no-verify`，那等于把整个自证关掉 —— 用一个绿色的对勾换掉「发出去的包到底
+  能不能用」这个判断。
 - **打包脚本自证可用**：不只打 tar，而是解包 → 装到临时前缀 → 跑门禁前两层，
   任何一步失败就删掉半成品退出，不留一个看起来正常的坏包。
 - **`pack.sh --bump` + 同号不同内容拒绝打包**：漏升版本会让包名恒定、覆盖上一个包，
@@ -34,8 +37,18 @@
 
 ### 发布
 
-- 移交给 GitHub Actions：推 `xteam-v*` tag → 跑门禁前两层 → 建 Release →
+- 移交给 GitHub Actions：推 `xteam-v*` tag → 跑门禁 → 建 Release →
   自动更新 `ffqa/homebrew-tap` 的 Formula。本地不再需要发布脚本。
+- **`.gitignore` 补 `/Formula/`（锚定顶层）**：原来写 `Formula/`，而 macOS 的
+  `core.ignorecase` 默认为 true，于是它把发布模板所在的 `.github/formula/`
+  一起吃掉 —— 模板从没进过仓库，CI 从一个不存在的路径读它，发版必炸，而本地
+  看不出任何问题。
+- **「代码不再硬编码 `.xteam`」那条守卫一直是空转的**：它找的是 `'"\.xteam"'`，
+  而 Python 不会吃掉反斜杠，这种字符串全仓库一次都没出现过，于是断言恒过 ——
+  真硬编码了也抓不到。改成 raw string，并已用注入验证能拦住。
+- **Formula 占位符从 `{{VERSION}}` 改成 `@VERSION@`**：前者和 Ruby 自己的插值
+  语法撞车，漏替换时错误只会在用户 `brew install` 时才炸。现在替换后会 grep
+  残留 + `ruby -c` 语法自检，两道都在发版时就拦住。
 
 ## 0.1.1
 

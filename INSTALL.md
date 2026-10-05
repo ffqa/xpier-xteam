@@ -44,7 +44,7 @@ PM_TEAM_HOME=/path/to/xteam-<版本> /path/to/xteam-<版本>/bin/xteam doctor
 ```bash
 xteam doctor                       # 环境体检
 xteam doctor --probe all --model <名字>   # 批量实测哪些 agent 认 --model
-python3 <解包目录>/tests/test_protocol.py   # 协议状态机 470+ 条断言
+python3 <解包目录>/tests/test_protocol.py   # 协议状态机 480+ 条断言
 bash    <解包目录>/tests/smoke.sh          # 三层门禁（需要 herdr + agent）
 ```
 
