@@ -1,0 +1,158 @@
+name: release
+
+# 发版：推 tag 即完成打包 + Release + Homebrew Tap 更新。
+#   bash pack.sh --bump=patch && git push && git push --tags
+#   （pack.sh --bump 会自动提交并打 tag）
+#
+# 为什么不再用本机 brew-publish.sh：发版要「同一台机器、同一份 dist/、同一个
+# HEAD」三者对齐才安全，而这三点在 CI 里是天然成立的 —— tag 指哪个提交，
+# 就发布哪个提交，不会因为本机忘记重打包而发出旧包。
+on:
+  push:
+    tags: ['xteam-v*']
+
+# 没配 workflow_dispatch：手动触发拿不到「哪个 tag」的语义，
+# 而 Release 的资产名与 tag 强绑定（下载 URL 里就是 tag 名）。
+# 要重发就删掉 Release 和 tag 再推一次 —— 那是发布，不是运维。
+
+permissions:
+  contents: write   # 建 Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # **必须取完整历史 + tags**。两个地方都依赖它：
+          #   · pack.sh 的 git 模式用 `git archive HEAD` 打已提交内容
+          #   · pack.sh 靠 `git tag --list 'xteam-v*'` 判断「距上次打包几个提交」
+          # fetch-depth: 1 会让 tag 列表为空，于是它误判成「首次打包」——
+          # 版本新鲜度检查静默失效，而它恰恰是防「发旧包」的那道闸。
+          fetch-depth: 0
+          # 当前 tag 就是触发者，checkout 检出它即可；但 pack.sh 的干净检查
+          # 会看到 CI 注入的 .git 内部状态，所以排除掉（.git 不进 archive）。
+          persist-credentials: true
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 核对 tag 与 VERSION 一致
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${REF_NAME#xteam-v}"
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ]; then
+            echo "::error::tag 是 $TAG_VERSION，但 VERSION 文件写的是 $FILE_VERSION"
+            echo "tag 与 VERSION 不一致就别发了 —— 装的版本号会骗人。"
+            exit 1
+          fi
+          echo "tag xteam-v$TAG_VERSION == VERSION ✓"
+
+      # 打包 + 自证可用（解包 → 装到临时前缀 → 跑门禁前两层）。
+      # 这一步失败就不会有 Release，也不会污染 Tap。
+      - name: 打包并验证
+        run: bash pack.sh
+
+      - name: 收集产物
+        id: pkg
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          NAME="xteam-$VERSION"
+          ls -l "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256"
+          {
+            echo "version=$VERSION"
+            echo "name=$NAME"
+            echo "sha=$(cut -d' ' -f1 < "dist/$NAME.tar.gz.sha256")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+          NAME: ${{ steps.pkg.outputs.name }}
+        run: |
+          set -euo pipefail
+          # notes 只取 CHANGELOG 里**当前版本那一段**。以前直接 --notes-file
+          # CHANGELOG.md，于是 0.1.5 的 Release 正文显示的是 0.1.0 的内容 ——
+          # 看着像发布了，其实正文和包对不上。
+          awk -v v="$VERSION" '
+            $0 == "## " v { grab=1; next }
+            /^## / { grab=0 }
+            grab
+          ' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::warning::CHANGELOG.md 里没有 ## $VERSION 这一段，Release 正文将用自动生成的"
+            NOTES_ARGS=(--generate-notes)
+          else
+            NOTES_ARGS=(--notes-file /tmp/notes.md)
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist/$NAME.tar.gz" "dist/$NAME.tar.gz.sha256" \
+            --title "xteam $VERSION" "${NOTES_ARGS[@]}"
+
+      # ---------------------------------------------------------------- Tap
+      # 用部署密钥（SSH）而不是 PAT：令牌一旦泄漏在 Actions 日志/环境里就等于
+      # 整个账号的权限，而这把 key 只能写 homebrew-tap 一个仓库，且随时可吊销。
+      - name: 更新 Homebrew Tap
+        env:
+          TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
+          TAP_KNOWN_HOSTS: ${{ secrets.TAP_KNOWN_HOSTS }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+          SHA: ${{ steps.pkg.outputs.sha }}
+          NAME: ${{ steps.pkg.outputs.name }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAP_SSH_KEY" ] || { echo "::error::没配 secrets.TAP_SSH_KEY，跳过 Tap 更新"; exit 1; }
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TAP_SSH_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          # Host 必须固定成部署密钥所属的仓库：github.com 是共享主机，
+          # 不校验 host key 等于把私钥交给任何冒充 GitHub 的人。
+          printf '%s\n' "$TAP_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          TAP_REPO="git@github.com:ffqa/homebrew-tap.git"
+          TMP="$(mktemp -d)"
+          git clone --depth 1 --quiet "$TAP_REPO" "$TMP/tap"
+
+          mkdir -p "$TMP/tap/Formula"
+          # 用模板 + sed，而不是在 YAML 里写 heredoc：YAML 的 run: 块本身有缩进，
+          # 而 heredoc 的结束符必须顶格 —— 两层缩进叠在一起很容易写出一个
+          # **静默不闭合**的 heredoc，症状还表现为「Formula 生成失败」而不是
+          # 指向真正出错的那一行。模板是独立文件，Ruby 语法不被 YAML 缩进污染。
+          sed -e "s|{{VERSION}}|$VERSION|g" \
+              -e "s|{{SHA256}}|$SHA|g" \
+              -e "s|{{NAME}}|$NAME|g" \
+              .github/formula/xteam.rb.template > "$TMP/tap/Formula/xteam.rb"
+
+          # 残留占位符 = 替换漏了。发出去一个带 {{VERSION}} 的 Formula，
+          # brew 的报错会指向用户的机器，排查成本远高于在这里拦住。
+          if grep -qE '\{\{[A-Z0-9_]+\}\}' "$TMP/tap/Formula/xteam.rb"; then
+            echo "::error::Formula 里还有未替换的占位符："
+            grep -nE '\{\{[A-Z0-9_]+\}\}' "$TMP/tap/Formula/xteam.rb"
+            exit 1
+          fi
+
+          cd "$TMP/tap"
+          git add Formula/xteam.rb
+          if git diff --cached --quiet; then
+            echo "Tap 里 Formula 无变化，跳过提交"
+          else
+            git -c user.email=github-actions[bot]@users.noreply.github.com \
+                -c user.name=github-actions[bot] \
+                commit -q -m "xteam $VERSION"
+            git push -q origin HEAD
+            echo "已更新 ffqa/homebrew-tap"
+          fi
+
+          echo
+          echo "完成。其他机器上跑："
+          echo "  brew tap ffqa/tap"
+          echo "  brew install ffqa/tap/xteam"

@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.pm/
+
+# xteam 工作目录（agent 中间产物，不入库）
+.xteam/
+
+# 打包产物（pack.sh 生成）。不入库，也不该让工作区变脏 ——
+# 否则 pack.sh 的「工作区必须干净」检查会被它自己造出来的目录卡住。
+dist/
+
+# brew Formula 由 GitHub Actions 生成后推到 ffqa/homebrew-tap，本地不留副本。
+# 同理：Formula/ 一旦入库，pack.sh 的干净检查会先被它拦下。
+Formula/
+
+# 发布已交给 GitHub Actions（.github/workflows/release.yml）。
+# 这个脚本只是本机历史遗留，逻辑已迁进 workflow，改它不会再影响发版。
+brew-publish.sh

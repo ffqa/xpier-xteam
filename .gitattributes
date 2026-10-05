@@ -1,0 +1,12 @@
+# 打包（git archive）时剔除的东西。
+# 这些在本机仓库里保留 —— 那是开发工具的状态，不属于 xteam 本身。
+# 用 export-ignore 而不是删文件：本地照常可用，发行包里干净。
+.gitattributes   export-ignore
+.gitignore       export-ignore
+.memsearch/     export-ignore
+.brooks-lint-history.json export-ignore
+review-report.md export-ignore
+brew-publish.sh export-ignore
+Formula/        export-ignore
+**/__pycache__/ export-ignore
+*.pyc           export-ignore

@@ -1,0 +1,46 @@
+name: ci
+
+# 只跑门禁前两层（静态 → 单测）。第 3 层要 herdr + 真 agent 起三个 pane，
+# 那是本地/目标机器的事，塞进 CI 只会变成一条永远红的、没人看的流水线。
+on:
+  push:
+    branches: [main]
+    tags: ['xteam-v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # pack.sh 的「工作区必须干净」检查：CI 会额外检出 submodule/历史深度，
+          # 这里只取当前提交，且不 fetch tags（层 1/2 不需要）
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # 门禁 1/3：静态。单跑而不是调 smoke.sh —— smoke.sh 没有「只跑前两层」
+      # 的开关，在这里 grep 它的输出反而脆。
+      - name: 静态检查
+        run: |
+          python3 tests/lint_names.py
+          python3 tests/lint_shell.py install.sh tests/smoke.sh pack.sh
+          python3 -m py_compile bin/xteam bin/xteam_lib.py tests/test_protocol.py
+
+      # 门禁 2/3：协议单测（约 10s）
+      - name: 协议单测
+        run: python3 tests/test_protocol.py
+
+      # 打包脚本的 git 模式会做「工作区必须干净」检查，而 CI 里跑它会因
+      # checkout 产生的状态被拦下。用 --worktree 打，并在同一 job 里验证 ——
+      # 这正是 pack.sh 自证可用的那条路径。
+      - name: 打包并自证可用
+        run: bash pack.sh --worktree

@@ -1,0 +1,2949 @@
+#!/usr/bin/env python3
+"""xteam — 三个 pane（pm / tl / dev）的编排器。
+
+    xteam up [项目目录]     建 .xteam/、拉起三个 pane、投角色章程
+    xteam say <role> <msg>  门铃
+    xteam status            状态表（含每个角色欠的义务）
+    xteam watch start|stop|status|once
+    xteam down              收摊：只关角色 pane，workspace 保留（可复用）
+
+设计前提见 bin/xteam_lib.py 顶部注释——那四条约束全部来自 apartment 三个 pane
+的实测教训，不是推测。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from xteam_lib import (  # noqa: E402
+    BOOT_ORDER,
+    IDLE_ALERT_SECS,
+    IDLE_ESCALATE_SECS,
+    STUCK_WORKING_SECS,
+    DEFAULT_ROLES,
+    HUMAN_ESCALATE_REPEAT_SECS,
+    Herdr,
+    IdleTracker,
+    OBLIGATIONS,
+    Protocol,
+    ROLES,
+    RoleSpec,
+    WAITING_GRACE_SECS,
+    DEFAULT_START_MODEL,
+    REPO_KINDS,
+    Registry,
+    agent_catalog,
+    load_verified_agents,
+    probe_store_path,
+    save_verified_agent,
+    die,
+    fmt_duration,
+    latest_recap,
+    RECAP_CONTEXT_COOLDOWN,
+    roles_touched_task,
+    list_models,
+    search_models,
+    wiki_append,
+    wiki_search,
+    wiki_dir,
+    parse_context_pct,
+    XTEAM_DIRNAME,
+    recap_path,
+    fmt_epoch,
+    HERDR_KINDS,
+    VERIFIED_TUI_MODEL,
+    ASSUMED_TUI_MODEL,
+    load_roles,
+    log_event,
+    log_timeline,
+    normalize_kind,
+    now,
+    now_utc,
+    _read_json,
+    write_json,
+    ONESHOT_VERIFIED,
+    QaAgentRejected,
+    QaConfig,
+    QA_WHEN,
+    model_cost_risk,
+    review_digest,
+    review_path,
+    run_external_review,
+    qa_should_run,
+    CONTRACT_TEMPLATE,
+    contract_filename,
+    contract_files,
+    contract_log_change,
+    contracts_dir,
+    contract_real_path,
+    contract_path,
+    CONTRACT_METHODS,
+    parse_contract_name,
+    plausible_model,
+    rules_fingerprint,
+    save_rules_state,
+    stale_rules,
+)
+
+def _ensure_xteam_readme(root: Path, team_dir: Path) -> None:
+    """往 .xteam/ 放一份 README，说明这套协议是什么、文件各自干什么。
+
+    给两类读者：
+      · 人类 —— clone 下来打开 .xteam/ 就懂这套流程怎么跑
+      · agent —— **尤其重要**：新起的 agent 第一件事就是读这份文件，
+        比在角色章程里重复解释协议更省 context，也保证章程和实际文件对得上。
+
+    只在缺失时写，且**源比副本新就覆盖** —— 否则协议演进后旧说明会一直误导人。
+    """
+    source = TEMPLATES / "XTEAM_README.md"
+    if not source.exists():
+        return
+    target = team_dir / "README.md"
+    if (not target.exists()
+            or target.stat().st_mtime < source.stat().st_mtime):
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _ensure_gitignored(root: Path, team_dir: Path) -> None:
+    """把 .xteam 加进项目 .gitignore —— **只增不覆盖**。
+
+    这台机器上它的 33 份工件里全是 agent 的中间产物和可能的凭据/路径，上传上去
+    既噪音又可能泄密。但 .gitignore 是用户的文件：已有内容必须原样保留，
+    只在缺失时补一行。所以先查后写，绝不 truncate。
+    """
+    name = team_dir.name
+    gi = root / ".gitignore"
+    try:
+        if gi.exists():
+            text = gi.read_text(encoding="utf-8")
+            if any(ln.strip() in (name, f"/{name}", f"{name}/") for ln in text.splitlines()):
+                return
+            with gi.open("a", encoding="utf-8") as fh:
+                if text and not text.endswith("\n"):
+                    fh.write("\n")
+                fh.write(f"\n# xteam 工作目录（agent 中间产物，不入库）\n{name}/\n")
+        else:
+            gi.write_text(
+                "# xteam 工作目录（agent 中间产物，不入库）\n"
+                f"{name}/\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[{now()}] ⚠ 没能更新 .gitignore：{exc}", file=sys.stderr)
+
+
+def _find_root() -> Path:
+    """定位 xteam 的资源根目录（roles/ 与 templates/ 的父目录）。
+
+    两种布局都要支持，否则「拷到 ~/.local/bin 就能用」是假的：
+      · 开发布局：<root>/bin/xteam + <root>/roles/ + <root>/templates/
+      · 安装布局：~/.local/bin/xteam + ~/.local/share/xteam/{roles,templates}
+    优先 PM_TEAM_HOME 环境变量（最可控），其次安装布局，最后退回开发布局。
+    """
+    env = os.environ.get("PM_TEAM_HOME")
+    if env:
+        return Path(env).expanduser().resolve()
+    for share in (Path.home() / ".local" / "share" / "xteam",
+                  Path("/usr/local/share/xteam"), Path("/opt/xteam")):
+        if (share / "roles").is_dir():
+            return share
+    return Path(__file__).resolve().parent.parent
+
+
+def _version() -> str:
+    """读版本号。
+
+    **优先读脚本自己所在的那个包的 VERSION**，而不是 `PM_TEAM_HOME` 指向的
+    资源目录 —— 后者在开发时指向已安装的旧副本，会让 `xteam --version`
+    显示的还是上次的版本（实测踩过：源码 0.1.1，显示「未知」）。
+    """
+    me = Path(__file__).resolve()
+    for f in (me.parent.parent / "VERSION", HERE / "VERSION"):
+        try:
+            v = f.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    for f in (HERE / "VERSION", HERE.parent / "VERSION"):
+        try:
+            v = f.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    return "未知"
+
+
+HERE = _find_root()
+ROLES_DIR = HERE / "roles"
+TEMPLATES = HERE / "templates"
+
+
+def check_assets() -> None:
+    """启动即校验资源齐全。缺了要立刻说清缺什么、去哪拿，而不是运行到一半报 IOError。"""
+    missing = [d for d in (ROLES_DIR, TEMPLATES) if not d.is_dir()]
+    if missing:
+        die(
+            f"xteam 资源目录缺失：{', '.join(str(m) for m in missing)}\n"
+            f"  它从 {HERE} 找 roles/ 和 templates/。\n"
+            f"  修法（二选一）：\n"
+            f"    1. 设 PM_TEAM_HOME 指向 xteam 的安装目录（含 roles/ templates/）\n"
+            f"    2. 重新安装：xteam-install"
+        )
+
+
+# pidfile 放在**项目自己的** .xteam/watch/ 下，不放 /tmp。
+# 放 /tmp 是全局单例：两个项目同时跑巡检会互相覆盖 pid，
+# 于是一个项目的 `watch stop` 杀掉另一个的进程，`status` 也报错状态。
+WATCHDOG_PID = "watch.pid"
+
+
+def env_bin_ok(kind: str) -> bool:
+    return shutil.which(kind) is not None
+
+
+def _probe_one(env: Herdr, kind: str, model: str) -> tuple[bool, str]:
+    """真起一个 pane 试这个 kind 的 TUI 认不认 `--model`。返回 (成功, 说明)。
+
+    单个和批量共用。**成功即落盘**是关键：探测可能中断（用户 Ctrl-C、机器休眠），
+    已验证的结果必须留下来，否则下次要全部重来。
+    """
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    spec = RoleSpec("probe", kind, "探针", model)
+    ws_id = ""
+    try:
+        spec.preflight(allow_openrouter=True)
+        ws = env.create_workspace(str(tmp), "pm-probe")
+        ws_id = (ws.get("workspace") or ws).get("workspace_id")
+        tab = env.create_tab(ws_id, str(tmp), "probe")
+        tab_id = (tab.get("tab") or tab).get("tab_id")
+        panes = env.panes_of_tab(ws_id, tab_id)
+        env.start_agent(panes[0], tab_id, spec)
+        status = env.agent_status(panes[0])
+        save_verified_agent(kind)
+        return True, f"起来了（状态={status}），认 --model"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc).split("\n")[0][:120]
+    finally:
+        try:
+            if ws_id:
+                env.close_workspace(ws_id)
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _probe_all(env: Herdr, herdr_ok: bool, model: str) -> int:
+    """批量探测：**已装但还没实测** --model 能力的那些 kind。
+
+    只探「已装」的：没装的探了必然失败，纯粹浪费时间 —— 而每个 kind 最坏要等
+    90s 才超时。已经实测过的跳过，所以**中断后再跑一次就接着走**，不会白来。
+    """
+    if not herdr_ok:
+        die("没有 herdr，无法起 pane 验证")
+    known = env.kinds_supported() or HERDR_KINDS
+    installed = sorted(k for k in known if env_bin_ok(normalize_kind(k)))
+    verified = load_verified_agents()
+    todo = [k for k in installed if normalize_kind(k) not in verified]
+    print(f"\n[{now()}] 批量探测 --model 能力")
+    print(f"  已装 {len(installed)} 个，已实测 {len(installed) - len(todo)} 个，"
+          f"待测 {len(todo)} 个：{'、'.join(todo) or '（没有了）'}")
+    if not todo:
+        print("  没有待测的。想重测某一个：`xteam doctor --probe <kind>`")
+        return 0
+    print("  每个最多等 90s，全程可能几分钟。中断了可以重跑，已通过的会跳过。")
+    print("  问不出模型名的会跳过 —— 那些 CLI 不支持非交互列模型"
+          "（claude 会直接进交互会话、codex 报 stdin is not a terminal），"
+          "此时可以用 --model <名字> 指定。\n")
+
+    ok_list: list[str] = []
+    bad: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    for i, kind in enumerate(todo, 1):
+        m = model
+        if not m:
+            # 探测的意义是验证 --model，所以必须带一个模型名。
+            # plausible_model 过滤掉「把欢迎语当模型名」的解析事故 ——
+            # 不然 probe 会报「启动超时」，把人引向「这个 agent 认不认该模型」
+            # 的错误方向（实测 claude 会返回一整段会话欢迎语）。
+            try:
+                cands = [c for c in list_models(kind)
+                         if c.get("model") and not c.get("blocked")
+                         and plausible_model(c["model"])]
+            except Exception:  # noqa: BLE001
+                cands = []
+            m = cands[0]["model"] if cands else ""
+        if not m:
+            skipped.append((kind, "无法非交互地问出模型名 —— 实测 claude 根本没有 "
+                                 "`models` 子命令（会直接进交互会话），codex 则报 "
+                                 "stdin is not a terminal。手测："
+                                 f"xteam doctor --probe {kind} --model <名字>"))
+            print(f"  [{i}/{len(todo)}] {kind:<12} ⊘ 跳过：问不出模型名")
+            continue
+        print(f"  [{i}/{len(todo)}] {kind:<12} 起 pane 试 --model {m} …", flush=True)
+        ok, note = _probe_one(env, kind, m)
+        (ok_list.append(kind) if ok else bad.append((kind, note)))
+        print(f"      {'✓ ' if ok else '✗ '}{note}")
+
+    print(f"\n[{now()}] 结果：{len(ok_list)} 个通过，{len(bad)} 个失败，"
+          f"{len(skipped)} 个跳过")
+    if ok_list:
+        print(f"  ✓ 转成实测：{'、'.join(ok_list)}")
+        print(f"    已记入 {probe_store_path()}（跨进程有效，up --set-model 会照用）")
+    for kind, note in bad:
+        print(f"  ✗ {kind}：{note}")
+    for kind, note in skipped:
+        print(f"  ⊘ {kind}：{note}")
+    if ok_list:
+        print("\n  看完整能力表：xteam agents")
+    return 0 if ok_list or not bad else 1
+
+
+def _mark_session_ended(root: Path, label: str, ws_id: str,
+                        panes_closed: bool = False) -> None:
+    """把 session 标成「已结束」，并留下续接线索。
+
+    workspace 关掉后 pane_id 就是死引用了 —— 留着会让下次 up / status 以为还连着。
+    所以标 `state: ended` 并清空 panes，但**不删任何数据**：下次 restore 要能读回
+    「上次是怎么起的、用了哪些 agent」。
+
+    （这个函数之前只被调用、从未定义。`down` 走到这一步就 NameError —— 而那正是
+    最常见的路径：workspace 还在时 down。smoke 的 cleanup 把 stderr 丢了所以一直
+    没暴露。现由 tests/lint_names.py 静态抓住。）
+    """
+    path = Protocol(root).dir / "session.json"
+    data = _read_json(path)
+    if not data:
+        return
+    data["state"] = "panes-down" if panes_closed else "ended"
+    data["workspace_kept"] = bool(panes_closed)
+    data["ended_at"] = now()
+    data["ended_workspace_id"] = ws_id
+    data["resume_hint"] = (f"xteam --project {root} up . --watch "
+                           f"&& xteam --project {root} restore")
+    data["panes"] = {}          # 死引用，留着会误导
+    write_json(path, data, indent=2)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """环境体检：逐项实测，不靠推断。
+
+    `--probe kind --model M` 会真起一个 pane 试 agent 认不认 --model，跑完自动清理。
+    这把「推断」变成「实测」——agent 能力表里那 17 个 ? 就是留给它来升级成 ✓ 的。
+    """
+    env = Herdr(scope=args.workspace or "doctor")
+    print(f"[{now()}] xteam doctor\n")
+
+    py_ok = sys.version_info >= (3, 9)
+    print(f"  Python        {sys.version.split()[0]}  "
+          f"{'✓' if py_ok else '✗ 需要 3.9+'}")
+    herdr_ok = shutil.which(env.bin) is not None
+    print(f"  herdr         {'✓ ' + env.bin if herdr_ok else '✗ 找不到（地基）'}")
+    if herdr_ok:
+        kinds = env.kinds_supported()
+        print(f"  herdr kinds   {len(kinds) if kinds else '?'} 个"
+              + (f"（运行时探测）" if kinds else "（探测失败，用内置表）"))
+    # **必须列全部已装的，不是只列 team.json 里用到的。** 之前只查
+    # load_roles() 里出现的 kind，于是本项目配了 devin/opencode 就只显示这两个，
+    # 明明装了 omp/pi/qodercli/cursor 却像没装 —— 而 doctor 的意义就是
+    # 告诉你「哪些能用」。本项目实际用的单独一行说明。
+    probe_kinds = env.kinds_supported() or set(HERDR_KINDS)
+    installed = sorted(k for k in probe_kinds if env_bin_ok(k))
+    print(f"  已装 agent    {', '.join(installed) or '（无）'}"
+          + (f"  （共 {len(installed)}/{len(probe_kinds)}）" if installed else ""))
+    used = sorted({r.kind for r in load_roles(Path(args.project).resolve()).values()})
+    missing_used = [k for k in used if not env_bin_ok(k)]
+    print(f"  本项目要用    {', '.join(used) or '（未声明）'}"
+          + (f"  ⚠ 缺：{'、'.join(missing_used)}" if missing_used else ""))
+    print(f"  实测 --model  {', '.join(sorted(VERIFIED_TUI_MODEL))}")
+    print(f"  推断 --model  {len(ASSUMED_TUI_MODEL)} 个（用 --probe 转成实测）\n")
+
+    if args.probe == "all":
+        return _probe_all(env, herdr_ok, args.model)
+
+    if args.probe:
+        # --probe 收的是 **agent kind**（omp/claude/devin…），不是角色名。
+        # 校验用运行时探测到的 kind 列表，外加内置表兜底（离线时）。
+        kind = normalize_kind(args.probe)
+        known = env.kinds_supported() or HERDR_KINDS
+        if kind not in known:
+            die(f"本机 herdr 不认识 agent kind {kind!r}。"
+                f"可用：{', '.join(sorted(known))}")
+        if not env_bin_ok(kind):
+            die(f"{kind} 不在 PATH 上，先装它")
+        if not herdr_ok:
+            die("没有 herdr，无法起 pane 验证")
+        kinds = env.kinds_supported()
+        if kinds and kind not in kinds:
+            die(f"本机 herdr 不支持 {kind}")
+        model = args.model or ""
+        if not model:
+            cands = [c for c in list_models(kind)
+                     if c.get("model") and not c.get("blocked")
+                     and plausible_model(c["model"])]
+            model = cands[0]["model"] if cands else ""
+        print(f"  探针：起 {kind}"
+              + (f" --model {model}" if model else "（不带模型）") + " …")
+        ok, note = _probe_one(env, kind, model)
+        if ok:
+            print(f"  ✓ {note}")
+            print(f"  已记入 {probe_store_path()}")
+            print("  以后 `xteam agents` 会把它标成 ✓实测（跨进程有效）")
+        else:
+            print(f"  ✗ {note}")
+            print("  注意区分两种原因：该 CLI 的 TUI 不认 --model，还是它卡在"
+                  "首次登录/onboarding 屏。后者先在终端手跑一次它完成初始化。")
+    return 0
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """问一句。拿不到 TTY（非交互环境）就用默认值，绝不阻塞等输入。"""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(f"{prompt} [{default}] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default
+    return ans or default
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """声明这个仓库是什么结构，然后建 .xteam/。
+
+    **为什么要显式声明而不是靠自动发现**：三项目根目录、单应用仓库、带共享契约的
+    多项目，治理方式完全不同（要不要每个切片声明项目、动 api 要不要提示下游）。
+    靠猜迟早搞混 —— 所以在 init 时问清楚并落盘，之后所有行为都读这份声明。
+    """
+    root = Path(args.project).resolve()
+    if not root.is_dir():
+        die(f"目录不存在：{root}")
+    proto = Protocol(root)
+    reg = Registry(root)
+    if reg.path.exists() and not args.force:
+        die(f"{reg.path.relative_to(root)} 已存在。要重新声明加 --force"
+            f"（会覆盖，不会删你的 tasks/ wiki/ 记忆）")
+
+    # 候选：子目录里的 git 仓库，或当前目录本身
+    cands = sorted(p.name for p in root.iterdir()
+                   if p.is_dir() and not p.name.startswith(".")
+                   and (p / ".git").exists()) if root.iterdir() else []
+    is_repo = (root / ".git").exists()
+    print(f"[{now()}] xteam init  root={root}")
+    print(f"  发现 {len(cands)} 个子项目：{'、'.join(cands) if cands else '（无）'}")
+
+    # ---- 1. 这个仓库本身是什么类型 ----
+    if args.repo_kind:
+        kind = args.repo_kind
+    elif cands and len(cands) > 1:
+        kind = _ask("  这个仓库是什么结构？\n"
+                    "    single    单应用仓库\n"
+                    "    multi-app  多个独立应用，互不依赖\n"
+                    "    multi-api  多项目且有共享契约层（api 同时服务多个消费方）",
+                    "multi-app")
+    else:
+        kind = "single"
+    if kind not in REPO_KINDS:
+        die(f"未知的结构类型 {kind!r}，可选：{', '.join(REPO_KINDS)}")
+    print(f"  结构：{kind} — "
+          f"{'单应用仓库' if kind == 'single' else ('多项目' + ('（含共享契约）' if kind == 'multi-api' else ''))}")
+
+    # ---- 2. 项目清单 ----
+    projects = []
+    if kind == "single":
+        name = args.name or root.name
+        projects = [{"name": name, "kind": "app", "consumers": []}]
+        print(f"  项目：{name}")
+    else:
+        raw = args.projects or (",".join(cands) if cands else "")
+        if args.projects:
+            chosen = [x.strip() for x in raw.split(",") if x.strip()]
+        else:
+            chosen = [x.strip() for x in _ask("  项目清单（逗号分隔）", raw).split(",")
+                      if x.strip()]
+        # 校验：存在 + 不越界
+        for name in chosen:
+            if reg.resolve_dir(name) is None:
+                die(f"项目 {name!r} 在 {root} 下不存在（只允许直接子目录）")
+        # 共享契约层
+        if args.shared_api:
+            shared = [x.strip() for x in args.shared_api.split(",") if x.strip()]
+        elif kind == "multi-api":
+            shared = [x.strip() for x in
+                      _ask("  哪个/哪些是共享契约层（如 api）", "").split(",") if x.strip()]
+        else:
+            shared = []
+        for name in chosen:
+            is_shared = name in shared
+            consumers = ([c for c in chosen if c not in shared]
+                         if is_shared else [])
+            projects.append({"name": name,
+                             "kind": "shared-api" if is_shared else "app",
+                             "consumers": consumers})
+        print(f"  项目：{', '.join(chosen)}")
+        if shared:
+            print(f"  共享契约层：{', '.join(shared)}"
+                  f"（改它会提醒下游：{', '.join(consumers_of(shared, chosen))}）")
+
+    # ---- 3. 落盘 ----
+    proto.ensure()
+    reg.save({"kind": kind, "projects": projects,
+              "_initialized": now(),
+              "_note": "手工声明；kind 决定治理方式，consumers 决定动契约时要通知谁"})
+    proto.write_index()
+
+    # init 要能独立成立：只跑 init 不跑 up 的用户，也该拿到文档、忽略规则和
+    # 配置模板。原先这些都挂在 up 上，于是「先声明结构、后开跑」的路径上，
+    # .xteam/ 既没有说明、也没进 .gitignore（会被误提交）。
+    _ensure_xteam_readme(root, proto.dir)
+    _ensure_gitignored(root, proto.dir)
+
+    # 配置模板：没有它，用户得先猜 team.json 的结构才知道能改什么。
+    team_path = proto.dir / "team.json"
+    if not team_path.exists():
+        write_json(team_path, {
+            "_howto": "改这里决定每个角色用哪个 agent 和模型；"
+                       "下次 xteam up 自动沿用。中途要换跑 xteam swap <角色> <agent>。"
+                       "model 留空=用该 agent 的默认。写法因 agent 而异"
+                       "（opencode 的 TUI 不认 --model，写了会被拒绝）。",
+            "_see": "xteam models <agent> 看该 agent 真正可用的模型；"
+                    "xteam doctor --probe <agent> --model X 实测一次。",
+            "roles": {r: {"kind": k, "model": m} for r, (k, _cn), m in
+                      ((r, DEFAULT_ROLES[r], "") for r in DEFAULT_ROLES)},
+        }, indent=2)
+        print(f"  已写 {team_path.relative_to(root)}（配置模板，可直接改）")
+    print(f"  已写 {reg.path.relative_to(root)}")
+
+    # 共享契约层才有必要建 contracts/ —— 普通仓库建空目录只是噪音
+    if any(p["kind"] == "shared-api" for p in projects):
+        cdir = proto.dir / "contracts"
+        cdir.mkdir(exist_ok=True)
+        readme = cdir / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                "# API 契约\n\n"
+                "跨项目共享的接口约定放这里。改契约前先在这里记录，"
+                "改完在时间线留一条，xteam 会在门禁共享契约切片时提示下游影响面。\n\n"
+                "建议一个契约一文件：`POST /orders.md`，写清请求/响应/错误码。\n",
+                encoding="utf-8")
+        print(f"  已建 {cdir.relative_to(root)}/（跨项目 API 契约）")
+
+    print()
+    print("下一步：")
+    print(f"  xteam up . --watch          # 起 pm/tl/dev 三个 pane")
+    if kind != "single":
+        print(f"  xteam projects              # 确认项目与依赖无误")
+    print(f"  切片里声明项目：task.json 写 {{\"project\": \"api\"}}"
+          if kind != "single" else "  单应用，无需声明项目")
+    return 0
+
+
+def consumers_of(shared: list[str], chosen: list[str]) -> list[str]:
+    out: list[str] = []
+    for name in shared:
+        out += [c for c in chosen if c not in shared and c not in out]
+    return out
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    """列出这次 xteam 治理哪些项目、谁消费谁、每个项目还欠多少活。
+
+    多项目下这是入口命令：先看它，才知道一个切片该声明成哪个 project。
+    """
+    root = Path(args.project).resolve()
+    reg = Registry(root)
+    data = reg.load()
+    proto = Protocol(root)
+    by_proj = proto.by_project()
+
+    print(f"[{now()}] xteam projects  root={root}")
+    print(f"  结构：{reg.describe_structure()}")
+    if data.get("_auto"):
+        print("  ⚠ 注册表尚不存在，以下是按「子目录里有 git 仓库」自动发现的。")
+        print(f"    需要标记共享契约请编辑 {reg.path.relative_to(root)}")
+        print(f"    （把 api 之类标成 kind=shared-api + consumers=[...]，"
+              f"xteam 才会提示下游影响）")
+    print()
+    if not data.get("projects"):
+        print("  未发现任何项目。xteam 单项目模式下不需要注册表。")
+        return 0
+    for p in data["projects"]:
+        name = p.get("name", "?")
+        shared = p.get("kind") == "shared-api"
+        tags = ["共享契约"] if shared else []
+        if p.get("consumers"):
+            tags.append("被 " + "、".join(p["consumers"]) + " 消费")
+        opens = by_proj.get(name, [])
+        d = reg.resolve_dir(name)
+        mark = "✓" if d else "✗ 目录不存在"
+        print(f"  {name:<12} {mark:<10} {' '.join(tags)}")
+        if opens:
+            for t in opens:
+                print(f"      未闭合：{t}")
+    unassigned = by_proj.get("(未声明)", [])
+    if unassigned:
+        print()
+        print(f"  ⚠ 有切片没声明项目：{', '.join(unassigned)}")
+        print(f"    补法：.xteam/tasks/<切片>/task.json 写 {{\"project\": \"<名字>\"}}")
+    return 0
+
+
+def _qa_task(root: Path, name: str = "") -> Path:
+    """定位要评审的切片。不给名字时：有且仅有一个未闭合切片就用它。"""
+    proto = Protocol(root)
+    if name:
+        for t in proto.all_tasks():
+            if t.name == name:
+                return t
+        die(f"没有这个切片：{name}")
+    opens = proto.open_tasks()
+    if not opens:
+        die("没有未闭合的切片，先 `xteam say pm \"...\"` 派活")
+    if len(opens) > 1:
+        die(f"有 {len(opens)} 个未闭合切片，说清是哪个：\n  "
+            + "\n  ".join(t.name for t in opens))
+    return opens[0]
+
+
+def cmd_qa(args: argparse.Namespace) -> int:
+    """第三方评审：用一个**没参与过这个项目**的 agent 冷读 spec 和 diff。
+
+    为什么不加成第四个常驻角色：PM 和 TL 读的是同一份 spec.md，若错在 spec
+    本身，两个角色会一起错；再加一个读同一份的 reviewer 同样会错，还多出
+    「谁裁决」的问题。外部进程是冷读 —— 它唯一能补的就是「需求本身有没有问题」。
+
+    **它不是裁判。** 结论只是 PM 门禁的输入之一，`verdict.json` 仍只有 PM 一个作者。
+    """
+    root = Path(args.project).resolve()
+    qc = QaConfig(root)
+    cfg = qc.load()
+
+    if args.qa_action == "show":
+        print(f"[{now()}] 第三方评审配置（{qc.path.relative_to(root)}）")
+        print(f"  agent   {cfg['agent']}"
+              f"{'（已实测支持一次性调用）' if cfg['agent'] in ONESHOT_VERIFIED else '（⚠ 未实测支持一次性调用，可能失败）'}")
+        print(f"  model   {cfg['model'] or '（用它自己的默认）'}")
+        print(f"  何时跑  {cfg['when']}"
+              f"{'  ← 默认。门禁前不会自动跑，用 xteam qa run 手动触发' if cfg['when'] == 'manual' else ''}")
+        if cfg["risky_projects"]:
+            print(f"  高风险项目  {'、'.join(cfg['risky_projects'])}")
+        if cfg["prompt"]:
+            print(f"  额外要求  {cfg['prompt'][:120]}")
+        if cfg["model"]:
+            risk = model_cost_risk(cfg["agent"], cfg["model"])
+            if risk:
+                print(f"  ⚠ {risk}")
+        if not qc.configured():
+            print(f"  （还没落过盘，用 `xteam qa set` 固化）")
+        return 0
+
+    if args.qa_action == "clear":
+        if qc.path.exists():
+            qc.path.unlink()
+            print(f"[{now()}] 已清除 {qc.path.relative_to(root)}（回到默认：手动触发）")
+        else:
+            print("本来就没有配置")
+        return 0
+
+    if args.qa_action == "set":
+        for attr, key in (("agent", "agent"), ("model", "model"),
+                          ("when", "when"), ("prompt", "prompt")):
+            value = getattr(args, attr, None)
+            if value is not None:
+                cfg[key] = value
+        if args.timeout is not None:
+            cfg["timeout"] = args.timeout
+        if args.project_names is not None:
+            cfg["risky_projects"] = list(args.project_names)
+        if args.agent:
+            cfg["agent"] = normalize_kind(args.agent)
+        risk = model_cost_risk(cfg["agent"], cfg["model"]) if cfg["model"] else ""
+        qc.save(cfg)
+        print(f"[{now()}] 已写入 {qc.path.relative_to(root)}")
+        print(f"  agent={cfg['agent']}  when={cfg['when']}  "
+              f"model={cfg['model'] or '(默认)'}")
+        if cfg["agent"] not in ONESHOT_VERIFIED:
+            print(f"  ⚠ {cfg['agent']} 未实测支持「一次性调用」，"
+                  f"`xteam qa run` 可能失败。已实测的："
+                  f"{'、'.join(sorted(ONESHOT_VERIFIED))}")
+        if risk:
+            print(f"  ⚠ {risk}")
+        return 0
+
+    # ---- run ----
+    task = _qa_task(root, args.task or "")
+    # cfg 是从磁盘读出来的本地副本，改它不落盘 —— --model/--prompt 只影响本次
+    if args.model:
+        cfg["model"] = args.model
+    risk = model_cost_risk(cfg["agent"], cfg["model"]) if cfg["model"] else ""
+    print(f"[{now()}] 第三方评审 {task.name}")
+    print(f"  agent={cfg['agent']} model={cfg['model'] or '(默认)'} "
+          f"（最多 {cfg['timeout']}s）")
+    if risk:
+        print(f"  ⚠ {risk}")
+    ok, note = run_external_review(root, task, cfg, args.prompt or cfg["prompt"])
+    print(f"  {'✓ ' if ok else '✗ '}{note}")
+    if not ok:
+        # 外部工具不可用**不该让门禁停摆** —— 记一笔，继续。
+        log_timeline(root, "qa", f"{task.name} 第三方评审失败：{note[:200]}")
+        return 1
+    digest = review_digest(task)
+    log_timeline(root, "qa", f"{task.name} 第三方评审完成（{len(digest)} 字）")
+    print()
+    print("── 评审结论（已落盘，门铃会带给 PM）──")
+    print(digest)
+    # 结论要真的送到 PM 手上，否则等于没跑
+    try:
+        label, _ = resolve_ws_label(root, args.workspace)
+        herdr = Herdr(scope=label)
+        ws = herdr.find_workspace(label)
+        proto = Protocol(root)
+        pane = (_read_json(proto.dir / "session.json").get("panes") or {}).get("pm")
+        if ws and pane:
+            res = herdr.doorbell(pane, f"【第三方评审】{task.name} 交上来了。"
+                                      f"这是 {cfg['agent']} 的独立冷读意见"
+                                      f"（不是你判定的依据，是给你多一个视角）：\n\n"
+                                      f"{digest}\n\n"
+                                      f"全文：{review_path(task)}")
+            print(f"[{now()}] 已门铃 PM：{res}")
+        else:
+            print(f"[{now()}] workspace 没在跑，结论留在文件里供 restore 后查看")
+    except Exception as exc:                    # 门铃失败不该推翻评审结果
+        print(f"[{now()}] 门铃 PM 失败（评审结果仍在文件里）：{exc}")
+    return 0
+
+
+def cmd_contracts(args: argparse.Namespace) -> int:
+    """管理 `.xteam/contracts/` —— 跨项目共享的 API 契约。
+
+    约定：**一个契约一个文件**，文件名是 `METHOD /path`（路径里的 `/` 写成 `_`）。
+    只在有 shared-api 项目时才有意义 —— 单应用仓库没有「下游」这回事。
+    """
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    reg = Registry(root)
+    shared = [p["name"] for p in reg.load().get("projects", [])
+              if p.get("kind") == "shared-api"]
+
+    if args.action == "list":
+        files = contract_files(root)
+        print(f"[{now()}] API 契约（{contracts_dir(root).relative_to(root)}）")
+        if not shared:
+            print("  （当前没有 shared-api 项目，契约层用不上）")
+        if not files:
+            print("  还没有契约。用 `xteam contracts new \"POST /orders\"` 建一个")
+            return 0
+        for f in files:
+            if f.name.lower().startswith("readme"):
+                continue          # 目录说明，不是契约
+            # 以 front-matter 里的真实路径为准：文件名在路径含下划线时有歧义，
+            # 而这里是要给人判断「这是哪个接口」的，歧义等于错。
+            method, path = contract_real_path(f)
+            head = f"{method} {path}" if method else f"{f.name}（文件名不合规）"
+            if method and contract_filename(method, path) != f.name:
+                head += f"   ← 文件名有歧义，按内容里的真实路径显示"
+            print(f"  {head}")
+        # 哪些切片声明了改它
+        by_contract: dict[str, list[str]] = {}
+        for t in proto.all_tasks():
+            for c in reg.contracts_of_task(t):
+                by_contract.setdefault(c, []).append(t.name)
+        for c, tasks in sorted(by_contract.items()):
+            mark = "✓" if (contracts_dir(root) / c).exists() else "✗ 缺文件"
+            print(f"    {mark} {c} —— 被切片引用：{'、'.join(tasks)}")
+        return 0
+
+    if args.action == "new":
+        spec = args.spec.strip()
+        parts = spec.split(None, 1)
+        if len(parts) != 2:
+            die("写成 `METHOD /path`，例如：xteam contracts new \"POST /orders\"")
+        if parts[0].strip().upper() not in CONTRACT_METHODS:
+            die(f"不认识的方法 {parts[0]!r}。可选：{'、'.join(CONTRACT_METHODS)}")
+        name = contract_filename(parts[0], parts[1])
+        method, path = parse_contract_name(name)
+        path_file = contract_path(root, name)
+        if path_file is None:
+            die(f"算出来的契约名 {name!r} 不合规（应为 `METHOD _path.md`）")
+        path_file.parent.mkdir(parents=True, exist_ok=True)
+        if path_file.exists() and not args.force:
+            die(f"{name} 已存在。要重置骨架加 --force（会覆盖你写的内容）")
+        path_file.write_text(CONTRACT_TEMPLATE.format(method=method, path=path),
+                             encoding="utf-8")
+        print(f"[{now()}] 已建 {contracts_dir(root).relative_to(root)}/{name}")
+        # consumers_of 返回列表，多个共享项目时要摊平，否则 join 会拿到 list of list
+        consumers: list[str] = []
+        for proj in shared:
+            consumers += [c for c in reg.consumers_of(proj) if c not in consumers]
+        if consumers:
+            print(f"  下游消费方：{'、'.join(consumers)}（改契约后要通知它们）")
+        print("  改完记得让切片在 task.json 的 contracts 里引用它，并在时间线留痕。")
+        return 0
+
+    if args.action == "log":
+        # 改契约不留痕等于没改 —— 下游无从判断自己手里那份实现还能不能用。
+        if contract_path(root, args.name) is None:
+            die(f"{args.name!r} 不是合法的契约文件名（应为 `METHOD _path.md`），"
+                f"或试图写到 .xteam/contracts/ 之外")
+        line = contract_log_change(root, args.name, args.who or "human", args.what)
+        if not line:
+            die(f"没能记入 {args.name}：文件不存在，或里面没有「## 变更记录」小节"
+                f"（没写成功，所以也没写时间线）")
+        print(f"[{now()}] 已记入 {args.name} 的变更记录，并落到时间线")
+        print(f"  {line}")
+        affected: list[str] = []
+        for p in reg.load().get("projects", []):
+            if p.get("kind") == "shared-api":
+                affected += reg.consumers_of(p["name"])
+        if affected:
+            print(f"  ⚠ 下游会受影响：{'、'.join(affected)} —— 记得同步")
+        return 0
+
+    # ---- check ----
+    problems: list[str] = []
+    for cyc in proto.dep_cycles():
+        problems.append("依赖成环：" + " → ".join(cyc))
+    for t in proto.all_tasks():
+        for miss in proto.missing_deps(t):
+            problems.append(f"切片 {t.name} 的 depends_on 指向不存在的 {miss!r}")
+        for miss in proto.contracts_missing(t):
+            problems.append(f"切片 {t.name} 声明的契约文件不存在：{miss}")
+    for f in contract_files(root):
+        # README.md 是目录说明（init 建的），不是契约，别拿它判合规
+        if f.name.lower().startswith("readme"):
+            continue
+        if not parse_contract_name(f.name)[0]:
+            problems.append(f"契约文件名不合规（应为 `METHOD _path.md`）：{f.name}")
+    if not problems:
+        print(f"[{now()}] ✓ 依赖与契约自洽")
+        return 0
+    print(f"[{now()}] ✗ {len(problems)} 处问题：")
+    for p in problems:
+        print(f"  · {p}")
+    return 1
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """列出/搜索这台机器上某个 agent 真正可用的模型。
+
+    **默认显示全部**，openrouter 的用 🚫 标出来而不是藏起来 —— 用户要自己挑，
+    替他筛掉反而不好选。很多模型两个版本同名（`muse`、`deepseek-v4.1` 都有
+    openrouter 版和已付费版），光看名字分不出来，所以按 provider 标记。
+    `--only-paid` 才只看已付费的。
+    """
+    kind = normalize_kind(args.kind)
+    if not shutil.which(kind):
+        die(f"没装 {kind}，先装它再看模型清单")
+    if args.query:
+        hits = search_models(kind, args.query,
+                             include_blocked=not args.only_paid, limit=args.limit)
+        title = f"{kind} 中匹配 {args.query!r} 的模型"
+    else:
+        hits = [m for m in list_models(kind)
+                if args.only_paid is False or not m["blocked"]][:args.limit]
+        title = f"{kind} 可用模型"
+    if not hits:
+        print(f"[{now()}] {title}：无"
+              + ("" if args.only_paid else "（--only-paid 可过滤 openrouter）"))
+        return 0
+    print(f"[{now()}] {title}（{len(hits)} 个"
+          + ("" if not args.only_paid else "，只列已付费") + "）\n")
+    for m in hits:
+        mark = "🚫 openrouter" if m["blocked"] else "✅"
+        print(f"  {mark:14} {m['model']}")
+    print()
+    print("  用法：xteam up . --set-model <role>=<上面的模型名>")
+    if not args.only_paid:
+        print("  只看已付费线路：xteam models %s --only-paid" % kind)
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """检索 .xteam/wiki 里沉淀的决策与教训。PM 接手新切片前先搜一遍。"""
+    root = Path(args.project).resolve()
+    hits = wiki_search(root, args.query, limit=args.limit)
+    if not hits:
+        print(f"[{now()}] wiki 里没有匹配 {args.query!r} 的记录"
+              + ("（wiki 目录还不存在）" if not wiki_dir(root).is_dir() else ""))
+        return 0
+    print(f"[{now()}] 命中 {len(hits)} 条：\n")
+    cur = None
+    for h in hits:
+        if h["section"] != cur:
+            cur = h["section"]
+            print(f"  ── {cur}")
+        print(f"    {h['file']}:{h['line']}  {h['text'][:100]}")
+    return 0
+
+
+def cmd_note(args: argparse.Namespace) -> int:
+    """往 wiki 追加一条决策/教训/约定。"""
+    root = Path(args.project).resolve()
+    body = args.body
+    if args.file:
+        try:
+            body = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            die(f"读不了 {args.file}：{exc}")
+    try:
+        p = wiki_append(root, args.kind, args.title, body, by=args.role)
+    except ValueError as exc:
+        die(str(exc))
+    print(f"[{now()}] 已记入 {p}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """从 .xteam 的记忆恢复现场——不管是误关还是主动关的。
+
+    数据本来就没丢（down 只关 workspace，不删文件），所以 restore 做的是
+    **把散落的记忆重新汇总成人能读的样子**，并把未完成的事摆到台面上。
+    """
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    if not proto.dir.is_dir():
+        die(f"{proto.dir} 不存在，这个项目没用 xteam 起过。先 xteam up .")
+    label, _ = resolve_ws_label(root, args.workspace)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    # 三态而不是两态：workspace 留着但 pane 已关（down 之后）是常态，
+    # 报成「运行中」会让人以为还有人干活；报成「未启动」又掩盖了可以复用。
+    if not ws:
+        state = "未启动"
+    else:
+        n = len(herdr.role_map(ws["workspace_id"]))
+        state = f"运行中（{n} 个 agent）" if n else "workspace 在，pane 已关（可复用）"
+
+    print(f"[{now()}] xteam restore  project={root}")
+    print(f"  workspace {label!r}：{state}")
+    print()
+    print("  已闭合切片（不会再动）:")
+    closed = [t for t in proto.all_tasks() if (t / "closed.md").exists()]
+    print("    " + (", ".join(t.name for t in closed) or "（无）"))
+    print("  未闭合（下次 up 会接着推）:")
+    opens = proto.open_tasks()
+    for t in opens:
+        owes = {r: o for r, o in proto.debts(t).items()}
+        who = "、".join(f"{r}:{o}" for r, o in owes.items()) or "无（等新需求）"
+        print(f"    {t.name}  →  {who}")
+    if not opens and not closed:
+        print("    （无）")
+    print()
+    tl = proto.dir / "watch" / "timeline.log"
+    if tl.exists():
+        lines = [l for l in tl.read_text(encoding="utf-8").splitlines() if l.strip()]
+        print(f"  时间线最后 {min(5, len(lines))} 条（共 {len(lines)} 条）:")
+        for l in lines[-5:]:
+            print(f"    {l[:110]}")
+    print()
+    recaps = sorted((proto.dir / "memory").glob("*-recap.md")) \
+        if (proto.dir / "memory").is_dir() else []
+    if recaps:
+        print("  已有 recap（派活时会自动附给对方）:")
+        for r in recaps:
+            print(f"    {r.name}  {r.stat().st_mtime and '存在'}")
+    else:
+        print("  尚无 recap —— 下次切片闭合时 xteam 会主动要求写")
+    print()
+    if not ws:
+        print("  恢复现场：xteam up . --watch")
+    return 0
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    """列出本机可编排的 agent 及其模型能力（全部为实测结论）。"""
+    # 同 doctor：列全部已装的。只列 team.json 里用到的 kind 会让
+    # 「明明装了却显示没装」，而这条命令的意义就是回答「我能编排谁」。
+    env = Herdr(scope=args.workspace or "agents")
+    probe_kinds = env.kinds_supported() or set(HERDR_KINDS)
+    installed = {k for k in probe_kinds if env_bin_ok(k)}
+    print(f"[{now()}]\n{agent_catalog(installed, verified=load_verified_agents())}")
+    return 0
+
+def resolve_ws_label(root: Path, explicit: str | None,
+                     herdr: Herdr | None = None) -> tuple[str, str]:
+    """决定用哪个 workspace。返回 (label, 依据说明)。
+
+    **顺序即优先级**：
+
+    1. `--workspace X` —— 显式指定，永远最优先
+    2. `.xteam/session.json` 里记的上次用的 workspace（若它的 pane 仍在 cwd 内）
+    3. **cwd 反查**：本目录位于某个 workspace 的 pane 之内，取**最贴切**的那个
+       （深度最大 = cwd 路径最长 = 最具体）。这才是「我现在在哪个 workspace」
+    4. 目录名 —— 兜底，会新建一个 workspace
+
+    第 3 条替代了 herdr 的 `focused`：那个字段在非交互查询下恒为 False，
+    靠不住；pane 的 cwd 才是事实。
+    """
+    if explicit:
+        return explicit, "--workspace 指定"
+    env = herdr or Herdr(scope="resolve")
+    try:
+        hits = env.detect_by_cwd(root)
+    except Exception:  # noqa: BLE001
+        hits = []
+    if not hits:
+        return root.name, "没找到覆盖本目录的 workspace，用目录名"
+    best_depth = hits[0][1]
+    tied = [lbl for lbl, d in hits if d == best_depth]
+    if len(tied) > 1:
+        # 并列时优先认「本项目上次用过的那一个」——那是权威记录
+        seen = (_read_json(Protocol(root).dir / "session.json")
+                .get("workspace"))
+        if seen in tied:
+            return seen, "cwd 反查有并列，按 session.json 记录"
+        # 再退一步：xteam 角色更多的那个（更可能是这个项目在用的）
+        best, best_n = None, -1
+        for lbl in tied:
+            try:
+                ws = env.find_workspace(lbl)
+                n = len(env.role_map(ws["workspace_id"])) if ws else 0
+            except Exception:  # noqa: BLE001
+                n = 0
+            if n > best_n:
+                best, best_n = lbl, n
+        return (best or tied[0],
+                f"cwd 反查有并列（{'、'.join(tied)}），取 xteam 角色最多的"
+                f"（{best_n} 个）；要指定用 --workspace")
+    return hits[0][0], f"cwd 反查命中（{hits[0][0]}）"
+
+
+def started_order(args: argparse.Namespace) -> list[str]:
+    """本次要拉起的角色，按启动顺序。reviewer 默认不启动。"""
+    return [r for r in BOOT_ORDER if r != "reviewer" or args.reviewer]
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """把最新的角色章程与协议同步到已在跑的项目。
+
+    角色章程是 `up` 时一次性投进 pane 的，之后 xteam 改了章程，正在跑的 pane 拿到的
+    还是旧的。这条命令重投章程 + 刷新 `.xteam/PROTOCOL.md`，让规则变更不必重启整套。
+    """
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    proto.ensure()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        die(f"找不到 workspace {args.workspace!r}（先跑 xteam up）")
+    # 检测哪些规则改了还没投给正在跑的 pane
+    stale = set(stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+    role_map = herdr.role_map(ws["workspace_id"])
+
+    src = TEMPLATES / "PROTOCOL.md"
+    dst = proto.dir / "PROTOCOL.md"
+    if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+        dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"[{now()}] .xteam/PROTOCOL.md 已更新")
+
+    targets = [r for r in BOOT_ORDER if r in role_map]
+    if stale:
+        print(f"[{now()}] 检测到变更：{'、'.join(sorted(stale))}")
+    else:
+        print(f"[{now()}] 章程与协议都没变化，不打扰正在跑的 pane")
+    sent = 0
+    for role in targets:
+        # **只重投真的变了的。** 原来每次 sync 都把三份章程全推一遍，agent 得
+        # 重读没变的内容——既噪音，又把真正的变更淹掉。
+        if stale and role not in stale:
+            continue
+        charter = (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
+        msg = (f"【协议更新】你的角色章程已更新，请重读并立即生效：\n"
+               f"{charter}")
+        result = herdr.doorbell(role_map[role]["pane_id"], msg, wait_s=3)
+        print(f"[{now()}] 章程已重投 {role}：{result}")
+        sent += 1
+    if sent:
+        save_rules_state(root, rules_fingerprint(
+            ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+    if not targets:
+        print("没有可同步的角色")
+    return 0
+
+# ---------------------------------------------------------------- up
+
+
+def _with_default_model(spec: RoleSpec) -> RoleSpec:
+    """没显式配 model 时，按 kind 补默认模型（devin → swe-2-max）。
+
+    只影响启动参数，不写进 team.json —— 否则 status 会显示「默认模型」而非实际模型。
+    """
+    if spec.model:
+        return spec
+    fallback = DEFAULT_START_MODEL.get(spec.kind)
+    return RoleSpec(spec.role, spec.kind, spec.cn, fallback) if fallback else spec
+
+
+def _boot_role(herdr: Herdr, root: Path, ws_id: str, role: str,
+               spec: RoleSpec) -> tuple[str, str]:
+    """建 tab → 取 pane → 起 agent。返回 (pane_id, tab_id)。
+
+    **up 和 swap 必须走同一条路径。** 换 agent 若另写一套，漏掉 XTEAM_ROLE
+    环境变量或命名空间的话，换过的 pane 会和 up 出来的行为不一致 —— 而这种
+    不一致只在换过之后才显形，排查极贵。
+    """
+    tab = herdr.create_tab(ws_id, str(root), role, env={"XTEAM_ROLE": role})
+    # create 返回体把 tab 嵌在具名键下（tab_created.tab），不是平铺的 tab_id
+    tab_id = (tab.get("tab") or tab).get("tab_id")
+    if not tab_id:
+        die(f"tab 创建返回异常（未找到 tab_id）：{tab}")
+    panes = herdr.panes_of_tab(ws_id, tab_id)
+    if not panes:
+        die(f"tab {tab_id} 下找不到 pane")
+    herdr.start_agent(panes[0], tab_id, spec)
+    return panes[0], tab_id
+
+
+def _find_role_tab(herdr: Herdr, ws_id: str, role: str, known: str = "") -> str:
+    """找到角色所在 tab。
+
+    **不能只按 label == role 找**：start_agent 收尾会把 tab 改名成
+    `role-<workspace>`（agent name 全局唯一，tab 名跟着走），实测按 role 精确
+    匹配永远找不到。所以顺序是
+      1. session.json 里 up 时记下的 tab_id（权威）
+      2. label 精确等于 role，或以 `role-` 开头（手工搭的 workspace 兜底）
+    """
+    if known:
+        return known
+    tabs = herdr._run("tab", "list", "--workspace", ws_id).get("tabs", [])
+    for t in tabs:
+        if t.get("label") == role:
+            return t.get("tab_id", "")
+    for t in tabs:
+        label = t.get("label") or ""
+        if label.startswith(f"{role}-"):
+            return t.get("tab_id", "")
+    return ""
+
+
+def _swap_block_reason(state: str, force: bool) -> str:
+    """换 agent 的安全阀。返回空串=放行，非空=该拒绝的理由。
+
+    **working 时换掉等于把没做完的活连同上下文一起扔掉**，所以默认拦住。
+    blocked（它自己停下了）和 unknown（读不到状态）都放行 —— 前者没什么可丢，
+    后者不该因为读不到就挡住人。抽成纯函数是为了能固定验证：真跑一次 swap 要起
+    真 agent，太贵，而冒烟里那条断言是 flaky 的（刚投完章程的 agent 有时
+    working、有时 idle，都合法）。
+    """
+    if state in ("idle", "blocked", "unknown") or force:
+        return ""
+    return (f"现在是 {state}，换掉会丢掉它正在做的上下文。\n"
+            "  等它 idle 再换；或先 `xteam say <角色> \"停下并写 recap\"`；"
+            "确实要强换加 --force。")
+
+
+def _persist_role(root: Path, role: str, spec: RoleSpec) -> None:
+    """把换过的角色配置写进 team.json，下次 up 直接复用。"""
+    path = Protocol(root).dir / "team.json"
+    entry: dict[str, str] = {"kind": spec.kind}
+    if spec.model:
+        entry["model"] = spec.model
+    roles: dict = {}
+    if path.exists():
+        try:
+            roles = json.loads(path.read_text(encoding="utf-8")).get("roles") or {}
+        except (OSError, json.JSONDecodeError, ValueError):
+            roles = {}
+    roles[role] = entry
+    write_json(path, {"roles": roles, "_updated": now()}, indent=2)
+
+
+def _handover_brief(root: Path, proto: Protocol, role: str) -> str:
+    """换 agent 的交接底稿：新 agent 靠这段文字接上旧 agent 的班。
+
+    直接关掉旧 pane 会丢掉整个对话上下文 —— 新 agent 面对一个「已经在进行中」
+    的活却不知道进行到哪。所以必须带上三样：旧 agent 的 recap、别人的 recap
+    尾巴（它在链路上游，刚跟谁沟通过）、协议现状（谁欠什么义务）。
+    """
+    parts: list[str] = []
+    # **自己的 recap 也要限长。** 以前只有「别人的」限 600 字，自己的完整注入；
+    # 实测 20 万字的 recap 会让交接 prompt 同样变成 20 万字。
+    mine = latest_recap(root, role)[-RECAP_INJECT_CHARS * 4:]
+    parts.append(f"【你之前（{role}）写的 recap】\n{mine}"
+                 if mine else
+                 f"【{role} 之前没有留下 recap —— 接手时以 .xteam/ 下的工件为准，"
+                 f"别凭空假设进度】")
+    # **别人的 recap 只带尾部，且限长。** recap 是给「接手的人扫一眼」用的，
+    # 不是上下文主体 —— 两个角色各贴 1200 字会把交接提示撑到几千 token，
+    # 而新 agent 大概率只看得到最前面那几行。
+    for other in DEFAULT_ROLES:
+        if other == role:
+            continue
+        tail = latest_recap(root, other)[-RECAP_INJECT_CHARS:]
+        if tail:
+            parts.append(f"【{other} 最近的 recap（尾部 {RECAP_INJECT_CHARS} 字）】\n{tail}")
+    debts = proto.overall_debts()
+    if debts:
+        parts.append("【协议现状：谁欠什么义务】\n"
+                     + "\n".join(f"  {r} 欠 {ob}" for r, ob in sorted(debts.items())))
+    opens = [t.name for t in proto.open_tasks()]
+    if opens:
+        parts.append("【未闭合切片】" + "、".join(opens))
+    return "\n\n".join(parts)
+
+
+def cmd_swap(args: argparse.Namespace) -> int:
+    """中途把某个角色换成另一个 agent（可同时换模型）。
+
+    为什么这不是「运行中改配置」：运行中的 TUI 换不了自己的 agent，换 agent
+    必然要重建 pane。**但也因此 model 可以在启动时精确指定**，绕开了运行中用
+    方向键盲选模型的风险（列表无稳定编号，实测盲按会落到 openrouter 上）。
+
+    代价：旧 agent 的对话上下文随 pane 一起消失。所以先要它写 recap 交接，
+    再把 recap + 协议现状注入新 agent。
+    """
+    root = Path(args.project).resolve()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    role = args.role
+    specs = load_roles(root)
+    if role not in specs:
+        die(f"未知角色 {role!r}，可选：{', '.join(sorted(specs))}")
+    if role not in BOOT_ORDER:
+        die(f"角色 {role!r} 不在常驻名单里（常驻：{', '.join(BOOT_ORDER[:3])}）")
+
+    base = specs[role]
+    kind = normalize_kind(args.agent) if args.agent else base.kind
+    spec = _with_default_model(RoleSpec(role, kind, base.cn, args.model or base.model))
+
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        die(f"workspace {label!r} 不在运行。先 `xteam up .`")
+    ws_id = ws["workspace_id"]
+
+    # ---- 所有校验做完再动 pane ----
+    try:
+        spec.preflight(allow_openrouter=args.allow_openrouter)
+        spec.preflight_env(herdr, herdr.kinds_supported())
+    except RuntimeError as exc:
+        die(str(exc))
+
+    proto = Protocol(root)
+    session_path = proto.dir / "session.json"
+    session = _read_json(session_path)
+    old_pane = (session.get("panes") or {}).get(role)
+    old_state = herdr.agent_status(old_pane) if old_pane else "unknown"
+    # **working 时拒绝**：此刻关 pane 等于把没做完的活连同上下文一起扔掉。
+    blocked = _swap_block_reason(old_state, args.force)
+    if blocked:
+        die(f"{role} {blocked}")
+
+    print(f"[{now()}] {role}：{old_state} → {spec.describe() or 'CLI 默认模型'}")
+
+    # ---- 交接：先要旧 agent 留下 recap，再拆 ----
+    if not args.no_recap:
+        if old_pane:
+            print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
+            herdr.doorbell(old_pane,
+                           f"你要被换掉了。请立刻把当前进展、已确认的结论、"
+                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md，"
+                           f"然后停下。",
+                           wait_s=args.recap_wait)
+        print(f"[{now()}] recap："
+              f"{'已拿到' if latest_recap(root, role) else '没有（以 .xteam/ 工件为准）'}"
+              f"（{proto.dir}/memory/{role}-recap.md）")
+
+    # ---- 两阶段替换：新 agent 先起来，成功了才关旧的 ----
+    #
+    # 原来先 close_tab 再起新的：**新 agent 起不来时，旧的已经没了**，上下文
+    # 一起丢，且不可回滚。现在先起新的、确认它进入交互态，再关旧 tab。
+    #
+    # 能这么做的前提是 agent name 全局唯一 —— 新 agent 必须用**临时名**起，
+    # 否则 `tl-<scope>` 已被旧 agent 占用。这里用 `swap-<role>-<scope>`，
+    # 它对 role_map 不可见（role 前缀是 "swap"），所以切换期间新旧并存也不会
+    # 让巡检认错人。
+    tab_id = _find_role_tab(herdr, ws_id, role,
+                            (session.get("tabs") or {}).get(role, ""))
+    if not tab_id:
+        die(f"找不到 {role} 的 tab（workspace 可能被手工动过）。先 `xteam status` 看看")
+
+    brief = _handover_brief(root, proto, role)      # 交接底稿：旧 tab 关掉前先取
+    tmp_name = f"swap-{role}-{label}"
+    tab = herdr.create_tab(ws_id, str(root), f"swap-{role}",
+                           env={"XTEAM_ROLE": role})
+    new_tab = (tab.get("tab") or tab).get("tab_id")
+    panes = herdr.panes_of_tab(ws_id, new_tab) if new_tab else []
+    if not new_tab or not panes:
+        die(f"为 {role} 建新 tab 失败，原 {role} 未受影响")
+    print(f"[{now()}] 试起新的 {role}（临时名 {tmp_name}）…", flush=True)
+    try:
+        herdr.start_agent(panes[0], new_tab,
+                          RoleSpec(f"swap-{role}", spec.kind, spec.cn, spec.model),
+                          name=tmp_name)
+    except Exception as exc:  # noqa: BLE001
+        # **回滚：旧 tab 一个字都没动过**，这正是两阶段的价值
+        try:
+            herdr.close_tab(new_tab)
+        except Exception:       # noqa: BLE001
+            pass
+        die(f"新 {role} 启动失败，**原 {role} 保持不动**（tab {tab_id} 仍在）：\n"
+            f"  {str(exc).splitlines()[0][:200]}")
+    pane_id = panes[0]
+    st = herdr.agent_status(pane_id)
+    if not st or st in ("dead", "exited", "error"):
+        try:
+            herdr.close_tab(new_tab)
+        except Exception:       # noqa: BLE001
+            pass
+        die(f"新 {role} 起来但状态异常（{st}），已丢弃；原 {role} 保持不动")
+
+    # 新 agent 确实活了 → 这时才关旧 tab，并把新 agent 改名成正式名
+    herdr.close_tab(tab_id)
+    formal = f"{role}-{label}"
+    herdr._run("agent", "rename", pane_id, formal)
+    herdr._run("pane", "rename", pane_id, formal)
+    herdr._run("tab", "rename", new_tab, formal)
+    print(f"[{now()}]   新 {role} 已就位（{formal}），旧 tab {tab_id} 已关")
+
+    # ---- 投章程 + 交接底稿 ----
+    charter = (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
+    intro = (
+        f"你刚被拉起，接替 {label} 项目里的 {role}（{spec.cn}）。\n"
+        f"项目根目录：{root}\n"
+        f"注意：你**不是**从零开始 —— 这是中途换人，上一个 {role} 刚被换掉。\n"
+        f"角色章程如下，从现在起按它工作。\n\n" + charter
+        + "\n\n" + brief
+    )
+    print(f"[{now()}] 章程+交接已投 {role}："
+          f"{herdr.send_initial_prompt(pane_id, intro, wait_s=15)}")
+    print(f"[{now()}]   pane={pane_id} tab={new_tab}（旧 tab {tab_id} 已关）")
+
+    # ---- 落盘：session.json 换 pane 映射，team.json 记住新配置 ----
+    if session:
+        session["panes"] = {**(session.get("panes") or {}), role: pane_id}
+        session["tabs"] = {**(session.get("tabs") or {}), role: new_tab}
+        session.setdefault("swaps", []).append(
+            {"role": role, "at": now(), "to": spec.describe(), "previous": old_state})
+        write_json(session_path, session, indent=2)
+    _persist_role(root, role, spec)
+    log_timeline(root, "swap",
+                 f"{role} 换为 {spec.describe() or 'CLI 默认模型'}（原 {old_state}）")
+    print(f"\n[{now()}] 完成。{role} 现在是 {spec.describe() or 'CLI 默认模型'}")
+    print("  已写入 .xteam/team.json，下次 `xteam up` 会沿用")
+    return 0
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    if not root.is_dir():
+        die(f"项目目录不存在：{root}")
+
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    proto = Protocol(root)
+    proto.ensure()
+    _ensure_gitignored(root, proto.dir)
+    _ensure_xteam_readme(root, proto.dir)
+    # 协议文件随项目走：换台机器 clone 下来，agent 读的是同一份约定。
+    # **源比副本新就覆盖**——只在「不存在时」拷会让协议更新永远送不到已在跑的项目：
+    # agent 中途重读约定读到的还是旧版，而新规则（比如 PM 的判据自检）形同虚设。
+    proto_source = TEMPLATES / "PROTOCOL.md"
+    proto_target = proto.dir / "PROTOCOL.md"
+    stale = (not proto_target.exists()
+             or proto_target.stat().st_mtime < proto_source.stat().st_mtime)
+    if stale:
+        proto_target.write_text(proto_source.read_text(encoding="utf-8"),
+                                encoding="utf-8")
+        print(f"[{now()}] .xteam/PROTOCOL.md 已更新到当前版本")
+
+    # ---- 配置解析与校验：全部在任何副作用之前 ----
+    # 顺序很重要：配置写错时不能已经建了 workspace、起了几个 pane——那样会留下
+    # 半成品，得手动 down 才收得干净。
+    specs = load_roles(root)
+    for flag, attr in ((args.set_model, "model"), (args.set_agent, "kind")):
+        for pair in flag or []:
+            if "=" not in pair:
+                die(f"要写成 role={attr}，收到 {pair!r}")
+            role, value = pair.split("=", 1)
+            if role not in specs:
+                die(f"未知角色 {role!r}，可选：{', '.join(sorted(specs))}")
+            base = specs[role]
+            fields = {"kind": base.kind, "cn": base.cn, "model": base.model}
+            # 别名归一：口语里的 cursor-agent 落进 herdr 必须是 cursor
+            fields[attr] = normalize_kind(value) if attr == "kind" else value
+            specs[role] = RoleSpec(role, **fields)
+
+    # 环境体检：换机器时先确认 herdr 认这个 agent、agent CLI 装了没。
+    # 用运行时问出来的 kind 列表，不用硬编码的 HERDR_KINDS（会随版本漂移）。
+    env = Herdr(scope=label)
+    supported = env.kinds_supported()
+    for role in BOOT_ORDER:
+        if role == "reviewer" and not args.reviewer:
+            continue
+        try:
+            specs[role].preflight(allow_openrouter=args.allow_openrouter)
+            specs[role].preflight_env(env, supported)
+        except RuntimeError as exc:
+            die(str(exc))
+
+    # ---- 确认无误，开始有副作用的动作 ----
+    herdr = Herdr(scope=label)
+    existing = herdr.find_workspace(label)
+    if existing:
+        # **复用 workspace，不要再开一个。** 反复 up 会在屏幕上堆一堆同名
+        # workspace，而它们指向同一个项目 —— 既浪费终端空间，又让人搞不清
+        # 「我到底在跟哪个说话」。workspace 是长寿命容器，pane 才是易失的。
+        ws_id = existing["workspace_id"]
+        print(f"[{now()}] workspace {label!r} 已存在（{ws_id}）—— 复用，不新建")
+        live = {r: a["pane_id"] for r, a in
+                herdr.role_map(ws_id).items() if r in BOOT_ORDER}
+        if live:
+            print(f"[{now()}] 已在跑的角色：{'、'.join(sorted(live))}"
+                  f"（不动它们）")
+            stale = [r for r in started_order(args) if r not in live]
+            if not stale:
+                print(f"[{now()}] 要换掉已有角色用 `xteam swap <角色> <agent>`；"
+                      f"要收摊用 `xteam down`（只关 pane，workspace 留着）")
+                return 0
+            print(f"[{now()}] 补起缺失的角色：{'、'.join(stale)}")
+    else:
+        ws = herdr.create_workspace(str(root), label)
+        # herdr 的 create 返回体把实体嵌在具名键下（workspace_created.workspace），
+        # 不是平铺的 workspace_id。平铺解析会在第一次 up 时直接失败。
+        entity = ws.get("workspace") or ws.get("tab") or ws
+        ws_id = entity.get("workspace_id") or ws.get("workspace_id")
+        if not ws_id:
+            die(f"workspace 创建返回异常（未找到 workspace_id）：{ws}")
+        print(f"[{now()}] workspace {label!r} → {ws_id}")
+    print(f"[{now()}] 角色配置已校验：" + "  ".join(
+        f"{r}={specs[r].describe()}" for r in started_order(args)))
+
+    started: dict[str, str] = {}
+    tabs_of: dict[str, str] = {}
+    used: dict[str, str] = {}
+    for role in started_order(args):
+        if existing and role in live:
+            started[role] = live[role]      # 复用已有 pane，不重复起
+            continue
+        spec = _with_default_model(specs[role])
+        print(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
+              flush=True)
+        pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
+        started[role] = pane_id
+        tabs_of[role] = tab_id
+        used[role] = spec.describe() or "CLI 默认模型"
+        print(f"[{now()}]   pane={pane_id} tab={tab_id}")
+
+    # 角色章程：PM 先收到（它是入口），再 TL，最后 dev
+    #
+    # **章程后面必须附一段「现状自检」。** 只投章程的话，重启起来的 agent 是孤儿：
+    # 它不知道这个项目进行到哪、自己欠什么、上一个自己做到哪。只有章程，它会
+    # 从零开始问「所以现在要做什么」—— 而答案就在 .xteam/ 里，它没被告知去读。
+    # 单个 pane 崩了再 `up` 补起时最容易出这个孤儿。
+    for role in ("pm", "tl", "dev"):
+        if role not in started:
+            continue
+        charter = (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
+        brief = _handover_brief(root, proto, role)
+        intro = (
+            f"你刚被拉起，加入 {label} 项目的三 pane 协作（pm / tl / dev）。\n"
+            f"项目根目录：{root}\n\n"
+            f"## 第一件事：自检，不要先开口问\n"
+            f"下面是你这个角色的现状。**先按它接手，不要问「所以现在做什么」** ——\n"
+            f"答案就在这里，读完直接干活；确实有歧义再问。\n\n"
+            f"{brief}\n\n"
+            f"## 角色章程\n{charter}\n\n"
+            f"接手后第一句应该是**陈述你接下来要做的那件事**，不是提问。"
+        )
+        result = herdr.send_initial_prompt(started[role], intro, wait_s=15)
+        print(f"[{now()}] 章程+现状已投 {role}：{result}")
+
+    # 记下投进 pane 的是哪一版章程/协议，之后 status 才能提醒「改了没生效」
+    save_rules_state(root, rules_fingerprint(
+        ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+
+    state = {
+        "workspace": label,
+        "workspace_id": ws_id,
+        "project": str(root),
+        "panes": started,
+        "tabs": tabs_of,
+        "agents": used,
+        "started_at": now(),
+        "started_at_utc": now_utc(),
+    }
+    (proto.dir / "session.json").write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # 把这次实际用的 agent/model 落成项目配置，下次 up 直接复用。
+    # 只在有非默认项时写，避免在项目里留一个全是默认值的空配置。
+    team_path = proto.dir / "team.json"
+    chosen = {
+        role: {"kind": specs[role].kind, **({"model": specs[role].model}
+                                           if specs[role].model else {})}
+        for role in started
+        if specs[role].model or specs[role].kind != ROLES[role][0]
+    }
+    if chosen:
+        merged = dict(chosen)
+        if team_path.exists():
+            try:
+                merged = {**(json.loads(team_path.read_text(encoding="utf-8"))
+                            .get("roles") or {}), **chosen}
+            except (OSError, json.JSONDecodeError):
+                pass
+        write_json(team_path, {"roles": merged, "_updated": now()}, indent=2)
+        print(f"  已写入 .xteam/team.json（下次 up 自动沿用）")
+
+    print(f"\n[{now()}] 启动完成。角色：{', '.join(started)}")
+    for role, agent in used.items():
+        print(f"  {role:<6} → {agent}")
+    print(f"  看状态：xteam status    门铃：xteam say <role> \"...\"")
+    if args.watch:
+        print(f"[{now()}] 拉起巡检 …")
+        # workspace 必须一起传：cmd_watch 靠它定位 pidfile 和给子进程拼参数，
+        # 漏了会 AttributeError，表现为「拉起巡检」后什么都没起来。
+        return cmd_watch(argparse.Namespace(action="start", project=str(root),
+                                             workspace=label))
+    return 0
+
+
+# ---------------------------------------------------------------- say
+
+
+def cmd_say(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        die(f"找不到 workspace {label!r}")
+    role_map = herdr.role_map(ws["workspace_id"])
+    if args.role not in role_map:
+        die(
+            f"workspace {label!r} 里没有角色 {args.role!r}。"
+            f"现有：{sorted(role_map) or '（无）'}"
+        )
+    pane = role_map[args.role]["pane_id"]
+    # 把对方最近的 recap 附在门铃里：上下文被清空后，它靠这个想起自己做过什么。
+    # 只带 tail——recap 可能很长，全塞进去会把门铃变成噪音。
+    recap = latest_recap(root, args.role)
+    if recap:
+        tail = recap.strip().splitlines()[-8:]
+        head = "（你上次的 recap 摘要）\n" + "\n".join(tail) + "\n\n"
+    else:
+        head = ""
+    status = herdr.doorbell(pane, head + args.message, wait_s=args.settle)
+    log_event(proto.dir / "watch" / "doorbell.log", f"-> {args.role}: {args.message[:80]}")
+    # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
+    # 「刚才那声门铃到底有没有把它叫醒、什么时候叫的」。
+    print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
+    if status.startswith(("prompt-failed", "enter-failed")):
+        print("  ⚠ 投递失败，角色可能不可达（pane 崩了 / 停在审批 UI）", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- status
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    proto = Protocol(root)
+    # 章程/协议改了但没投给正在跑的 pane —— 主动提示，别让人自己想起来 sync
+    stale = stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md")
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        # 这不是错误，是「还没开工」。原来直接 die，看着像故障；
+        # 实际上最可能的情况就是用户还没 up 过。
+        print(f"[{now()}] 项目 {label!r} 还没有在跑的 workspace。")
+        print(f"  开跑：xteam --project {root} up . --watch")
+        print(f"  看协议层现状（不需要 workspace）：xteam --project {root} projects")
+        return 1
+    role_map = herdr.role_map(ws["workspace_id"])
+    if not role_map:
+        # **workspace 在 ≠ 在跑。** down 之后 workspace 是保留的，所以
+        # 「workspace 存在但没有 agent」是正常状态（pane 已关），
+        # 报成错误会让人以为出了故障。
+        print(f"[{now()}] workspace {args.workspace!r} 在，但**没有 agent 在跑**"
+              f"（pane 已关，workspace 保留着）。")
+        proto = Protocol(root)
+        opens = [t.name for t in proto.slice_order(proto.open_tasks())]
+        print(f"  未闭合切片：{'、'.join(opens) or '（无）'}")
+        print(f"  重新开跑（复用这个 workspace）：xteam --project {root} up . --watch")
+        return 1
+
+    debts = proto.obligations()
+    rows = []
+    for role in BOOT_ORDER:
+        agent = role_map.get(role)
+        if not agent:
+            continue
+        status = agent.get("agent_status", "unknown")
+        pending = debts.get(role, [])
+        if pending:
+            owes = pending[0][1]
+            where = f"{pending[0][0]}" + (f" +{len(pending)-1}" if len(pending) > 1 else "")
+        else:
+            owes, where = "none", ""
+        rows.append((role, ROLES[role][1], status, owes, where, agent.get("pane_id", "")))
+
+    # 读巡检的持久状态：它记着每个角色「当前状态从何时开始」「最后一次活动在何时」。
+    # 这两个时刻比「idle 了多久」更有用——用户要判断的正是 idle/ready 发生在几点。
+    tracker = IdleTracker(proto.dir / "watch" / "idle.state")
+    stamp_now = int(time.time())
+    for row in rows:
+        tracker.observe(row[0], row[2], role_map[row[0]].get("state_change_seq"))
+
+    width = max(len(r[0]) for r in rows)
+    print(f"xteam status  {now()}   workspace={args.workspace!r} ({ws['workspace_id']})")
+    print(f"project={root}\n")
+    if stale:
+        print(f"  ⚠ 规则改了但正在跑的 pane 还是旧的：{'、'.join(sorted(stale))}"
+              f" —— 跑 xteam sync 让它生效")
+    print(f"{'role'.ljust(width)}  {'状态':<8}  {'持续':<8}  {'起始于':<14}  {'最后活动':<14}  义务 / 在哪")
+    print("-" * (width + 74))
+    for role, cn, status, owes, where, pane in rows:
+        if tracker.is_fake_working(role):
+            status = "假working"       # 声称在干活但 seq 停滞
+        held = fmt_duration(stamp_now - tracker.state_since(role))
+        since_at = fmt_epoch(tracker.state_since(role))
+        active_at = fmt_epoch(tracker.last_active_at(role))
+        tail = f"{owes} {where}".rstrip()
+        print(f"{role.ljust(width)}  {status:<8}  {held:<8}  {since_at:<14}  {active_at:<14}  {tail}")
+
+    idle_hits = []
+    for role, cn, status, owes, where, pane in rows:
+        if status in ("working", "blocked"):
+            continue
+        if owes != "none":
+            idle_hits.append((role, status, owes, where,
+                              fmt_epoch(tracker.state_since(role))))
+    if idle_hits:
+        print("\n⚠ 该动没动：")
+        for role, status, owes, where, since_at in idle_hits:
+            print(f"   {role} ({status} 自 {since_at}) 欠 {owes} @ {where}")
+            print(f"      → xteam say {role} \"{OBLIGATIONS.get(owes, '')}\"")
+    else:
+        print("\n✓ 无欠账角色。真 idle 且 owes:none 是合法终态（做完了在等下一项）。")
+
+    queue = proto.dir / "QUEUE.md"
+    if queue.exists():
+        pending_n, total_n = proto.queue_counts()
+        print(f"\n队列：{pending_n} 项未完成 / 共 {total_n} 项")
+    open_tasks = proto.slice_order(proto.open_tasks())
+    if open_tasks:
+        print(f"未闭合切片：{', '.join(t.name for t in open_tasks)}")
+
+        # 依赖状态：等前置的切片看起来和「卡住」一模一样，必须单独讲清。
+        cycles = proto.dep_cycles()
+        for c in cycles:
+            print(f"  ⚠ 依赖成环：{' → '.join(c)}（这些切片永远排不上队）")
+        waiting_deps = {t.name: proto.deps_blocking(t)
+                        for t in open_tasks if proto.deps_blocking(t)}
+        if waiting_deps:
+            print("  等前置（不是卡住）："
+                  + "  ".join(f"{k}←{'/'.join(v)}" for k, v in waiting_deps.items()))
+        for t in open_tasks:
+            miss = proto.missing_deps(t)
+            if miss:
+                print(f"  ⚠ {t.name} 的 depends_on 指向不存在的切片：{'、'.join(miss)}"
+                      f"（拼错了，不是排队）")
+        cmiss = {t.name: proto.contracts_missing(t)
+                 for t in open_tasks if proto.contracts_missing(t)}
+        if cmiss:
+            print("  ⚠ 声明了契约却还没建文件："
+                  + "  ".join(f"{k}→{'/'.join(v)}" for k, v in cmiss.items()))
+    return 0
+
+
+# ---------------------------------------------------------------- watch
+
+
+def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> None:
+    proto = Protocol(root)
+    proto.ensure()
+    label = _read_label(root)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        log_event(logf, "MISSING-WORKSPACE 找不到 workspace，巡检暂停")
+        return
+    role_map = herdr.role_map(ws["workspace_id"])
+    debts = proto.obligations()
+    # 「本来该有哪些角色」以 session.json 为准，而不是「BOOT_ORDER 全都算」。
+    # up 起了哪几个，巡检就只盯哪几个。
+    expected = set(BOOT_ORDER[:3])
+    session_file = root / XTEAM_DIRNAME / "session.json"
+    if session_file.exists():
+        try:
+            expected = set(json.loads(session_file.read_text(encoding="utf-8"))
+                           .get("panes") or expected)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 每轮都落一行采样，哪怕什么都没发生。理由：只有「出事才写日志」的话，
+    # 「巡检到底还在不在跑」和「巡检已死」在日志里长得一模一样。
+    samples = []
+    for role in BOOT_ORDER:
+        agent = role_map.get(role)
+        if not agent:
+            # 只报「本来该在、现在没了」的 pane。reviewer 默认不启动，把它算成
+            # MISSING 会让日志天天报一个没人打算起的角色——真出问题时这条
+            # 告警就没说服力了。「该不该起」由 session.json 记录。
+            if role in expected:
+                missing_for = tracker.mark_missing(role)
+                if missing_for == 1:
+                    log_event(logf,
+                              f"MISSING {role} 不在 agent list——pane 可能已退出或崩溃")
+                samples.append(f"{role}=MISSING({fmt_duration(missing_for)})")
+            else:
+                samples.append(f"{role}=未启用")
+            continue
+        tracker.clear_missing(role)
+        status = agent.get("agent_status", "unknown")
+        idle = tracker.observe(role, status, agent.get("state_change_seq"))
+        pending = debts.get(role, [])
+        owes = pending[0][1] if pending else "none"
+        task = pending[0][0] if pending else "-"
+        pane = agent["pane_id"]
+        samples.append(
+            f"{role}={status}/{fmt_duration(idle)}@{fmt_epoch(tracker.state_since(role))}"
+            f"/owes={owes}"
+        )
+
+        # blocked = agent 停在选项/提问 UI 上。这不是「在干活」，是整条链的断点。
+        # 巡检直接替它按推荐项作答（用户 2026-10-01 定的规则：遇选择题默认选推荐项
+        # 继续执行，不要为已经有答案的问题打断整条链）。破坏性操作不在此列——
+        # 那种由 PM 写 blocked.json 走 pm-response，巡检不代答。
+        if status == "blocked":
+            if tracker.alerted(role) != "answered":
+                picked = _answer_choice(root, role, proto)
+                log_event(logf,
+                          f"BLOCKED-ANSWER {role} idle={fmt_duration(idle)} → {picked}")
+                outcome = blocked_answer_outcome(picked)
+                if outcome["mark_answered"]:
+                    tracker.set_alerted(role, "answered")
+                elif outcome["needs_escalation"]:
+                    # 解析不出选项 / 投递失败 —— 不能静默停放。接到既有升级机制：
+                    # 记 NEEDS-HUMAN + 写带 WAITING 的时间线 + 响通知，且按
+                    # HUMAN_ESCALATE_REPEAT_SECS 周期重提醒（不是一次性）。
+                    if int(time.time()) - int(
+                            tracker.state.get(role, {}).get("escalated_at", 0)
+                    ) >= HUMAN_ESCALATE_REPEAT_SECS:
+                        escalate_to_human(root, herdr, role, task, owes, idle, logf)
+                        tracker.state.setdefault(role, {})["escalated_at"] = int(time.time())
+            continue
+        if status == "working":
+            # 假 working：声称在干活但 seq 不推进。原判据在这里直接跳过，
+            # 导致 PM 卡 9 分钟无人知晓。现在按停滞时长告警。
+            if idle >= STUCK_WORKING_SECS and tracker.alert_level(role) < 1:
+                msg = (f"【巡检】你已连续 {fmt_duration(idle)} 处于 working 状态，"
+                       f"但没有任何状态推进（state_change_seq 不变）——"
+                       f"你可能卡住了。若在等人类请 stamp --waiting；"
+                       f"否则请说明卡在哪一步。")
+                result = herdr.doorbell(pane, msg, wait_s=5)
+                log_event(logf, f"STUCK {role} working-no-progress "
+                                f"{fmt_duration(idle)} -> {result}")
+                tracker.set_alerted(role, 1)
+            continue
+        if owes == "none":
+            continue
+        if idle < IDLE_ALERT_SECS:
+            continue
+
+        level = tracker.alerted(role)
+        if isinstance(level, int) and level >= 2:
+            # **阶梯用完不等于放弃。** 原来这里直接 continue，导致：PM 被催两次
+            # 仍不响应 → 全队唯一的解阻塞人退出 → 整条链死得比 apartment 还彻底
+            # （apartment 至少还有 obs-pane 在旁边）。真实故障就是这类静默卡死。
+            # 现在升级到人类：记 NEEDS-HUMAN 事件 + 周期重提醒，直到有人接手。
+            if int(time.time()) - int(tracker.state.get(role, {}).get("escalated_at", 0)) \
+                    >= HUMAN_ESCALATE_REPEAT_SECS:
+                escalate_to_human(root, herdr, role, task, owes, idle, logf)
+                tracker.state.setdefault(role, {})["escalated_at"] = int(time.time())
+                tracker.flush()
+            continue
+
+        # 声明「在等你拍板」的角色不催：等人类是合法状态，不是卡死。
+        # 但要留痕——否则「被免打扰」和「没人管」在日志里长得一样。
+        waiting, wait_age, flag = _waiting_on_human(
+            root, role, WAITING_GRACE_SECS)
+        if waiting:
+            if tracker.alerted(role) != "suppressed":
+                log_event(logf,
+                          f"SUPPRESSED {role} idle={fmt_duration(idle)} owes={owes} "
+                          f"waiting_age={fmt_duration(wait_age)} flag={flag}")
+                tracker.set_alerted(role, "suppressed")
+            continue
+        if tracker.alerted(role) == "suppressed":
+            # 免打扰已过期或角色恢复活动，重新允许正常告警阶梯
+            tracker.set_alerted(role, 0)
+        if tracker.alert_level(role) == 0:
+            msg = (
+                f"【巡检】你已 idle {idle}s，而协议显示你欠着：{owes}（{task}）。"
+                f"{OBLIGATIONS.get(owes,'')}"
+            )
+            # 门禁前先说清影响面：改共享契约项目（api 之类）会让下游失效，
+            # PM 判 PASS 前得知道要通知谁，而不是等前端默默坏掉。
+            msg += _downstream_note(root, task)
+            # 第三方评审（when=always/risky 时）：在催 PM 判门禁**之前**先把
+            # 独立冷读意见准备好。放这里是因为门禁是唯一「一次判断定生死」的
+            # 关口，也是外部视角唯一能增值的时刻。
+            # 每个切片只跑一次（落过 external-review.md 就不重复），否则巡检
+            # 每轮都调一次外部 agent，钱和延迟都白花。
+            if role == "pm" and owes == "gate" and not review_path(task).exists():
+                want, why = qa_should_run(root, task)
+                if want:
+                    cfg = None
+                    try:
+                        cfg = QaConfig(root).load()
+                    except QaAgentRejected as exc:
+                        # qa.json 配错不该让巡检崩，也不该悄悄跳过 —— 说出来，
+                        # 否则 PM 会以为「没有第三方意见」是因为没人发现问题。
+                        log_event(logf, f"QA skip task={task} {exc}")
+                        msg += f"\n\n【第三方评审未跑】qa.json 的 agent 配置有问题：{exc}"
+                if want and cfg is not None:
+                    log_event(logf, f"QA start task={task} reason={why}")
+                    print(f"[{now()}] 第三方评审 {task.name}（{why}）…", flush=True)
+                    ok, note = run_external_review(root, task, cfg)
+                    log_event(logf, f"QA {'ok' if ok else 'fail'} task={task} {note[:160]}")
+                    if ok:
+                        msg += ("\n\n【第三方评审已附上】"
+                                + review_digest(task, limit=600))
+                    else:
+                        # 外部工具挂了不该让门禁停摆，只提示 PM 这视角没有
+                        msg += f"\n\n（第三方评审没跑成：{note[:120]}——照常判）"
+            result = herdr.doorbell(pane, msg, wait_s=5)
+            log_event(logf, f"ALERT {role} idle={idle}s owes={owes} task={task} → {result}")
+            tracker.set_alerted(role, 1)
+        elif idle >= IDLE_ESCALATE_SECS:
+            msg = (
+                f"【巡检升级】idle {idle}s 且仍欠 {owes}（{task}）——可能卡死。"
+                f"回一句状态，或报告你卡在哪一步。"
+            )
+            result = herdr.doorbell(pane, msg, wait_s=5)
+            log_event(logf, f"ESCALATE {role} idle={idle}s owes={owes} → {result}")
+            tracker.set_alerted(role, 2)
+
+    try:
+        proto.write_index()          # 单文件快照，别让人挨个翻 task 目录
+    except OSError:
+        pass
+    _maybe_request_recap(root, herdr, role_map, tracker, logf)
+    log_event(logf, "SAMPLE " + "  ".join(samples))
+
+
+# 一个切片做完后 context 就该瘦身：让 agent 自己写 recap 存档，再由新任务带上它。
+# 不用 `/compact`——实测 opencode 的斜杠命令里没有它（只有 /review /update），
+# devin 也没有对应 flag。agent 自己写摘要反而更可靠：文件可被 PM 检索、跨会话存活、
+# 出问题能回看它当时是怎么想的。
+RECAP_HIGH_PCT = 60          # 超过这个占用就催 recap
+SLICE_JUST_CLOSED = "closed"
+
+
+def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path) -> None:
+    """切片刚闭合、或 context 偏高时，向**真正参与了那个切片**的角色要一份 recap。
+
+    三处改动，都是冲着「省 token + 别再坏」去的：
+
+    1. **路径修正**：原来提示里写 `.pm/memory/...`，而代码读 `.xteam/memory/...`
+       —— `.pm` 是改名前的残留，于是每份 recap 都写进了黑洞，
+       `latest_recap()` 永远读不到，handover 里注入的「别人的 recap」一直是空的。
+    2. **不再动 `alerted`**：原来用 `set_alerted(role, "recap")` 记账，污染了
+       0/1/2 的告警阶梯，最严重的一处是 `alerted < 1` 抛 TypeError 而那行在
+       working 分支里 —— agent 转 working 后巡检直接崩。改用独立的
+       `recap_asked` 字段。
+    3. **按需 + 限长**：原先任何切片闭合都让三个角色各写一份结构化长文档。
+       现在只问在这个切片里**留下过工件**的角色，并明确要求 15 行内、覆盖写。
+    """
+    proto = Protocol(root)
+    mem = proto.dir / "memory"
+    for role, agent in role_map.items():
+        if role not in ("pm", "tl", "dev"):
+            continue
+        pane = agent["pane_id"]
+        if agent.get("agent_status") == "working":
+            continue                       # 别打断正在干活的
+        try:
+            text = herdr.read_pane(pane, 10)
+        except Exception:                  # noqa: BLE001
+            continue
+        pct = parse_context_pct(text)
+
+        # **冷却在最前面，涵盖所有触发原因。**
+        # 之前冷却只挂在 context 分支上，而记账有两种写法：切片分支写切片名、
+        # context 分支写空串。于是 context 触发过一次后，记账是 ""，
+        # 下一轮切片分支的判据「recap_asked_for == 切片名」永远不成立 → 又命中，
+        # 而此时 need 已是 True、挂在其后的冷却根本没被检查 —— **每 60 秒问一遍，
+        # 跑一夜就是几百次**（用户实测 696 次）。两个分支各修各的堵不住，
+        # 因为记账格式和判据格式本来就对不上；统一在入口拦才对。
+        if tracker.recap_asked_ago(role) < RECAP_CONTEXT_COOLDOWN:
+            continue
+
+        # 刚闭合的切片：只问真正参与过的角色，且每个切片只问一次
+        need, why = False, ""
+        for t in proto.all_tasks():
+            if not (t / "closed.md").exists():
+                continue
+            if role not in roles_touched_task(t):
+                continue                    # 没参与就别凭空编一段
+            if tracker.recap_asked_for(role) == t.name:
+                continue                    # 这个切片已经问过了
+            need, why = True, f"切片 {t.name} 闭合"
+            break
+        if not need and pct is not None and pct >= RECAP_HIGH_PCT:
+            need, why = True, f"context {pct}% 偏高"
+
+        if not need:
+            continue
+        mem.mkdir(parents=True, exist_ok=True)
+        target = mem / f"{role}-recap.md"
+        msg = (
+            f"【收尾】请写一份 recap 到 {target}（**覆盖写，不要追加**）。\n"
+            f"原因：{why}。这份文件跨会话保留，之后给你派活或换人时会带上它。\n"
+            f"只要 15 行以内，四行小标题即可：\n"
+            f"  ## 做完什么\n  ## 验证结果（实测命令 + 数字）\n"
+            f"  ## 关键决定与理由\n  ## 下一步 / 遗留\n"
+            f"写完就停下，别展开叙述 —— 它是给下一个接手的人扫一眼用的，不是作文。"
+        )
+        if pct:
+            msg += f"（当前 context {pct}%）"
+        result = herdr.doorbell(pane, msg, wait_s=5)
+        log_event(logf, f"RECAP-ASK {role} reason={why} -> {result}")
+        tracker.set_recap_asked(role, why.split()[1] if why.startswith("切片") else "")
+
+
+# 注入别人 recap 时的最大字符数。够看清「做到哪、下一步是什么」就行。
+RECAP_INJECT_CHARS = 600
+
+RECOMMEND_WORDS = ("推荐", "建议", "默认", "prefer", "recommend", "default")
+
+
+def _parse_options(tail: str) -> list[dict]:
+    """从 pane 尾部文本里解析选项列表。
+
+    认两种常见写法：
+      1) `1. 退租切片（推荐）`        —— 编号 + 文字
+      2) `> 1. 退租切片` / `▸ 1. …`  —— TUI 高亮的那一项
+    识别不出就返回空列表——宁可不动，也不要对看不懂的界面乱按。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for line in tail.splitlines():
+        text = line.strip().lstrip("│┃ ").strip()
+        m = re.match(r"^[>▸▶❯›»⯈*\-•✓\s]*(\d+)[.、)]\s*(.+)$", text)
+        if not m:
+            continue
+        body = m.group(2).strip()
+        if len(body) < 2 or body in seen:
+            continue
+        # 选项后面常跟状态字样（「(推荐)」「[Recommended]」），判断推荐时要用它
+        label = re.sub(r"[（(\[【].{0,12}?[)）\]】]\s*$", "", body).strip() or body
+        seen.add(body)
+        out.append({
+            "text": label,
+            "recommended": any(w in body.lower() for w in RECOMMEND_WORDS),
+        })
+    return out
+
+
+def blocked_answer_outcome(picked: str) -> dict:
+    """把 `_answer_choice` 的返回文案判成「是否算已答」/「是否需要升级」。
+
+    **纯函数**：只依赖入参，不碰 herdr，故可被单测直接断言。
+
+    契约：**成功**返回以 "... → 已提交" 收尾（见 `_answer_choice` 的
+    `return f"选了「{...}」→ 已提交，agent 恢复 working"`）。
+    ⚠️ 不能用「以『选了』开头」判定——**投递失败**的文案也是
+    `f"选了「{...}」但投递失败：{err}"`，同样以「选了」开头，却**没有送出去**。
+    用「已提交」这个成功专属标记，才能把失败如实判为失败。
+    """
+    if "已提交" in picked:
+        return {"mark_answered": True, "needs_escalation": False}
+    # 权限请求要人工确认 = 该升级，不是「没答上就算了」
+    if "需人工确认" in picked:
+        return {"mark_answered": False, "needs_escalation": True}
+    # 认出来了但不敢动（认不出对象 / 认不出肯定选项）—— 同样要升级，
+    # 否则巡检会一直重复尝试，而没人知道它卡在权限框上
+    if "权限框未自动处理" in picked:
+        return {"mark_answered": False, "needs_escalation": True}
+    return {"mark_answered": False, "needs_escalation": True}
+
+
+# ---------------------------------------------------------------- 权限弹窗
+#
+# agent 干活时常停在「要授权吗」的框上（写 /tmp、跑测试、开端口），
+# 不答就整条链停摆。但**无条件自动 yes 等于给任意代码发通行证** ——
+# `rm -rf`、`git push --force`、`sudo` 同样会弹框。
+#
+# 所以是白名单 + 黑名单双重判定：
+#   · 请求的是**开发范围内的路径**（临时目录、构建缓存、项目内）→ 自动放行
+#   · 命令命中**不可逆操作** → 永不自动，升级给人
+#   · 认不出来 → 不动，保留现场（宁可卡住也不乱按）
+
+# 命中就永不自动放行 —— 先判这个，所以它比 allow_paths 优先。
+NEVER_AUTO = (
+    "rm -rf", "rm -fr", "mkfs", "dd if=", "shutdown", "reboot",
+    "git push --force", "git push -f", "git reset --hard", "git clean -fd",
+    "sudo", "doas", "chmod -R 777", "chown -R",
+    "drop table", "drop database", "truncate table", "delete from",
+    "kubectl delete", "terraform destroy", "aws s3 rm", "docker system prune",
+    "brew uninstall", "npm publish",
+)
+
+# 可以自动放行的路径前缀。**临时目录排第一** —— 它是开发里最常被问、
+# 又最不可能造成破坏的地方（重启就没了）。
+ALLOW_PATHS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp",
+               "/var/folders/", "/dev/null", "/dev/stdout", "/dev/stderr")
+
+# 识别「这是个权限/授权框」的关键词。宁可多认（认不出就不动）也不要漏认。
+PERMISSION_MARKERS = (
+    "do you want to", "would you like to", "permission to",
+    "allow ", "authorize", "grant", "需要授权", "是否允许", "允许", "要授权",
+)
+
+# 肯定回答的说法。不同 CLI 措辞不一样，都收。
+YES_WORDS = ("yes", "allow", "allow once", "always allow", "proceed",
+             "continue", "y", "是", "允许", "继续", "好")
+
+
+def detect_permission_prompt(tail: str) -> dict:
+    """判断 pane 尾部是不是权限/授权框。返回 {is_permission, subject}。
+
+    `subject` 是被请求的东西（路径或命令片段），用来做白/黑名单判定 ——
+    认不出 subject 时返回空串，调用方就**不该自动放行**。
+    """
+    low = tail.lower()
+    if not any(m in low for m in PERMISSION_MARKERS):
+        return {"is_permission": False, "subject": "", "command": "",
+                "path": ""}
+    # **命令优先于路径**，而且两者都带出去。实测踩过：只取路径时
+    # 「Allow `rm -rf /tmp/x`」被当成「要写 /tmp」而放行了 —— 那正是
+    # 本该拦住的那一条。带引号的命令比裸路径危险，必须一起判黑名单。
+    command = ""
+    m = re.search(r"[`\"']([^`\"']{3,120})[`\"']", tail)
+    if m:
+        command = m.group(1)
+    path = ""
+    m = re.search(r"(/[A-Za-z0-9._/@+-]{2,}(?:/[A-Za-z0-9._/@+-]*)*)", tail)
+    if m:
+        path = m.group(1)
+    return {"is_permission": True,
+            "subject": command or path, "command": command, "path": path}
+
+
+def permission_verdict(subject: str, project: str = "",
+                       extra_allow: tuple = (), command: str = "") -> str:
+    """该自动放行吗？返回 allow / deny / unknown。**纯函数**，可单测。
+
+    `command` 与 `subject` **都要过黑名单**：`rm -rf /tmp/x` 的 subject 是
+    /tmp/x（在允许范围内），但 command 才是要拦的那条。只看一个就会漏。
+    """
+    parts = [x for x in (subject, command) if x]
+    if not parts:
+        return "unknown"
+    for part in parts:
+        low = part.lower()
+        for bad in NEVER_AUTO:
+            if bad in low:
+                return "deny"             # 不可逆操作，永不自动
+    # **不能用 startswith 做目录边界判断。** 它只是字符串前缀匹配，于是：
+    #   /tmp/../Users/admin/.ssh/authorized_keys  -> 前缀 /tmp 命中，实际在 ~/.ssh
+    #   /tmp2/secret                              -> 前缀 /tmp 命中，实际是另一个目录
+    #   /repo-evil/file                            -> 前缀 /repo 命中，同上
+    # 这三种都会被自动放行，等于让巡检替 agent 确认项目外的文件操作。
+    #
+    # 正确做法：先 resolve()（消掉 .. 和符号链接，得到**真实**路径），再用
+    # relative_to() 判断是否真的在允许目录**内**。relative_to 抛 ValueError
+    # 就是「不在内」，这正是我们要的语义。
+    target = subject.strip()
+    if not target.startswith("/"):
+        return "unknown"          # 相对路径无法在没有 cwd 的情况下判边界
+    try:
+        real = Path(target).resolve()
+    except (OSError, RuntimeError):
+        return "unknown"          # 解析不了（死循环链接等）-> 交给人
+    allow = [Path(x) for x in (list(ALLOW_PATHS) + list(extra_allow)
+                               + ([project] if project else []))]
+    for pref in allow:
+        try:
+            base = pref.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if real == base:
+            return "allow"
+        # is_relative_to 在 3.9 没有，用 relative_to 的异常表达同一件事。
+        try:
+            real.relative_to(base)
+            return "allow"
+        except ValueError:
+            continue
+    return "unknown"
+
+
+def pick_permission_answer(tail: str, project: str = "",
+                           extra_allow: tuple = ()) -> dict:
+    """权限框 → 该按哪个选项。纯函数，不碰 herdr。"""
+    det = detect_permission_prompt(tail)
+    if not det["is_permission"]:
+        return {"act": "none", "why": "不是权限框"}
+    verdict = permission_verdict(det["subject"], project, extra_allow,
+                                det.get("command", ""))
+    if verdict == "deny":
+        return {"act": "deny",
+                "why": f"命中不可逆操作，拒绝自动放行：{det['subject'][:60]}"}
+    if verdict == "unknown":
+        return {"act": "none",
+                "why": "认不出请求对象或不在允许范围，不自动放行："
+                       + (det["subject"][:60] or "(空)")}
+    opts = _parse_options(tail)
+    yes = next((o for o in opts
+                if any(o["text"].strip().lower() == w
+                       or o["text"].strip().lower().startswith(w + " ")
+                       for w in YES_WORDS)), None)
+    if not yes:
+        return {"act": "none", "why": "认不出肯定选项，不自动放行："}
+    # 「always allow」优先 —— 一次授权管到底，省得反复弹
+    always = next((o for o in opts if "always" in o["text"].lower()), None)
+    pick = always or yes
+    return {"act": "allow", "text": pick["text"],
+            "why": f"{det['subject'][:60]} 属于开发范围内"}
+
+
+def _answer_choice(root: Path, role: str, proto: Protocol) -> str:
+    """agent 停在选择题上时，按「推荐项优先」替它作答。
+
+    **投递通道必须是 `pane send-text` + `pane send-keys enter`，不能用
+    `agent prompt`。** 实测：agent 处于 blocked 时 `agent prompt` 直接被拒
+    （`agent_blocked: requires interactive input`），而 send-text 能把选项打进去、
+    enter 提交，agent 随即从 blocked 转 working。第一次实现就是踩了这个坑——
+    日志写着「代答成功」，实际一条都没送出去。
+
+    只答**选择题**，不代答破坏性操作。删数据、force push、发布这类如果被自动按下，
+    后果不可逆；真需要人类授权的事由 PM 写 blocked.json → pm-response 走协议，
+    巡检看到的是文件不是 UI，不会走到这里。
+    """
+    label = _read_label(root)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        return "无 workspace，未作答"
+    agent = herdr.role_map(ws["workspace_id"]).get(role)
+    if not agent:
+        return f"找不到 {role} 的 pane"
+    pane = agent["pane_id"]
+    try:
+        tail = herdr.read_pane(pane)
+    except Exception as exc:                    # 读不到就只报告，不瞎答
+        return f"读 pane 失败（{type(exc).__name__}），未作答"
+
+    # **先看是不是权限框。** 权限框和选择题的处理完全不同：选择题按推荐项答，
+    # 权限框要按白/黑名单判 —— 对权限框按「第一项」盲答，等于给 rm -rf 发通行证。
+    perm = pick_permission_answer(tail, project=str(root))
+    if perm["act"] == "deny":
+        # 命中不可逆操作：**不代答**，让它继续卡着，由升级链交给人
+        log_timeline(root, role,
+                     f"权限请求被拦下（不自动放行）：{perm['why']}")
+        return f"权限请求需人工确认 —— {perm['why']}"
+    if perm["act"] == "allow":
+        ok, err = herdr.send_choice(pane, perm["text"], settle_s=5)
+        if not ok:
+            return f"权限放行投递失败：{err}"
+        log_timeline(root, role,
+                     f"巡检自动放行权限：{perm['why']} → 选了「{perm['text']}」")
+        return (f"自动放行权限「{perm['text']}」→ 已提交，agent 恢复 working"
+                f"（{perm['why']}）")
+    if perm["act"] == "none" and "不是权限框" not in perm["why"]:
+        # 是权限框但不敢动：说清楚为什么不动，别让日志看着像「什么都没发生」
+        return f"权限框未自动处理：{perm['why']}"
+
+    options = _parse_options(tail)
+    if not options:
+        return "未识别出选项（可能不是选择题），保留现场等 PM 处理"
+
+    chosen = next((o for o in options if o["recommended"]), options[0])
+    ok, err = herdr.send_choice(pane, chosen["text"], settle_s=5)
+    if not ok:
+        # 投递失败就**如实记失败**，不写「已代答」——否则日志会骗人
+        return f"选了「{chosen['text'][:40]}」但投递失败：{err}"
+    log_timeline(root, role, f"巡检代答：选了「{chosen['text'][:40]}」（推荐优先）")
+    return f"选了「{chosen['text'][:40]}」→ 已提交，agent 恢复 working"
+
+
+def escalate_to_human(root: Path, herdr, role: str, task: str, owes: str,
+                      idle: int, logf: Path) -> None:
+    """角色催不动了 —— 升级到人类，绝不静默放弃。
+
+    三件事，缺一不可：
+      1. 大声记事件（人不主动翻日志，就会重演 apartment 那个「卡几小时」）
+      2. 写进时间线并打 WAITING 标记，让它下次上线第一眼看到「这里等你」
+      3. 响 macOS 通知 —— 唯一能真正打断人的通道；失败也不放弃，终端已有输出
+    """
+    log_event(logf, f"NEEDS-HUMAN {role} owes={owes} task={task} "
+                    f"idle={fmt_duration(idle)} 催了两轮无响应")
+    log_timeline(root, role,
+                 f"催了两轮仍不响应，已升级给人类：欠 {owes}（{task}）",
+                 waiting=True, wait_for=f"人类处理 {role} 的 {owes}")
+    title = f"xteam: {role} 卡住了"
+    body = f"{role} 欠 {owes}（{task}），已 idle {fmt_duration(idle)}，催两轮无响应"
+    subprocess.run(["osascript", "-e",
+                    f'display notification "{body}" with title "{title}"'],
+                   capture_output=True, timeout=10)
+    print(f"[{now()}] ⚠ NEEDS-HUMAN: {body}", file=sys.stderr)
+
+
+def _downstream_note(root: Path, task_name: str) -> str:
+    """切片动的是共享契约项目时，补一句「谁受影响」。
+
+    空字符串表示不是共享契约项目、或没有下游 —— 绝大多数情况不产生噪音。
+    """
+    proto = Protocol(root)
+    reg = Registry(root)
+    projects = [proto.project_of(t) for t in proto.all_tasks()
+                if t.name == task_name]
+    impact = reg.downstream_impact([p for p in projects if p])
+    if not impact:
+        return ""
+    return (f"\n⚠ 本切片动的是共享契约项目（{projects[0]}），"
+            f"下游会受影响：{'、'.join(impact)}。"
+            f"判 PASS 前先确认这些消费方是否需要同步适配。")
+
+
+def _waiting_on_human(root: Path, role: str, grace: int) -> tuple[bool, int, str]:
+    """该角色是否声明了「在等人类决策」。
+
+    读时间线里该角色最后一行，末段是 WAITING* 且龄 ≤ grace → 免打扰。
+    免打扰但不静默：仍然记 SUPPRESSED 事件，否则「跳过」和「卡死」在日志里没区别。
+    """
+    path = root / XTEAM_DIRNAME / "watch" / "timeline.log"
+    if not path.exists():
+        return False, 0, ""
+    last = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 2 and parts[1] == role:
+            last = line
+    if not last:
+        return False, 0, ""
+    parts = [p.strip() for p in last.split("|")]
+    flag = parts[-1] if parts else ""
+    if not flag.startswith("WAITING"):
+        return False, 0, ""
+    try:
+        import datetime
+        stamp = datetime.datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, IndexError):
+        return False, 0, flag
+    age = int(time.time() - stamp.timestamp())
+    return age <= grace, age, flag
+
+
+
+def cmd_stamp(args: argparse.Namespace) -> int:
+    """给角色自己的输出打时间戳，并落进共享时间线。
+
+    存在的理由：手写时间戳的可靠性 = 写的人对自己「何时看过表」的记忆。实测漂过。
+    交给脚本就不可能漂，而且三个 pane 的时刻落在同一条时间线里，可以直接排出
+    「谁在什么时候把活交给了谁」。
+    """
+    root = Path(args.project).resolve()
+    role = args.role or _detect_role()
+    if not role:
+        die(f"推断不出角色（不在 xteam 起的 pane 里？）。显式传：xteam stamp <role> \"摘要\"")
+    if role not in ROLES:
+        die(f"未知角色 {role!r}，可选：{', '.join(ROLES)}")
+    line = log_timeline(root, role, args.summary, waiting=args.waiting,
+                        wait_for=args.wait_for)
+    if role in ("tl", "dev"):
+        # 阻塞是**升级链的起点**：谁问的、问什么、经谁的手，都要有结构化留痕。
+        # apartment 的教训是「dev 提了阻塞，没人看见，卡几小时」——留痕是第一步。
+        record_escalation(root, role, args.summary)
+    if not args.quiet:
+        print(f"[{now()}] {role}  {line}")
+    return 0
+
+
+def record_escalation(root: Path, role: str, question: str) -> None:
+    """把一次阻塞登记进 .xteam 的升级链索引。
+
+    链的形态：tl/dev 提出 → pm 回应 → （必要时）人类接手。
+    每一步都由不同角色追加一行，所以事后能回答「这个问题最终是谁解决的、
+    中间卡了多久」——apartment 那次就是因为没有任何链可查，才没人知道有人提过。
+    """
+    path = root / XTEAM_DIRNAME / "escalations.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import time as _t
+    row = {"ts": now(), "epoch": int(_t.time()), "by": role,
+           "question": question.replace("\n", " ")[:300],
+           "task": _active_task(root)}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _active_task(root: Path) -> str:
+    """当前有未闭合义务的 task（一般是最新那个），用于给阻塞定位归属。"""
+    debts = Protocol(root).obligations()
+    for r in ("dev", "tl", "pm"):
+        if debts.get(r):
+            return debts[r][0][0]
+    opens = Protocol(root).open_tasks()
+    return opens[-1].name if opens else "-"
+
+
+def log_timeline(root: Path, role: str, summary: str, waiting: bool = False,
+                 wait_for: str = "") -> str:
+    """往 .xteam/watch/timeline.log 追加一行，返回该行内容。"""
+    path = root / XTEAM_DIRNAME / "watch" / "timeline.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parts = [now(), role, summary.replace("\n", " ").replace("|", "/")[:300]]
+    if waiting:
+        parts.append("WAITING" + (f":{wait_for[:80]}" if wait_for else ""))
+    line = " | ".join(parts)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    return line
+
+def _read_label(root: Path) -> str:
+    sf = root / XTEAM_DIRNAME / "session.json"
+    if sf.exists():
+        try:
+            return json.loads(sf.read_text(encoding="utf-8")).get("workspace", root.name)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return root.name
+
+
+def _read_pid(path: Path) -> int:
+    """安全读 pid 文件。**任何异常都当 0（无效）**，绝不向上抛。
+
+    这两个 pid 文件是巡检自己写的，但内容可能为空、被截断、或被人手改过。
+    一个 `int(...)` 裸调就能让 `watch status` 抛 traceback —— 而状态命令的
+    职责恰恰是在巡检出问题时还能给出可操作的输出。
+    """
+    try:
+        return int(path.read_text(encoding="utf-8").strip() or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def _pid_is_ours(pid: int, root: Path) -> bool:
+    """pid 是不是本项目的巡检进程。
+
+    pidfile 可能过期，而 **PID 会被系统复用** —— 对着一个无关进程发 SIGTERM
+    虽然罕见，但后果不可逆。归属判据：命令行里同时出现 xteam 入口和项目标识。
+
+    **项目标识必须同时试多种写法。** 实测踩过：macOS 上 /tmp 是符号链接，
+    `Path(x).resolve()` 得到 /private/tmp/x，而命令行里是用户原样传的 /tmp/x
+    —— 只比对 resolve 后的路径会永远判不符，于是「宁可不杀」变成「永远不杀」，
+    supervisor 反而清不掉。所以 resolved / 原样 / basename 都认。
+
+    三种结果要分清：
+      · 进程不存在        → False（只清文件，不发信号）
+      · 存在但命令行不符  → False（**宁可不杀，也不要误杀**）
+      · ps 不可用/读不出来 → True（退回旧行为，否则巡检会停不掉）
+    """
+    if pid <= 1:
+        return False
+    try:
+        proc = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    out = (proc.stdout or "").strip()
+    if not out:
+        return False                      # 进程没了
+    if "xteam" not in out:
+        return False                      # 连 xteam 都不是，八竿子打不着
+    return any(n and n in out for n in _root_needles(root))
+
+
+def _root_needles(root: Path) -> list[str]:
+    """项目路径的所有可能写法（命令行里出现的可能是其中任意一种）。"""
+    out = [str(root), root.name]
+    try:
+        out.append(str(Path(os.path.realpath(root))))
+    except OSError:
+        pass
+    return [x for x in out if x]
+
+
+def _signal_watchdog(name: str, path: Path, root: Path) -> str:
+    """校验后停一个巡检进程，并清掉 pid 文件。返回一行给人看的说明。"""
+    pid = _read_pid(path)
+    if pid <= 1:
+        if path.exists():
+            print(f"[{now()}] ⚠ {name} 的 pid 文件无效（{path.name}）—— 已清除，"
+                  f"不发信号（pid<=1 在 POSIX 上会命中进程组/init）", file=sys.stderr)
+            path.unlink(missing_ok=True)
+        return ""
+    if not _pid_is_ours(pid, root):
+        print(f"[{now()}] ⚠ {name} pid={pid} 不是本项目的巡检进程"
+              f"（pid 可能已被系统复用）—— 只清文件，不发信号", file=sys.stderr)
+        path.unlink(missing_ok=True)
+        return ""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return f"{name}={pid}"
+    except ProcessLookupError:
+        return ""
+    except PermissionError:
+        print(f"[{now()}] ⚠ 无权停 {name}（pid={pid}）", file=sys.stderr)
+        return ""
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    logf = root / XTEAM_DIRNAME / "watch" / "events.log"
+    pidfile = root / XTEAM_DIRNAME / "watch" / WATCHDOG_PID
+    tracker = IdleTracker(root / XTEAM_DIRNAME / "watch" / "idle.state")
+
+    if args.action == "status":
+        # supervisor 和 run **都要看**：只看 run 的话，run 刚崩的那 3 秒窗口里
+        # 会报「巡检未运行」，而 supervisor 明明活着、马上会把 run 拉起来 ——
+        # 这跟「真的没在跑」在状态输出里长得一模一样，正是最需要说准的时候。
+        watch_dir = root / XTEAM_DIRNAME / "watch"
+        found = []
+        for name, path in (("supervisor", watch_dir / "supervise.pid"),
+                           ("run", pidfile)):
+            pid = _read_pid(path)
+            if pid <= 0:
+                if path.exists():
+                    found.append(f"{name}=pid文件无效")
+                continue
+            found.append(f"{name}=pid {pid}"
+                         f"{'' if _alive(pid) else '（进程不在）'}")
+        if not found:
+            print("巡检未运行")
+            return 1
+        if all("进程不在" in f or "无效" in f for f in found):
+            print("巡检未运行（有残留 pid 文件，已失效）")
+            return 1
+        print(f"[{now()}] 巡检运行中：" + "  ".join(found))
+        if logf.exists():
+            for line in logf.read_text(encoding="utf-8").splitlines()[-5:]:
+                print("  " + line)
+        return 0
+
+
+    if args.action == "stop":
+        # **先杀 supervisor，再杀 run。** 顺序反了的话 supervisor 会在 3 秒内
+        # 把刚杀掉的 run 再拉起来——`down` 之后对着已关闭的 workspace 复活巡检。
+        #
+        # 两个 pid 文件**都要处理**，哪怕只有一个存在：run 崩了但 supervisor 还
+        # 活着时，只看 watch.pid 就会把 supervisor 漏掉，它随后继续重启 run。
+        stopped = []
+        watch_dir = root / XTEAM_DIRNAME / "watch"
+        for name, path in (("supervisor", watch_dir / "supervise.pid"),
+                           ("run", watch_dir / WATCHDOG_PID)):
+            if path.exists():
+                note = _signal_watchdog(name, path, root)
+                if note:
+                    stopped.append(note)
+        time.sleep(0.5)   # 给 SIGTERM 落地时间，否则 supervisor 最后一刻还会 fork
+        print(f"[{now()}] 已停巡检（{', '.join(stopped)}）" if stopped
+              else f"[{now()}] 巡检未运行")
+        return 0
+
+    if args.action == "once":
+        herdr = Herdr(scope=label)
+        _watch_cycle(root, herdr, tracker, logf)
+        print(logf.read_text(encoding="utf-8").splitlines()[-1] if logf.exists() else "(无事件)")
+        return 0
+
+    # `run` 是子进程自己的入口，必须在 start 分支之前拦截。
+    # 漏掉它 → run 落进 start → start 再 fork 一个 run → 无限自我派生、秒退。
+    if args.action == "supervise":
+        return cmd_watch_supervise(args)
+
+    if args.action == "run":
+        return cmd_watch_run(args)
+
+    # start
+    # 一律走 _read_pid：裸 int() 遇到被截断/手改过的 pid 文件会抛 ValueError，
+    # 而「巡检可以自愈」正是这个命令存在的意义 —— 被坏文件挡住启动是本末倒置。
+    # 顺带也查 supervisor：只看 run 的话，run 刚崩的那 3 秒窗口里会重复启动。
+    running = [(n, _read_pid(p)) for n, p in
+               (("supervisor", root / XTEAM_DIRNAME / "watch" / "supervise.pid"),
+                ("run", pidfile))]
+    alive = [(n, pid) for n, pid in running if _alive(pid)]
+    if alive:
+        print("已在运行 " + "  ".join(f"{n} pid={pid}" for n, pid in alive))
+        return 0
+    for n, path in (("supervisor", root / XTEAM_DIRNAME / "watch" / "supervise.pid"),
+                    ("run", pidfile)):
+        if path.exists() and not _alive(_read_pid(path)):
+            print(f"[{now()}] ⚠ {n} 的 pid 文件已失效（内容 {_read_pid(path) or '无效'}）"
+                  f" —— 已清理，继续启动", file=sys.stderr)
+            path.unlink(missing_ok=True)
+
+
+
+    log_event(logf, f"WATCHDOG-STARTED requested pid_to_be={os.getpid()} project={root}")
+    # setsid 脱离当前进程组：工具任务回收时对进程组 SIGKILL 会连坐
+    # （apartment 的看门狗实测活 12min/7min 无痕死亡，两任都是这么死的）
+    child = subprocess.Popen(
+        # 全局参数必须排在子命令**之前**，否则 argparse 直接拒绝 → 子进程秒退。
+        [sys.executable, str(Path(__file__).resolve()), "--project", str(root),
+         "--workspace", label, "watch", "supervise"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pidfile.write_text(str(child.pid))
+    for _ in range(10):
+        time.sleep(0.3)
+        if child.poll() is not None:
+            die("巡检子进程立刻退出，见 .xteam/watch/events.log")
+    log_event(logf, f"WATCHDOG-SPAWNED pid={child.pid}")
+    print(f"巡检已启动 pid={child.pid}")
+    return 0
+
+
+def _alive(pid: int) -> bool:
+    """进程还活着吗。
+
+    **pid <= 1 一律当死。** os.kill(0, 0) 的语义是「发给整个进程组」，
+    os.kill(1, 0) 打的是 init —— 两者都会成功返回，于是任何 pid 文件里的空串
+    都会被判成「还在运行」。这个函数是所有 pid 判断的唯一入口，所以护栏放这里，
+    而不是散在每个调用点前面（漏一处就又是一次「以为在跑其实没跑」）。
+    """
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+
+
+def cmd_watch_run(args: argparse.Namespace) -> int:
+    """巡检主循环。由 `watch start` 以脱离进程组的方式拉起。"""
+    root = Path(args.project).resolve()
+    label = _read_label(root)
+    logf = root / XTEAM_DIRNAME / "watch" / "events.log"
+    tracker = IdleTracker(root / XTEAM_DIRNAME / "watch" / "idle.state")
+    pidfile = root / XTEAM_DIRNAME / "watch" / WATCHDOG_PID
+    pidfile.write_text(str(os.getpid()))
+    log_event(logf, f"WATCHDOG-STARTED pid={os.getpid()} project={root}")
+
+    def bye(signum, _frame):
+        log_event(logf, f"WATCHDOG-EXITED reason=signal{'' if signum != signal.SIGTERM else '=TERM'} pid={os.getpid()}")
+        if pidfile.exists() and pidfile.read_text().strip() == str(os.getpid()):
+            pidfile.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    herdr = Herdr(scope=label)
+    while True:
+        try:
+            _watch_cycle(root, herdr, tracker, logf)
+        except Exception as exc:  # 任何异常都留大声原因，静默退出等于没有机制
+            log_event(logf, f"WATCHDOG-CYCLE-ERROR {type(exc).__name__}: {exc}")
+        time.sleep(60)
+
+
+def cmd_watch_supervise(args: argparse.Namespace) -> int:
+    """巡检守护：盯着 run 进程，死了就拉起来。
+
+    为什么需要：`run` 会被各种意外干掉（工具任务回收时的进程组 SIGKILL、手滑的
+    pkill、机器休眠）。C-33 的教训是「静默退出 = 没有机制」——巡检挂了却没人知道，
+    整条防停摆链就悄悄失效了。这里让它自己复活。
+    """
+    root = Path(args.project).resolve()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    logf = root / XTEAM_DIRNAME / "watch" / "events.log"
+    sup_pid = root / XTEAM_DIRNAME / "watch" / "supervise.pid"
+    sup_pid.write_text(str(os.getpid()))
+    log_event(logf, f"SUPERVISOR-STARTED pid={os.getpid()} project={root}")
+
+    def bye(signum, _frame):
+        log_event(logf, f"SUPERVISOR-EXITED signal={signum} pid={os.getpid()}")
+        if sup_pid.exists() and sup_pid.read_text().strip() == str(os.getpid()):
+            sup_pid.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    cli = str(Path(__file__).resolve())
+    restarts = 0
+    while True:
+        child = subprocess.Popen(
+            [sys.executable, cli, "--project", str(root), "--workspace", label,
+             "watch", "run"],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        # run 的 pid 写进 watch.pid，`watch status/stop` 认它
+        (root / XTEAM_DIRNAME / "watch" / WATCHDOG_PID).write_text(str(child.pid))
+        log_event(logf, f"RUN-SPAWNED pid={child.pid} restart#{restarts}")
+        code = child.wait()
+        log_event(logf, f"RUN-EXITED pid={child.pid} code={code} —— 3s 后拉起")
+        restarts += 1
+        if restarts > 200:            # 疯狂重启说明有系统性问题，停下来让人看
+            log_event(logf, f"SUPERVISOR-GIVING-UP restarts={restarts}")
+            sys.exit(1)
+        time.sleep(3)
+
+
+# ---------------------------------------------------------------- down
+
+
+def _stop_watchdog(root: Path, project: str) -> None:
+    """停掉巡检（supervisor + run），若在跑。workspace 已不存在时也要能做这件事。"""
+    # **不能只看 run 的 pid 活着与否。** run 崩了但 supervisor 还活着时，
+    # 旧写法会因为「watch.pid 没了 / 死了」直接返回，把 supervisor 漏掉 ——
+    # 它随后每 3 秒继续拉起 run，对着已 down 的 workspace 空转。
+    # 判据改成「**任一** pid 文件存在」，校验与终止交给 `watch stop`
+    #（它两个文件都无条件处理，并做归属校验，不误杀被复用的 pid）。
+    watch_dir = root / XTEAM_DIRNAME / "watch"
+    if not any((watch_dir / n).exists()
+               for n in (WATCHDOG_PID, "supervise.pid")):
+        return
+    try:
+        subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                        "--project", str(project), "watch", "stop"],
+                       capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    # **先停巡检，再看 workspace 在不在。** 顺序反了的话：workspace 被外部关掉或
+    # 丢失后，`down` 会因为找不到 workspace 直接返回，把 supervisor 留在那儿——
+    # 它会继续重启 run 并反复记录「workspace 缺失」。这是资源生命周期漏洞。
+    _stop_watchdog(root, args.project)
+    if not ws:
+        print(f"[{now()}] workspace {args.workspace!r} 不存在（巡检已停）")
+        return 0
+    ws_id = ws["workspace_id"]
+    session = _read_json(Protocol(root).dir / "session.json")
+    # **只关角色 tab，不关 workspace。** workspace 是长寿命容器：反复
+    # up/down 会在屏幕上堆一堆同名 workspace，而它们指向同一个项目 ——
+    # 既浪费终端空间，又让人搞不清「我到底在跟哪个说话」。agent 在跑才关 tab。
+    closed: list[str] = []
+    for role, tab in (session.get("tabs") or {}).items():
+        if not tab or not _alive_pane_exists(herdr, ws_id, tab):
+            continue
+        try:
+            herdr.close_tab(tab)
+            closed.append(role)
+        except Exception as exc:                # noqa: BLE001
+            print(f"[{now()}] ⚠ 关 {role} 的 tab 失败：{exc}", file=sys.stderr)
+    _mark_session_ended(root, args.workspace, ws_id, panes_closed=True)
+    _ensure_xteam_readme(root, Protocol(root).dir)
+    print(f"[{now()}] 已关闭 {len(closed)} 个角色 pane"
+          f"（{'、'.join(sorted(closed)) or '无'}）")
+    print(f"  workspace {label!r} ({ws_id}) **保留着** —— 下次 `xteam up .` 直接复用")
+    print(f"  记忆与工件保留在 {Protocol(root).dir}（不删）")
+    print(f"  重新开跑：xteam --project {root} up . --watch")
+    print(f"  连 workspace 一起清：herdr workspace close {ws_id}")
+    return 0
+
+
+def _alive_pane_exists(herdr: Herdr, ws_id: str, tab_id: str) -> bool:
+    """这个 tab 现在还在吗（down 之前可能已被手工关掉或 agent 崩了）。"""
+    try:
+        tabs = herdr._run("tab", "list", "--workspace", ws_id).get("tabs", [])
+    except Exception:                            # noqa: BLE001
+        return False
+    return any(t.get("tab_id") == tab_id for t in tabs)
+
+
+# ---------------------------------------------------------------- cli
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="xteam",
+        description="三 pane 编排器：pm(产品) / tl(团队) / dev(开发)",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--project", default=".", help="项目根目录（默认当前目录）")
+    # 装到多台机器上时，第一个要回答的问题是「这台跑的是哪个构建」——
+    # 版本号 + 提交 + 是装的还是源码运行的，三者齐了才能判断「是不是同一份」。
+    ap.add_argument("-v", "--version", action="store_true",
+                    help="显示版本并退出")
+    ap.add_argument("--workspace", default=None, help="herdr workspace label（默认项目目录名）")
+
+    # 不能 required=True —— 那样 `xteam --version` / `xteam -h` 会先被
+    # 「必须给子命令」拦下，用户根本看不到版本信息。改为缺命令时自己提示。
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("agents", help="列出可编排的 agent 及其模型能力（本机实测）")
+    p.set_defaults(func=cmd_agents)
+
+    p = sub.add_parser("init", help="声明这个仓库的结构（单应用 / 多项目 / 含共享契约层）")
+    p.add_argument("--repo-kind", choices=list(REPO_KINDS), help="非交互声明结构类型")
+    p.add_argument("--projects", help="项目清单，逗号分隔")
+    p.add_argument("--shared-api", help="哪个/哪些是共享契约层，逗号分隔")
+    p.add_argument("--name", help="单应用时给它起的名字（默认目录名）")
+    p.add_argument("--force", action="store_true", help="覆盖已有声明")
+    p.set_defaults(func=cmd_init)
+
+
+    p = sub.add_parser("projects", help="列出治理的项目、依赖关系与各自未闭合的活")
+    p.set_defaults(func=cmd_projects)
+
+    p = sub.add_parser("qa", help="第三方评审：用一个没参与过的 agent 冷读 spec 和 diff")
+    qsub = p.add_subparsers(dest="qa_action", required=True)
+    q = qsub.add_parser("show", help="看当前配置")
+    q.set_defaults(func=cmd_qa)
+    q = qsub.add_parser("set", help="固化配置（agent / model / 何时自动跑）")
+    q.add_argument("--agent", help="用哪个 agent 做第三方评审（已实测：qodercli）")
+    q.add_argument("--model", help="指定模型")
+    q.add_argument("--when", choices=list(QA_WHEN),
+                   help="manual=只手动（默认）/ always=每次门禁前 / risky=高风险切片")
+    q.add_argument("--project", dest="project_names", action="append",
+                   help="when=risky 时额外算高风险的项目，可重复")
+    q.add_argument("--prompt", help="追加给外部 agent 的额外要求")
+    q.add_argument("--timeout", type=int, help="超时秒数（默认 900）")
+    q.set_defaults(func=cmd_qa)
+    q = qsub.add_parser("run", help="对这个切片跑一次第三方评审")
+    q.add_argument("task", nargs="?", help="切片名；不给则用唯一的未闭合切片")
+    q.add_argument("--prompt", help="本次额外的提问要求（不落盘）")
+    q.add_argument("--model", help="本次临时换模型（不落盘）")
+    q.set_defaults(func=cmd_qa)
+    q = qsub.add_parser("clear", help="清除配置，回到默认（手动触发）")
+    q.set_defaults(func=cmd_qa)
+
+    p = sub.add_parser("contracts",
+                       help="管理跨项目 API 契约（一个契约一个文件）")
+    csub = p.add_subparsers(dest="action", required=True)
+    c = csub.add_parser("list", help="列出契约，以及哪些切片引用了它们")
+    c.set_defaults(func=cmd_contracts)
+    c = csub.add_parser("new", help="按 `METHOD /path` 建一个契约骨架")
+    c.add_argument("spec", help='例如 "POST /orders"')
+    c.add_argument("--force", action="store_true", help="覆盖已存在的文件")
+    c.set_defaults(func=cmd_contracts)
+    c = csub.add_parser("log", help="改完契约留痕：追加变更记录 + 写时间线")
+    c.add_argument("name", help="契约文件名，如 \"POST _orders.md\"")
+    c.add_argument("what", help="改了什么")
+    c.add_argument("--who", help="谁改的（默认 human）")
+    c.set_defaults(func=cmd_contracts)
+    c = csub.add_parser("check", help="查依赖环、拼错的前置名、不存在的契约")
+    c.set_defaults(func=cmd_contracts)
+
+    p = sub.add_parser("models", help="列出/搜索某 agent 可用的模型（默认过滤 openrouter）")
+    p.add_argument("kind", help="agent kind，如 opencode / omp / devin / pi / cursor")
+    p.add_argument("query", nargs="?", default="", help="搜索词，留空则全列")
+    p.add_argument("--only-paid", action="store_true",
+                   help="只看非 openrouter 的（默认全显示，openrouter 会被标记）")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(func=cmd_models)
+
+    p = sub.add_parser("search", help="检索 wiki 里的决策与教训")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("note", help="往 wiki 追加一条决策/教训/约定")
+    p.add_argument("kind", choices=["decisions", "lessons", "conventions"])
+    p.add_argument("title")
+    p.add_argument("body", nargs="?", default="")
+    p.add_argument("--file", help="正文从文件读")
+    p.add_argument("--role", default="", help="记录者")
+    p.set_defaults(func=cmd_note)
+
+    p = sub.add_parser("restore", help="从 .xteam 记忆恢复现场（数据从不删除）")
+    p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("doctor", help="环境体检；--probe 实测某 agent 认不认 --model")
+    p.add_argument("--probe", metavar="KIND",
+                   help="真起一个 pane 试这个 agent 的 TUI 认不认 --model。"
+                        "填 all 则批量探测「已装但未实测」的那些")
+    p.add_argument("--model", help="配合 --probe：要试的模型名")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("sync", help="把最新角色章程/协议同步到已在跑的 pane")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("up", help="建 .xteam/ 并拉起三个 pane")
+    # **不能叫 project**：argparse 里子解析器的同名参数会**覆盖**全局
+    # `--project`，于是 `xteam --project X up .` 里的 X 被静默忽略、状态全写到
+    # 当前目录。实测踩过：`--project /tmp/x up .` 把 .xteam 写进了别处。
+    p.add_argument("dir", nargs="?", default=None,
+                   help="项目根目录（等同于 --project，两者给一个即可）")
+    p.add_argument("--reviewer", action="store_true", help="额外拉起独立 reviewer pane")
+    p.add_argument("--watch", action="store_true", help="同时启动巡检")
+    p.add_argument("--set-model", action="append", metavar="ROLE=MODEL",
+                   help="指定某角色的模型，可重复。会**写入** .xteam/team.json 并长期沿用（要一次性用完就改完再 xteam swap 换回来）。"
+                        "写法取决于 agent：opencode 用 provider/model#variant，"
+                        "devin 用它账号里的模型名")
+    p.add_argument("--set-agent", action="append", metavar="ROLE=KIND",
+                   help="指定某角色用哪个 agent CLI（opencode/devin/claude/codex…）；同样会写入 .xteam/team.json 长期沿用")
+    p.add_argument("--allow-openrouter", action="store_true",
+                   help="显式授权使用 openrouter 模型（默认只提示不拦：其他 provider 已付费，"
+                        "走 openrouter 是额外开销）")
+    p.set_defaults(func=cmd_up)
+
+    p = sub.add_parser("swap",
+                       help="中途把某角色换成另一个 agent（可同时换模型）")
+    p.add_argument("role", choices=[r for r in BOOT_ORDER if r != "reviewer"],
+                   help="要换的角色")
+    p.add_argument("agent", nargs="?", help="换成哪个 agent（opencode/devin/claude…）")
+    p.add_argument("--model", help="同时指定模型（启动时精确指定，不盲选）")
+    p.add_argument("--force", action="store_true",
+                   help="即使它还在 working 也强换（会丢上下文）")
+    p.add_argument("--no-recap", action="store_true",
+                   help="不向旧 agent 索要 recap 交接（省时间，但新 agent 会更瞎）")
+    p.add_argument("--recap-wait", type=int, default=60,
+                   help="等旧 agent 写 recap 的秒数（默认 60）")
+    p.add_argument("--allow-openrouter", action="store_true",
+                   help="显式授权使用 openrouter 模型（默认只提示不拦）")
+    p.set_defaults(func=cmd_swap)
+
+    p = sub.add_parser("say", help="门铃")
+    p.add_argument("role")
+    p.add_argument("message")
+    p.add_argument("--settle", type=int, default=0, help="投递后等几秒再读状态")
+    p.set_defaults(func=cmd_say)
+
+    p = sub.add_parser("status", help="状态表（带时间戳）")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("stamp", help="给本角色输出打时间戳并记入共享时间线")
+    p.add_argument("role", nargs="?", help="角色名；在 xteam 的 pane 里可省略，自动推断")
+    p.add_argument("summary")
+    p.add_argument("--quiet", action="store_true", help="只记时间线，不打印（脚注用）")
+    p.add_argument("--waiting", action="store_true",
+                   help="声明「在等人类决策，不是卡死」——巡检据此免打扰")
+    p.add_argument("--wait-for", default="", help="等什么")
+    p.set_defaults(func=cmd_stamp)
+
+    p = sub.add_parser("watch", help="巡检")
+    p.add_argument("action",
+                   choices=["start", "stop", "status", "once", "run", "supervise"])
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("down", help="关掉 workspace")
+    p.set_defaults(func=cmd_down)
+
+    check_assets()
+    args = ap.parse_args()
+    # workspace 名只有一个来源：全局 --workspace，或项目目录名。子命令不再重复定义
+    # 它，否则 `xteam --workspace foo up .` 会被子解析器的默认值静默覆盖成目录名。
+    if not args.workspace:
+        base = args.project if args.cmd == "up" and args.project else "."
+        args.workspace = Path(base).resolve().name
+    if args.version:
+        print(f"xteam {_version()}")
+        try:
+            import subprocess as _sp
+            # 查**脚本自己所在**的仓库，不是 PM_TEAM_HOME 指向的资源目录
+            src = Path(__file__).resolve().parent.parent
+            commit = _sp.run(["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+            print(f"  提交：{commit.stdout.strip()}" if commit.returncode == 0
+                  else "  提交：（非 git 安装，或无 .git）")
+        except Exception:  # noqa: BLE001
+            print("  提交：（非 git 安装，或无 .git）")
+        import sys as _s
+        print(f"  Python：{_s.version.split()[0]}")
+        print(f"  资源：{HERE}")
+        print(f"  布局：{'安装' if (HERE / 'lib').exists() or 'share' in str(HERE) else '源码'}")
+        return 0
+
+    if not getattr(args, "cmd", None):
+        ap.print_help()
+        return 1
+    # `up` 的位置参数与全局 --project 合并，位置参数优先（更贴近直觉）。
+    # 放在这里而不是各命令里：只有一处要记得处理。
+    if getattr(args, "dir", None):
+        args.project = args.dir
+    elif getattr(args, "project", None) in (None, ""):
+        args.project = "."
+    return args.func(args)
+
+def _detect_role() -> str:
+    """从 herdr 环境变量推断当前角色，省得 agent 手打自己的名字。
+
+    xteam 启动时把 `XTEAM_ROLE` 注入 pane 环境；退而求其次看 pane_id 里的
+    agent name 前缀。推断不出就返回空串，让调用方显式传角色。
+    """
+    env_role = os.environ.get("XTEAM_ROLE", "").strip()
+    if env_role in ROLES:
+        return env_role
+    pane = os.environ.get("HERDR_PANE_ID", "")
+    if not pane:
+        return ""
+    try:
+        env = Herdr(scope="xteam")
+        for agent in env.agents():
+            if agent.get("pane_id") == pane:
+                role = str(agent.get("name", "")).split("-", 1)[0]
+                if role in ROLES:
+                    return role
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+EPILOG = """\
+首次使用（按顺序，别跳）:
+  1. xteam doctor                 确认 herdr 与 agent 都在
+  2. cd 你的项目 && git init      xteam 靠文件协议协作，没有版本控制等于没有后悔药
+  3. xteam init                   声明这个仓库是什么结构（见下）
+  4. xteam up . --watch           起 pm/tl/dev 三个 pane + 巡检
+  5. xteam say pm "你的需求……"      之后只跟 pm 说话，它会分派下去
+
+第 3 步的三种结构（决定后续行为，别猜）:
+  --repo-kind single      单应用仓库。xteam 只管它一个。
+  --repo-kind multi-app   多个独立应用，互不依赖。每个切片必须声明 project。
+  --repo-kind multi-api   多项目，且有共享契约层（api 同时服务多个消费方）。
+                          每个切片必须声明 project，动契约时会提示下游影响。
+  不带参数且有 TTY 时会交互式问你；CI 里用 flag 形式。
+  项目长出第二个仓之后再迁：xteam init --force --repo-kind multi-api ...（不动已有数据）
+
+常用:
+  status                  谁在干什么、谁欠着活、每个状态从几点开始
+  say/stamp <角色> "<消息>"  门铃 / 记时间线
+  projects                治理了哪些项目、依赖关系、各自未闭合的活
+  swap <角色> <agent>      中途换 agent（不用重启整套）
+  qa run                  第三方冷读评审（不是裁判，verdict 仍只有 pm 写）
+  contracts list|check    跨项目 API 契约
+  search / note           检索与沉淀 wiki 里的决策与教训
+  watch status|once       巡检状态 / 手动跑一轮
+  restore                 关掉后从 .xteam 恢复现场（数据从不删除）
+  down                    收摊（连巡检一起停，不删数据）
+
+三个角色:
+  pm   对接你 -> 需求成型 -> 门禁判 PASS/FAIL -> 巡检
+  tl   评估 spec -> 拆解 -> 派活 -> 持续 review -> 打回
+  dev  实现 -> 自测 -> 上报 -> 停下等审核 -> 主动要下一件
+
+协议全文在 .xteam/PROTOCOL.md，角色章程在 .xteam/roles/*.md。
+
+已知限制（先知道比撞上强）:
+  · opencode v2.0.20 的 TUI 不支持 --model，无法脚本化指定模型，它会用
+    自身 opencode.json 的配置。要指定模型请用 devin/omp/pi/cursor/qodercli。
+  · openrouter 下的模型默认**只提示、不拦**（其他 provider 已付费，走它是额外开销；确实要用加 --allow-openrouter 消掉提示）。
+    确实要用加 --allow-openrouter 显式授权。
+  · mcode / qoderclicn 不在 herdr 的 agent kind 列表里，无法编排。
+  · 改了 xteam 自身的规则后，跑 xteam sync 让正在跑的 pane 拿到新章程。
+  · 单次调用约 0.4s（Python 解释器启动占大头，与项目规模无关）。
+
+每个子命令都有 --help；环境问题先看 doctor，协议问题先看 .xteam/PROTOCOL.md。
+"""
+
+
+if __name__ == "__main__":
+    # 下游把管道关了（`| xteam --version | head`）时，print 会抛 BrokenPipeError
+    # 并打一整段栈 —— 那只是正常的提前退出，不该当成错误。
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        finally:
+            os._exit(0)
