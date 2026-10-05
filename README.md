@@ -234,6 +234,7 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 
 ```bash
 bash tests/smoke.sh              # 门禁：静态 → 单测 → 端到端，一次跑完三层
+bash tests/smoke.sh --no-e2e     # 只跑前两层（没装 herdr 时用这个）
 ```
 
 `smoke.sh` 是**门禁**，按「快 → 慢」分三层，**失败就停在那一层**：

@@ -39,8 +39,11 @@ jobs:
       - name: 协议单测
         run: python3 tests/test_protocol.py
 
-      # 打包脚本的 git 模式会做「工作区必须干净」检查，而 CI 里跑它会因
-      # checkout 产生的状态被拦下。用 --worktree 打，并在同一 job 里验证 ——
-      # 这正是 pack.sh 自证可用的那条路径。
+      # 打包 + 自证可用。用 --worktree：git 模式要求「工作区干净」，而 CI 的
+      # checkout 状态不由我们控制，--worktree 打的就是工作树本身，不受这条约束。
+      #
+      # pack.sh 内部会自己判断有没有 herdr：没有就只跑门前两层。所以这一条
+      # **不用**加 --no-verify —— 那会连「解包副本能装、能编译、单测全过」
+      # 都不验，等于发版时不再确认包可用。
       - name: 打包并自证可用
         run: bash pack.sh --worktree

@@ -110,6 +110,7 @@ tar xzf xteam-<版本>.tar.gz && cd xteam-<版本>
 python3 tests/test_protocol.py     # 协议单测（约 10s，只要 python3）
 python3 tests/lint_names.py        # 未定义的名字 / 不存在的方法
 bash tests/smoke.sh                # 三层门禁；第 3 层要 herdr + agent
+bash tests/smoke.sh --no-e2e       # 只跑前两层（这台机器没 herdr 时用）
 bash install.sh                    # 装完 xteam 就能在任意项目里用
 
 # 改完重新发布

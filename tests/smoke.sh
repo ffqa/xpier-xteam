@@ -5,10 +5,27 @@
 # workspace/tab/pane、agent 能不能被拉起并认领名字、门铃能不能真的送达。
 #
 # 用法：bash tests/smoke.sh [工作目录]
+#       bash tests/smoke.sh --no-e2e [工作目录]   # 只跑前两层，不起 pane
+#
+# --no-e2e 存在的理由：第 3 层要 herdr + 真 agent 起三个 pane。CI 上跑它必然失败
+# （「找不到 herdr —— 它是 xteam 的地基」），而 pack.sh --worktree 的自证会调本脚本。
+# 于是 CI 只能退而用 --no-verify 跳过整个自证 —— 那就等于**发版时不再验证包可用**。
+# 有了这个开关，CI 能验证「解包副本能装、能编译、单测全过」，只跳过真正需要
+# 人和机器的那一层。
 set -uo pipefail
 
+E2E=1
+WORK=""
+for a in "$@"; do
+  case "$a" in
+    --no-e2e) E2E=0 ;;
+    -*) echo "未知参数：$a （可用：--no-e2e）" >&2; exit 1 ;;
+    *)  [ -z "$WORK" ] && WORK="$a" || { echo "只能给一个工作目录" >&2; exit 1; } ;;
+  esac
+done
+
 BIN="$(cd "$(dirname "$0")/.." && pwd)/bin/xteam"
-WORK="${1:-$(mktemp -d)}"
+WORK="${WORK:-$(mktemp -d)}"
 WS="pm-smoke-$$"
 FAIL=0
 
@@ -40,7 +57,13 @@ trap cleanup EXIT
 finish() {
   printf '\n'
   if [ $FAIL -eq 0 ]; then
-    printf '✓ 门禁三层全过：静态 · 单测 %s 条断言 · 端到端\n' "${N_ASSERT:-0}"
+    # 摘要必须区分「三层全过」和「按要求只跑了两层」—— 否则 --no-e2e 的绿灯
+    # 会被读成「端到端也验过了」，而它恰恰没验。
+    if [ "${E2E:-1}" = "0" ]; then
+      printf '✓ 门前两层全过：静态 · 单测 %s 条断言（端到端按 --no-e2e 跳过）\n' "${N_ASSERT:-0}"
+    else
+      printf '✓ 门禁三层全过：静态 · 单测 %s 条断言 · 端到端\n' "${N_ASSERT:-0}"
+    fi
     printf '  工作目录 %s 即将删除\n' "$WORK"
   else
     printf '✗ 失败在【%s】层；已过的层：静态 · 单测 %s 条断言\n' \
@@ -97,6 +120,15 @@ if [ -n "$LAYER" ]; then
   printf '也避免在坏代码上跑出误导结果\n'
   exit 1
 fi
+
+# --no-e2e 在这里返回，**不是**在第 2 层之后 —— 因为第 3 层的准备动作
+# （mkdir 工作目录、git init、装两次 xteam）本身不需要 herdr，白跑没有意义，
+# 而它们又是「解包副本能不能接着开发」的一部分证据，保留。
+if [ "$E2E" = "0" ]; then
+  step "门禁 3/3" "端到端：--no-e2e 已跳过（需要 herdr + 真 agent）"
+  finish
+fi
+
 step "门禁 3/3" "端到端：真起三个 pane，验门铃 / 巡检 / 换 agent"
 
 

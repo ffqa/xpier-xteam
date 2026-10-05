@@ -282,8 +282,18 @@ if [ "$VERIFY" = "1" ]; then
   if [ "$WORKTREE" = "1" ]; then
     # 失败时**必须把门禁的输出打出来** —— 只说「跑不过」而不说为什么，
     # 等于让打包者再去别处重跑一遍才能定位，白白多花两分钟。
-    if (cd "$TMP/$NAME" && bash tests/smoke.sh >"$TMP/gate.log" 2>&1); then
-      say "  ✓ 解包副本能独立跑三层门禁（可在目标机直接开发）"
+    # CI 上没有 herdr，第 3 层必然失败。用 --no-e2e 跑前两层 ——
+    # 比整段 --no-verify 强得多：那样连「解包副本能装能跑单测」都不验了。
+    # 有 herdr 时仍然跑完整三层。
+    if command -v herdr >/dev/null 2>&1; then
+      GATE_ARGS=()
+      GATE_LABEL="解包副本能独立跑三层门禁（可在目标机直接开发）"
+    else
+      GATE_ARGS=(--no-e2e)
+      GATE_LABEL="解包副本能跑门前两层（本机无 herdr，端到端在目标机验）"
+    fi
+    if (cd "$TMP/$NAME" && bash tests/smoke.sh "${GATE_ARGS[@]}" >"$TMP/gate.log" 2>&1); then
+      say "  ✓ $GATE_LABEL"
     else
       printf '%s\n' "──── 解包副本的门禁输出 ────"
       tail -25 "$TMP/gate.log"
