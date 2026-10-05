@@ -99,6 +99,10 @@ jobs:
       # ---------------------------------------------------------------- Tap
       # 用部署密钥（SSH）而不是 PAT：令牌一旦泄漏在 Actions 日志/环境里就等于
       # 整个账号的权限，而这把 key 只能写 homebrew-tap 一个仓库，且随时可吊销。
+      #
+      # 没配 secret 时**报错而不是静默跳过**：Release 已经发出去了，用户会以为
+      # `brew install` 能用，而它其实还指着上一个版本。绿灯比红灯危险得多。
+      # 报错文案要说清「Release 已建成、只是 tap 没更」。
       - name: 更新 Homebrew Tap
         env:
           TAP_SSH_KEY: ${{ secrets.TAP_SSH_KEY }}
@@ -108,7 +112,12 @@ jobs:
           NAME: ${{ steps.pkg.outputs.name }}
         run: |
           set -euo pipefail
-          [ -n "$TAP_SSH_KEY" ] || { echo "::error::没配 secrets.TAP_SSH_KEY，跳过 Tap 更新"; exit 1; }
+          if [ -z "$TAP_SSH_KEY" ]; then
+            echo "::error::Release 已建好，但 Homebrew Tap 没更新：secrets.TAP_SSH_KEY 未配置。"
+            echo "::error::在 Settings → Secrets 里补上 TAP_SSH_KEY 与 TAP_KNOWN_HOSTS，"
+            echo "::error::然后按 PROJECT.md 的说明补发一次 tap。"
+            exit 1
+          fi
 
           mkdir -p ~/.ssh
           printf '%s\n' "$TAP_SSH_KEY" > ~/.ssh/tap_key
@@ -127,17 +136,28 @@ jobs:
           # 而 heredoc 的结束符必须顶格 —— 两层缩进叠在一起很容易写出一个
           # **静默不闭合**的 heredoc，症状还表现为「Formula 生成失败」而不是
           # 指向真正出错的那一行。模板是独立文件，Ruby 语法不被 YAML 缩进污染。
-          sed -e "s|{{VERSION}}|$VERSION|g" \
-              -e "s|{{SHA256}}|$SHA|g" \
-              -e "s|{{NAME}}|$NAME|g" \
+          #
+          # 占位符用 @NAME@ 而不是 {{NAME}}：后者是 **Ruby 自己的插值语法**
+          # （"…{0.1.6}…" 会被 Ruby 当成方法调用去求值），万一漏替换，
+          # 发出去的 Formula 是在用户 brew install 时才炸，而不是在这里炸。
+          sed -e "s|@VERSION@|$VERSION|g" \
+              -e "s|@SHA256@|$SHA|g" \
+              -e "s|@NAME@|$NAME|g" \
               .github/formula/xteam.rb.template > "$TMP/tap/Formula/xteam.rb"
 
-          # 残留占位符 = 替换漏了。发出去一个带 {{VERSION}} 的 Formula，
-          # brew 的报错会指向用户的机器，排查成本远高于在这里拦住。
-          if grep -qE '\{\{[A-Z0-9_]+\}\}' "$TMP/tap/Formula/xteam.rb"; then
+          # 残留占位符 = 替换漏了。这里必须拦住：否则 brew 的报错指向用户机器，
+          # 而真实原因（模板改了、sed 没跟着改）只存在于这个 workflow 里。
+          if grep -qE '@[A-Z0-9_]+@' "$TMP/tap/Formula/xteam.rb"; then
             echo "::error::Formula 里还有未替换的占位符："
-            grep -nE '\{\{[A-Z0-9_]+\}\}' "$TMP/tap/Formula/xteam.rb"
+            grep -nE '@[A-Z0-9_]+@' "$TMP/tap/Formula/xteam.rb"
             exit 1
+          fi
+
+          # Ruby 语法自检：brew 加载 Formula 时才解析，语法错同样只在用户机器上炸。
+          if command -v ruby >/dev/null 2>&1; then
+            ruby -c "$TMP/tap/Formula/xteam.rb" >/dev/null \
+              || { echo "::error::生成的 Formula 语法不过 ruby -c"; exit 1; }
+            echo "Formula 语法 ✓（ruby -c）"
           fi
 
           cd "$TMP/tap"

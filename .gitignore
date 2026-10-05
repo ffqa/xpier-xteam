@@ -11,7 +11,12 @@ dist/
 
 # brew Formula 由 GitHub Actions 生成后推到 ffqa/homebrew-tap，本地不留副本。
 # 同理：Formula/ 一旦入库，pack.sh 的干净检查会先被它拦下。
-Formula/
+#
+# **必须写成 `/Formula/`（带前导斜杠）。** 少了它就是「任意层级名为 Formula
+# 的目录」，而在 macOS 上 core.ignorecase 默认为 true、大小写不敏感 ——
+# 于是它连 `.github/formula/`（发布用的 Formula 模板）一起吃掉，
+# 而 release.yml 正是从那里读模板。结果：CI checkout 里没有模板，发版静默失败。
+/Formula/
 
 # 发布已交给 GitHub Actions（.github/workflows/release.yml）。
 # 这个脚本只是本机历史遗留，逻辑已迁进 workflow，改它不会再影响发版。
