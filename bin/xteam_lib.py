@@ -913,6 +913,21 @@ class Protocol:
                 out.setdefault(role, []).append(f"{t.name}:{ob}")
         if not out.get("pm") and self.queue_counts()[0] > 0:
             out["pm"] = ["(队列):start-next"]
+        # **队列全闭合但 REPORT.md 缺失 → PM 欠 report。** 切片 closed 只意味
+        # 「这片做完了」，而人类要的是「整个项目做完后能部署、能测试、有人接」。
+        # 没有这一条，PM 写完 closed.md 就判定「无欠账合法终态」，结项报告永远没人写。
+        #
+        # 判据是「**没有待办**」（pending == 0），不是「队列里一行都没有」
+        # （total == 0）。原来写的是 `queue_counts() == (0, 0)`，于是只在
+        # 「队列从没被用过」时才成立 —— 而 Protocol.ensure() 一上来就建出
+        # QUEUE.md，TL 追加切片后 total 永远 > 0。结果：**真实项目里这条义务
+        # 一次都不会触发**，结项报告永远没人催。PR 的测试没抓到，是因为它用的
+        # Bench 根本不写 QUEUE.md（total 恰好为 0），正好落在唯一能过的那个分支上。
+        # 「空项目不该催报告」由下面 `any(_is_closed(...))` 负责，与 total 无关。
+        if (not out.get("pm") and self.queue_counts()[0] == 0
+                and any(_is_closed(t) for t in self.all_tasks())
+                and not (self.dir / "REPORT.md").exists()):
+            out["pm"] = ["(项目):report"]
         return out
 
     @staticmethod
@@ -1066,6 +1081,12 @@ class Protocol:
 
         if closed:
             out["pm"] = "next-slice"
+        # **队列空了 next-slice 让位给 report。** 单个切片 closed 只意味「这片做完了」；
+        # 队列还有活时，催 PM 去取下一项是对的（别停）。队列空了再催「取下一项」就是空转——
+        # 真正的收尾是结项报告，由 overall_debts 按「队列空 + 有闭合切片 + 无 REPORT」判定。
+        # 这里只清「队列空」的情况：队列有活时 next-slice 照常。
+        if closed and self.queue_counts()[0] == 0:
+            out.pop("pm", None)
         return out
 
     # -- 跨切片依赖 --
@@ -1309,6 +1330,10 @@ OBLIGATIONS: dict[str, str] = {
                   "下一项**，有就直接开工（写 spec → 派 TL）；遇选择题默认选推荐项"
                   "继续。只有那里也空了，才**一次性**问人类要接下来几件 ——"
                   "别问「可以开始下一件吗」，也别一件一件地问。",
+    "report": "全部切片已闭合但 `.xteam/REPORT.md` 还没有 —— 写结项报告，写完才算"
+              "真正交付。按 `templates/REPORT-TEMPLATE.md` 的节写（目标 / 进度与完成情况 / "
+              "部署启动测试 / 默认账号信息 / 边界与疑问点），每节都要有可验证的内容，"
+              "不确定的标「未确认」并写确认方法，不要编。",
 }
 
 

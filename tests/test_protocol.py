@@ -257,6 +257,10 @@ def test_closed_frees_everyone_and_prompts_next_slice() -> None:
     print("\n[5] closed 之后：TL/dev 放空，PM 收到「去派下一项」")
     b = Bench()
     try:
+        # 队列还有活：closed 后 PM 该去取下一项（别停），不是写结项报告。
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n| 2 | b | todo | |\n", encoding="utf-8")
         b.advance_to("closed")
         check("closed → TL 不欠", b.owes("tl"), [])
         check("closed → dev 不欠", b.owes("dev"), [])
@@ -264,6 +268,79 @@ def test_closed_frees_everyone_and_prompts_next_slice() -> None:
         check("closed task 不再算未闭合", [t.name for t in b.proto.open_tasks()], [])
     finally:
         b.cleanup()
+
+
+def test_all_closed_without_report_pm_owes_report() -> None:
+    print("\n[5b] 全部闭合但 REPORT.md 缺失 → PM 欠 report；写完就不欠")
+    b = Bench()
+    try:
+        b.advance_to("closed")
+        # Bench 不写 QUEUE.md → queue_counts()==(0,0)，且有一个闭合切片，
+        # 正好命中 report 条件（空项目无切片时不命中，见下）。
+        check("全闭合无 REPORT → PM 欠 report",
+              b.proto.overall_debts().get("pm"), ["(项目):report"])
+        (b.proto.dir / "REPORT.md").write_text("# 结项报告\n", encoding="utf-8")
+        check("REPORT 写完 → PM 不再欠",
+              b.proto.overall_debts().get("pm"), None)
+    finally:
+        b.cleanup()
+    # 空项目（无切片、无队列）：要的是派活，不是写报告
+    b2 = Bench("empty-probe")
+    try:
+        b2.task.rmdir()  # 删掉 Bench 自带的空 task 目录
+        check("空项目 → PM 不欠 report",
+              b2.proto.overall_debts().get("pm"), None)
+    finally:
+        b2.cleanup()
+
+    # **队列从「有活」变「空」时，PM 的义务要跟着换。** 这是本次改动的核心：
+    # 队列有活时催 next-slice（别停）是对的；队列空了还催 next-slice 就是空转，
+    # 真正的收尾是结项报告。只测两个端点会漏掉「切换」本身 ——
+    # 而切换处最容易出「两条义务同时挂着」或「一条都不挂」的 bug。
+    b3 = Bench("handoff")
+    try:
+        qpath = b3.proto.dir / "QUEUE.md"
+        qpath.write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | todo | |\n", encoding="utf-8")
+        b3.advance_to("closed")
+        check("队列有活 + 闭合 → PM 欠 next-slice",
+              b3.proto.overall_debts().get("pm"), ["handoff:next-slice"])
+        check("此时不欠 report（还没到结项）",
+              "report" in str(b3.proto.overall_debts().get("pm")), False)
+        # 把队列标完 → 义务应当让位给 report，且 next-slice 消失（不是两条并存）
+        qpath.write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n", encoding="utf-8")
+        d = b3.proto.overall_debts().get("pm")
+        check("队列跑完（仍有行、全部 done）→ PM 欠 report", d, ["(项目):report"])
+        check("next-slice 已让位（不与 report 并存）",
+              "next-slice" in str(d), False)
+        check("REPORT 写完 → 什么都不欠（真实项目路径）",
+              (proto_dir_reports := b3.proto.dir).joinpath("REPORT.md").exists(), False)
+        (proto_dir_reports / "REPORT.md").write_text("# 结项报告\n", encoding="utf-8")
+        check("写完 REPORT 后 PM 清空", b3.proto.overall_debts().get("pm"), None)
+    finally:
+        b3.cleanup()
+
+    # **回归：报告义务必须按「有没有待办」判，而不是「队列里有没有行」。**
+    # 原判据是 queue_counts() == (0, 0)，而 Protocol.ensure() 一上来就建出
+    # QUEUE.md、TL 追加切片后 total 永远 > 0 —— 于是真实项目里这条义务
+    # 一次都不会触发，结项报告永远没人催。而当时的测试用的是 Bench
+    # （不写 QUEUE.md，total 恰好为 0），正好落在唯一能通过的那个分支上，
+    # 于是「测试全绿 + 功能是死的」同时成立。
+    # 这条断言就是照着真实布局写的：先 ensure() 建骨架，再用 TL 的写法追加行。
+    b4 = Bench("realistic")
+    try:
+        q4 = b4.proto.dir / "QUEUE.md"
+        q4.write_text(
+            "| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n", encoding="utf-8")
+        b4.advance_to("closed")
+        check("队列有行但全部 done → 仍欠 report（真实项目路径）",
+              b4.proto.overall_debts().get("pm"), ["(项目):report"])
+    finally:
+        b4.cleanup()
 
 
 def test_fail_round_reopens_the_loop() -> None:
@@ -871,6 +948,12 @@ def test_index_summarizes_all_tasks() -> None:
         check("含 spec 轮次", idx["tasks"][0]["spec_round"], 1)
 
         # 走完一轮，stage 应随之推进
+        # 队列还有活 → 闭合后 PM 该取下一项（next-slice），而不是写结项报告。
+        # report 只在「队列空 + 有闭合切片 + 无 REPORT.md」时才欠，所以这里
+        # 必须先把 QUEUE.md 铺上，否则测的是另一条路径。
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n| 2 | b | todo | |\n", encoding="utf-8")
         b.advance_to("closed")
         idx = b.proto.index()
         check("闭合后 stage=closed", idx["tasks"][0]["stage"], "closed")
@@ -2226,6 +2309,7 @@ def main() -> int:
         test_round_regression_is_conservative,
         test_legacy_consumed_key_is_readable,
         test_closed_frees_everyone_and_prompts_next_slice,
+        test_all_closed_without_report_pm_owes_report,
         test_fail_round_reopens_the_loop,
         test_multiple_tasks_accumulate_debts,
         test_idle_requires_both_signals,
