@@ -43,6 +43,7 @@ from xteam_lib import (  # noqa: E402
     REPO_KINDS,
     Registry,
     agent_catalog,
+    agent_name,
     load_verified_agents,
     probe_store_path,
     save_verified_agent,
@@ -366,7 +367,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"  本项目要用    {', '.join(used) or '（未声明）'}"
           + (f"  ⚠ 缺：{'、'.join(missing_used)}" if missing_used else ""))
     print(f"  实测 --model  {', '.join(sorted(VERIFIED_TUI_MODEL))}")
-    print(f"  推断 --model  {len(ASSUMED_TUI_MODEL)} 个（用 --probe 转成实测）\n")
+    print(f"  推断 --model  {len(ASSUMED_TUI_MODEL)} 个（用 --probe 转成实测）")
+    # 协议正文里让人「照着去 skills/ste/SKILL.md 看完整输出规范」，那处不给
+    # 绝对路径 —— 因为 PROTOCOL.md 会被拷进**用户项目的** .xteam/，写相对路径
+    # 必然解析不到。doctor 是 agent 唯一会主动跑的命令，所以绝对路径打在这里。
+    _skills = HERE / "skills"
+    if _skills.is_dir():
+        names = sorted(p.name for p in _skills.iterdir() if p.is_dir())
+        print(f"  输出规范      {', '.join(names)}  →  {_skills}")
+    else:
+        print(f"  输出规范      （本包没带 skills/：{_skills}）")
+    print()
 
     if args.probe == "all":
         return _probe_all(env, herdr_ok, args.model)
@@ -1129,14 +1140,15 @@ def _swap_block_reason(state: str, force: bool) -> str:
     """换 agent 的安全阀。返回空串=放行，非空=该拒绝的理由。
 
     **working 时换掉等于把没做完的活连同上下文一起扔掉**，所以默认拦住。
-    blocked（它自己停下了）和 unknown（读不到状态）都放行 —— 前者没什么可丢，
+    blocked（它自己停下了）、unknown（读不到状态）和 absent（旧 agent
+    已死——比如用户在 pane 里手退了 omp，根本没有可丢的上下文）都放行。
     后者不该因为读不到就挡住人。抽成纯函数是为了能固定验证：真跑一次 swap 要起
     真 agent，太贵，而冒烟里那条断言是 flaky 的（刚投完章程的 agent 有时
     working、有时 idle，都合法）。
     """
-    if state in ("idle", "blocked", "unknown") or force:
+    if state in ("idle", "blocked", "unknown", "absent") or force:
         return ""
-    return (f"现在是 {state}，换掉会丢掉它正在做的上下文。\n"
+    return (f"{state}：换掉会丢掉它正在做的上下文。\n"
             "  等它 idle 再换；或先 `xteam say <角色> \"停下并写 recap\"`；"
             "确实要强换加 --force。")
 
@@ -1244,8 +1256,10 @@ def cmd_swap(args: argparse.Namespace) -> int:
         if old_pane:
             print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
             herdr.doorbell(old_pane,
-                           f"你要被换掉了。请立刻把当前进展、已确认的结论、"
-                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md，"
+                           f"你要被换掉了。请把当前进展、已确认的结论、"
+                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md "
+                           f"（15 行以内，只写这四节：做完什么 / 验证结果 / 关键决定与理由 / "
+                           f"下一步遗留，不得加节），"
                            f"然后停下。",
                            wait_s=args.recap_wait)
         print(f"[{now()}] recap："
@@ -1267,7 +1281,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
         die(f"找不到 {role} 的 tab（workspace 可能被手工动过）。先 `xteam status` 看看")
 
     brief = _handover_brief(root, proto, role)      # 交接底稿：旧 tab 关掉前先取
-    tmp_name = f"swap-{role}-{label}"
+    tmp_name = agent_name(f"swap-{role}", label)
     tab = herdr.create_tab(ws_id, str(root), f"swap-{role}",
                            env={"XTEAM_ROLE": role})
     new_tab = (tab.get("tab") or tab).get("tab_id")
@@ -1298,7 +1312,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
 
     # 新 agent 确实活了 → 这时才关旧 tab，并把新 agent 改名成正式名
     herdr.close_tab(tab_id)
-    formal = f"{role}-{label}"
+    formal = agent_name(role, label)
     herdr._run("agent", "rename", pane_id, formal)
     herdr._run("pane", "rename", pane_id, formal)
     herdr._run("tab", "rename", new_tab, formal)
@@ -1538,7 +1552,7 @@ def cmd_say(args: argparse.Namespace) -> int:
     # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
     # 「刚才那声门铃到底有没有把它叫醒、什么时候叫的」。
     print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
-    if status.startswith(("prompt-failed", "enter-failed")):
+    if status.startswith("prompt-failed"):
         print("  ⚠ 投递失败，角色可能不可达（pane 崩了 / 停在审批 UI）", file=sys.stderr)
         return 1
     return 0
@@ -1903,9 +1917,11 @@ def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path)
         msg = (
             f"【收尾】请写一份 recap 到 {target}（**覆盖写，不要追加**）。\n"
             f"原因：{why}。这份文件跨会话保留，之后给你派活或换人时会带上它。\n"
-            f"只要 15 行以内，四行小标题即可：\n"
+            f"只要 15 行以内，**只写这四节，不得加节**：\n"
             f"  ## 做完什么\n  ## 验证结果（实测命令 + 数字）\n"
             f"  ## 关键决定与理由\n  ## 下一步 / 遗留\n"
+            f"不要写「这份 recap 存在的原因」、不要写工具观察笔记、不要复述队列——"
+            f"那些在 .xteam/ 里本来就有，重写一遍只是烧 token。\n"
             f"写完就停下，别展开叙述 —— 它是给下一个接手的人扫一眼用的，不是作文。"
         )
         if pct:

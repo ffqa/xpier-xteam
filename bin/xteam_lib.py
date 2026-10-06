@@ -145,6 +145,28 @@ def save_verified_agent(kind: str) -> None:
                                 "updated": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2)
 
 
+def agent_slug(label: str) -> str:
+    """workspace label → herdr agent name 可用的片段。
+
+    herdr agent name 全局唯一且只认 `^[a-z][a-z0-9_-]{0,31}$`（首字母小写、
+    最长 32 字符）—— 大写 workspace（如 `Sites`）原样拼成 `pm-Sites`
+    会被直接拒绝（invalid_agent_name）。所以所有 agent/tab/pane 命名
+    必须走 agent_name()，不许手拼 `f"{role}-{label}"`。
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "-", label.strip().lower()).strip("-_")
+    return slug or "ws"
+
+
+def agent_name(role: str, label: str) -> str:
+    """角色 + workspace label → 合法的 herdr agent name（含 32 字符截断）。
+
+    正式名 `role-slug` 与 swap 临时名 `swap-role-slug` 都走这里，前缀
+    永远是小写 role，所以「首字母小写」天然满足；超长时截断 slug 保上限。
+    """
+    name = f"{role}-{agent_slug(label)}"
+    return name[:32].rstrip("-_") if len(name) > 32 else name
+
+
 def normalize_kind(kind: str) -> str:
     """把口语别名折成 herdr kind。未知的原样返回，好让上层报错时能原样显示。"""
     return KIND_ALIASES.get(kind.strip().lower(), kind.strip().lower())
@@ -470,23 +492,35 @@ class Herdr:
                     name: str | None = None) -> None:
         """拉起 agent 并在三个寻址命名空间固定同一个名字。
 
-        agent name 全局唯一 → 用 `role-<workspace>` 做命名空间。
+        agent name 全局唯一 → 用 `role-<slug>` 做命名空间（slug 经 agent_name()
+        合法化，大写/空格 workspace 也能起）。
 
         `name` 可覆盖，用于 swap 的**两阶段**：新 agent 先用临时名
-        （如 `swap-tl-<scope>`）起，成功后再 rename 成正式名。这样同一角色的
-        新旧 agent 不会同时占用 `tl-<scope>`，也就不存在「起新的要先把旧的
+        （如 `swap-tl-<slug>`）起，成功后再 rename 成正式名。这样同一角色的
+        新旧 agent 不会同时占用正式名，也就不存在「起新的要先把旧的
         关掉」这个不可回滚的顺序。
         """
-        name = name or f"{spec.role}-{self.scope}"
+        name = name or agent_name(spec.role, self.scope)
         argv = ["agent", "start", name, "--kind", spec.kind,
                 "--pane", pane_id, "--timeout", "90000"]
         extra = spec.agent_args()
+        # **extra 必须真的拼进 argv。** 算对了却没传出去，等于每个 agent 都跑在
+        # 默认模型上，而 set-model / omp 默认这套设计整个失效、且没有任何测试会红
+        # （原来的断言全都只在单独调 agent_args()）。所以下面 test_protocol 里有
+        # 一条真跑 start_agent 抓 argv 的断言守着这里。
         if extra:
             argv += ["--"] + extra
         try:
             self._run(*argv, timeout=120)   # agent start 要等就绪，外层留余量
         except RuntimeError as exc:
-            if "timeout" in str(exc).lower():
+            # **只认真正的超时。** 原来是 `"timeout" in str(exc)` 子串匹配，
+            # 但 argv 里本来就有 `--timeout 90000`（被 _run 回显进错误串），
+            # 所以任何快速失败（如 invalid_agent_name rc=1）都被谎报成
+            # 「90s 内没进入交互态」—— 本次 Sites 故障就是这么被误导的。
+            # 真超时只有两种：subprocess 超时（"超过 …s 未返回"）和 herdr
+            # 服务端的等待超时（timed out waiting）。
+            msg = str(exc).lower()
+            if "未返回" in msg or "timed out waiting" in msg:
                 # **不要断言是模型参数的问题。** 实测 claude 不带 --model 也一样超时
                 # （首次运行的 onboarding/登录屏，herdr 检测不到交互态）。把原因归到
                 # 模型上会让人往错方向查。给出能区分两种原因的下一步。
@@ -556,15 +590,17 @@ class Herdr:
         """给一个**工作中**的 agent 发消息（走 agent prompt）。
 
         对 blocked 的 agent 无效（会被拒）——那种情况用 send_choice。
+
+        **不补 send-keys enter。** `agent prompt` 按 pane 的 bracketed-paste
+        模式发送「文本 + 编码后的回车」，是一次有序提交，herdr 只在两者都
+        写完才报成功。之前这里多补了一个裸 enter，而终端输入缓冲区是共享的：
+        用户正在输入框里打了一半的字时，这个 enter 会把「用户半句话 + 门铃
+        文本」一起提交——等于别人在用户打字时替用户按了回车（2026-10-06 实测）。
         """
         proc = subprocess.run([self.bin, "agent", "prompt", target, message],
                               capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             return f"prompt-failed: {proc.stderr.strip()[:120]}"
-        send = subprocess.run([self.bin, "agent", "send-keys", target, "enter"],
-                              capture_output=True, text=True, timeout=30)
-        if send.returncode != 0:
-            return f"enter-failed: {send.stderr.strip()[:120]}"
         if wait_s > 0:
             time.sleep(wait_s)
         return f"status={self.agent_status(target)}"

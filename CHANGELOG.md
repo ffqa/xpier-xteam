@@ -2,7 +2,53 @@
 
 ## 0.1.5
 
+### agent 与模型
+
+- **`agent_name()` 合法化 agent 名**：herdr 的 agent name 全局唯一且只认
+  `^[a-z][a-z0-9_-]{0,31}$`。大写 workspace（如 `Sites`）原样拼成 `pm-Sites`
+  会被直接拒（invalid_agent_name）。现在 `agent_slug()` + `agent_name()`
+  统一处理并按 32 字符截断，**所有** agent/tab/pane 命名都走它，不再手拼。
+- **`swap` 放行 `absent`**：旧 agent 已死（比如用户在 pane 里手退了 omp）时没有
+  可丢的上下文，不该因为「读不到状态」就挡住人。
+- **超时不再误报**：原来用 `"timeout" in str(exc)` 子串匹配，而 argv 里本来就有
+  `--timeout 90000`（被回显进错误串），于是任何快速失败（invalid_agent_name rc=1）
+  都被谎报成「90s 内没进入交互态」。改成只认真正的两种超时。
+- **门铃不再替用户按回车**：`agent prompt` 按 bracketed-paste 模式发「文本+编码回车」，
+  是一次有序提交。之前多补了一个裸 enter，而终端输入缓冲区是共享的 ——
+  用户打字打一半时，这个 enter 会把「半句话 + 门铃文本」一起提交。
+
+### 输出契约与任务边界
+
+- 新增 `skills/ste/`（ASD-STE100 中文改写）：STE 只管「对人说的话」，
+  spec/request 等工件按各角色章程详写。
+- **任务边界四环**：spec 范围节 → request 禁区节 → review 先核禁区 →
+  dev「多一点都不写」。缺任何一环，超范围改动都只在事后被发现（甚至不被发现）。
+- recap 只写四节、**不得加节**；swap 交接同约束。
+
 ### 修掉的真缺陷
+
+- **`--model` 被静默丢弃**（PR #1 引入）：`extra = spec.agent_args()` 那行还在，
+  `argv += ["--"] + extra` 被删了 —— 于是每个 agent 都跑在**默认模型**上，
+  `set-model` 与「默认用 omp」整套设计失效，且没有任何测试会红（所有断言都只在
+  单独调 `agent_args()`）。已修，并补了一条**真跑 `start_agent` 抓 argv** 的测试。
+- **`install.sh` 少装 README.md**（PR #1 引入）：docs/ 值得装就是为了 README 里的
+  相对链接能点开，README 没了那些链接就全断。
+- **协议里 `skills/ste/SKILL.md` 是死链**：`PROTOCOL.md` 会被拷进**用户项目的**
+  `.xteam/`，而 `skills/` 留在 xteam 安装目录，两者不在一棵树上。改成「安装目录下
+  （`doctor` 会打印绝对路径）」，并给 `doctor` 加了一行显示该目录。
+- **`lint_shell` 的 `set -u` 检测漏掉最常见写法**：用 `-u` 子串匹配，而
+  `set -euo pipefail` 里 `-u` 不是子串，于是所有 set -u 检查在 `pack.sh` /
+  `install.sh` 上静默失效。改成按短选项字母匹配。
+- **新增「空数组展开」检查**：`set -u` 下 `"${A[@]}"` 遇空数组在 **bash 3.2**
+  （macOS 自带）会报 unbound variable 并中断脚本，而报错指向数组、完全指不到
+  真正的原因（真实踩过：`pack.sh` 用空数组传可选参数，有 herdr 那条路径必炸）。
+  已在 bash 3.2 上实测确认。
+- **`lint_names` 对 `class Fake(_lib.Herdr)` 误报**：基类只认裸 `ast.Name`，
+  写成属性访问就查不到继承方法 → 报「不存在的方法」。违反它自己
+  「宁可漏报不要误报」的规矩。
+- **打包时校验文档相对链接**：docs/ 值得打包的唯一理由就是 README 里的链接能点开。
+  现在从 markdown 里抽出所有 `docs/`、`skills/` 链接逐个确认包里真有 ——
+  「文件在包里」和「有人指向它」是两件事，漏装只在用户点开时才发现。
 
 - **`swap` 曾非事务**：先关旧 tab 再起新 agent，新 agent 启动失败时旧 pane 和上下文
   已经没了。改为**两阶段替换** —— 新 agent 活了才关旧的，失败则原样回滚。

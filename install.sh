@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # xteam-install — 把 xteam 装到当前用户的 PATH 里。
 #
-# 装成什么布局：
 #   ~/.local/bin/xteam              可执行入口（薄壳，转发到 lib）
 #   ~/.local/share/xteam/lib/       xteam + xteam_lib.py
 #   ~/.local/share/xteam/roles/     三份角色章程
 #   ~/.local/share/xteam/templates/ 协议全文
+#   ~/.local/share/xteam/skills/    输出规范原文（如 ste，协议里只放精简版省 token）
 #   ~/.local/share/xteam/tests/     测试（可选，便于新机器上自检）
 #
 # 用法：
@@ -171,15 +171,21 @@ install_dir() {
 install_dir "$SRC/roles" "$SHAREDIR/roles"
 install_dir "$SRC/templates" "$SHAREDIR/templates"
 install_dir "$SRC/tests" "$SHAREDIR/tests"
+# skills 也要装：PROTOCOL 引了 `skills/ste/SKILL.md` 全文，漏了就断。
+# 源里没有 skills/ 时 install_dir 直接跳过（return 0），旧包照装不报错。
+install_dir "$SRC/skills" "$SHAREDIR/skills"
 # docs 也要装：README 里的相对链接（docs/多项目与契约.md 等）在装完的副本里
 # 同样要能点开，否则用户读到的 README 是一堆断链。
 install_dir "$SRC/docs" "$SHAREDIR/docs"
-[ -f "$SRC/README.md" ] && cp "$SRC/README.md" "$SHAREDIR/README.md"
 # VERSION 必须装：xteam --version 在安装布局下从 share/xteam/VERSION 读，
 # 漏了它就只能显示「未知」—— 而「这台机器跑的是哪个构建」正是多机部署时
 # 第一个要回答的问题。
 [ -f "$SRC/VERSION" ] && cp "$SRC/VERSION" "$SHAREDIR/VERSION"
 [ -f "$SRC/PROJECT.md" ] && cp "$SRC/PROJECT.md" "$SHAREDIR/PROJECT.md"
+# README 也得装：docs/ 之所以值得装，就是为了上面这个 README 里的相对链接
+# （docs/多项目与契约.md 等）在装完的副本里能点开。README 本身没了，那些链接
+# 就成了断链里的断链。
+[ -f "$SRC/README.md" ] && cp "$SRC/README.md" "$SHAREDIR/README.md"
 
 # 入口是薄壳：它只负责把 PM_TEAM_HOME 指到资源目录后转发。
 # 这样 xteam 真正的路径解析只有 _find_root() 一处，不会出现两套逻辑。

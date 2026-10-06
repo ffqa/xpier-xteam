@@ -65,7 +65,15 @@ def known_attributes(tree: ast.Module, path: Path) -> dict[str, set[str]]:
 
 
 def class_bases(tree: ast.Module) -> dict[str, list[str]]:
-    """类名 → 基类名列表（只取 `ast.Name` 形式的基类）。"""
+    """类名 → 基类名列表。
+
+    基类可以写成 `Herdr(...)`，也可以写成 `lib.Herdr(...)` / `_lib.Herdr(...)`
+    —— 后者是**属性访问**而不是裸名字。原来只认裸名字，于是
+    `class Fake(_lib.Herdr)` 的子类「一个方法都没有」，紧接着
+    `fake.start_agent()` 被报成「不存在的方法」：**纯误报**，
+    而这个检查器自己的规矩是「宁可漏报，不要误报」。
+    两种写法都取末段名字即可 —— 末段才是类名，`lib.Herdr` 的基类就叫 Herdr。
+    """
     out: dict[str, list[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
@@ -73,7 +81,11 @@ def class_bases(tree: ast.Module) -> dict[str, list[str]]:
             # 局部 FakeXxx），ast.walk 是 BFS 不保证源码顺序，后写覆盖先写
             # 会把「有基类」的那个抹掉。
             got = out.setdefault(node.name, [])
-            got.extend(b.id for b in node.bases if isinstance(b, ast.Name))
+            for b in node.bases:
+                if isinstance(b, ast.Name):
+                    got.append(b.id)
+                elif isinstance(b, ast.Attribute):
+                    got.append(b.attr)
     return out
 
 

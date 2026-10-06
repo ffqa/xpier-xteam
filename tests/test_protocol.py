@@ -1999,7 +1999,55 @@ def test_atomic_json_and_swap_transaction() -> None:
     check("起新 agent 在关旧 tab 之前", i_start < i_close, True)
     check("新 agent 失败时明确说旧的不受影响",
           "原 {role} 保持不动" in src, True)
-    check("用临时名避开全局唯一约束", "swap-{role}-{label}" in src, True)
+    # 临时名经 agent_name() 合法化（大写 workspace 也能起），不断言字面量拼接。
+    check("用临时名避开全局唯一约束", "agent_name(f\"swap-{role}\"" in src, True)
+
+    # #3b **argv 真的把 --model 传出去了吗**
+    # 上面所有 agent_args() 断言都是在**单独**调它。而「它算对了」和
+    # 「start_agent 把它拼进了 argv」是两件事 —— PR #1 就栽在这里：
+    # `extra = spec.agent_args()` 那行还在，`argv += ["--"] + extra` 被删了。
+    # 于是 agent_args() 的单测全绿，而每个 agent 实际都跑在**默认模型**上：
+    # set-model / omp 默认这套设计整个失效，没有任何测试会红。
+    # 所以这里必须真跑一次 start_agent 抓 argv。
+    import xteam_lib as _lib
+
+    class _FakeHerdr(_lib.Herdr):
+        def __init__(self) -> None:          # 绕开 __init__ 里的真实探测
+            self.bin = "herdr"
+            self.scope = "Sites"             # 大写：agent_name 正是为它而加
+            self.calls: list[tuple] = []
+
+        def _run(self, *argv, **kw):        # noqa: D102
+            self.calls.append(argv)
+
+    class _Modelable(_lib.RoleSpec):
+        # 绕开 probe 状态：这里只关心「有 --model 时会不会被拼进 argv」，
+        # 而 tui_model_ok 依赖本机跑过 probe，会让结果随机器变。
+        def supports_tui_model(self) -> bool:
+            return True
+
+    _h = _FakeHerdr()
+    _h.start_agent("p1", "t1", _Modelable(role="pm", kind="devin", cn="开发",
+                                           model="devin-large"))
+    _argv0 = _h.calls[0]
+    check("start_agent 把 --model 拼进了 argv（agent_args 算对了不等于传出去了）",
+          "--model" in _argv0, True)
+    check("--model 后面紧跟模型名", "devin-large" in _argv0, True)
+    check("agent name 已合法化（大写 workspace → 小写 slug）", _argv0[2], "pm-sites")
+
+    # opencode 的 TUI 不认 --model，那类 kind 一个都不能传
+    class _NoModel(_lib.RoleSpec):
+        def supports_tui_model(self) -> bool:
+            return False
+
+    _h3 = _FakeHerdr()
+    _h3.start_agent("p2", "t2", _NoModel(role="pm", kind="opencode", cn="产品",
+                                         model="whatever"))
+    check("不支持 TUI model 的 kind 不传 --model", "--model" in _h3.calls[0], False)
+
+    # slug 太长时必须截断到 herdr 的 32 字符上限，而不是被拒
+    check("超长 workspace 名被截断到 32 字符",
+          len(_lib.agent_name("pm", "x" * 80)), 32)
 
 
 def test_recap_no_loop_and_next_slice_pushes() -> None:
@@ -2053,6 +2101,21 @@ def test_recap_no_loop_and_next_slice_pushes() -> None:
               "不是阻塞理由" in tl_charter, True)
         check("TL 章程列举了不算阻塞的实现选择",
               "全是实现选择" in tl_charter, True)
+        # 任务边界：spec 范围节 → request 禁区节 → review 先核禁区 → dev 多一点都不写。
+        # 缺任何一环，超范围改动都只在事后被发现（甚至不被发现）。
+        check("PM 章程要求 spec 写「范围」节",
+              "「范围」节" in pm_charter, True)
+        check("PM 章程写明 spec 没写的一律不做",
+              "spec 没写的，一律不做" in pm_charter, True)
+        check("TL 章程缺范围节的 spec 直接打回",
+              "缺范围节" in tl_charter, True)
+        check("TL 章程要求 request 写「禁区」节",
+              "「禁区」节" in tl_charter, True)
+        check("TL 章程 review 先核禁区",
+              "先核禁区" in tl_charter, True)
+        dev_charter = (repo_doc("roles/dev.md")).read_text(encoding="utf-8")
+        check("DEV 章程禁区是硬线多一点都不写",
+              "多一点都不写" in dev_charter, True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -242,10 +242,47 @@ gzip -9 "$DIST/$NAME.tar"
 CONTENTS="$(tar tzf "$DIST/$NAME.tar.gz")"
 for must in "$NAME/bin/xteam" "$NAME/bin/xteam_lib.py" "$NAME/install.sh" \
             "$NAME/roles/pm.md" "$NAME/templates/PROTOCOL.md" \
+            "$NAME/skills/ste/SKILL.md" \
             "$NAME/README.md" "$NAME/INSTALL.md" "$NAME/VERSION" \
             "$NAME/LICENSE" "$NAME/CHANGELOG.md" "$NAME/tests/smoke.sh"; do
   echo "$CONTENTS" | grep -qx "$must" || die "包缺 $must"
 done
+
+# **相对链接不许断。** docs/ 值得打包的唯一理由是 README 里的相对链接能点开。
+# 而「文件在包里」和「有人在文档里指向它」是两件事 —— 漏装只在用户点开那一刻
+# 才发现，那时已经在别人机器上了。所以抽出所有 docs/、skills/ 链接，逐个确认包里真有。
+#
+# **必须用 for 而不是 `while ... done < pipe`**：管道会起子 shell，循环里
+# 累加的 BROKEN 带不出来，于是断链被静默吞掉 —— 正是这个检查要防的那类失败。
+BROKEN=""
+# 只查 **README.md**：它和被它指向的 docs/ 一起装进 share/xteam/，相对链接在
+# 装完的副本里成立。
+# templates/PROTOCOL.md **不查** —— 它会被拷进**用户项目的** .xteam/，而 skills/
+# 留在 xteam 自己的安装目录里，两处不在一棵树上，相对链接注定解析不到。
+# 已把 PROTOCOL 里那个路径改成「安装目录下的 skills/…（doctor 会打印绝对路径）」。
+for doc in README.md; do
+  dir="$(dirname "$doc")"
+  # 两种写法都算「指向某文件」：markdown 链接 ](docs/x.md)，以及正文里用
+  # 反引号直接写路径（`skills/ste/SKILL.md`）。后者不算链接，但同样会在
+  # 用户「照着去找」时落空。
+  links="$(sed -nE \
+    -e 's/.*\]\((docs\/[^)#]+|skills\/[^)#]+)\).*/\1/p' \
+    -e 's/.*`(docs\/[^`]+|skills\/[^`]+)`.*/\1/p' \
+    "$doc" 2>/dev/null || true)"
+  for link in $links; do
+    # README 在包根，dirname 给 "."，直接拼会变成 "xteam-0.1.5/./docs/x.md"，
+    # 而 tar 清单里是 "xteam-0.1.5/docs/x.md" —— 前缀对不上，于是好包也报断链。
+    case "$dir" in
+      .) target="$NAME/$link" ;;
+      *) target="$NAME/$dir/$link" ;;
+    esac
+    if ! echo "$CONTENTS" | grep -q "^$target\$"; then
+      BROKEN="$BROKEN $doc->$link"
+    fi
+  done
+done
+[ -z "$BROKEN" ] || die "文档里指向的文件在包里断了：$BROKEN"
+say "文档指向的 docs/ + skills/ 文件都在包里"
 say "包内容完整（$(echo "$CONTENTS" | wc -l | tr -d ' ') 项）"
 
 # ---------------------------------------------------------------- 3. 验证
@@ -286,13 +323,22 @@ if [ "$VERIFY" = "1" ]; then
     # 比整段 --no-verify 强得多：那样连「解包副本能装能跑单测」都不验了。
     # 有 herdr 时仍然跑完整三层。
     if command -v herdr >/dev/null 2>&1; then
-      GATE_ARGS=()
+      GATE_MODE="full"
       GATE_LABEL="解包副本能独立跑三层门禁（可在目标机直接开发）"
     else
-      GATE_ARGS=(--no-e2e)
+      GATE_MODE="front2"
       GATE_LABEL="解包副本能跑门前两层（本机无 herdr，端到端在目标机验）"
     fi
-    if (cd "$TMP/$NAME" && bash tests/smoke.sh "${GATE_ARGS[@]}" >"$TMP/gate.log" 2>&1); then
+    # **不用空数组 + "${arr[@]}" 传可选参数。** bash 3.2（macOS 自带）在
+    # `set -u` 下展开**空**数组会报 `arr[@]: unbound variable` —— 而本机有
+    # herdr 时数组恰好是空的，于是「有 herdr」那条路径必然炸，且报错完全指不到
+    # 真正原因。改成两个显式分支。
+    if [ "$GATE_MODE" = "full" ]; then
+      _gate() { (cd "$TMP/$NAME" && bash tests/smoke.sh "$@" >"$TMP/gate.log" 2>&1); }
+    else
+      _gate() { (cd "$TMP/$NAME" && bash tests/smoke.sh --no-e2e >"$TMP/gate.log" 2>&1); }
+    fi
+    if _gate; then
       say "  ✓ $GATE_LABEL"
     else
       printf '%s\n' "──── 解包副本的门禁输出 ────"
