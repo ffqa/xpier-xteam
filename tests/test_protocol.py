@@ -1999,7 +1999,8 @@ def test_atomic_json_and_swap_transaction() -> None:
     check("起新 agent 在关旧 tab 之前", i_start < i_close, True)
     check("新 agent 失败时明确说旧的不受影响",
           "原 {role} 保持不动" in src, True)
-    check("用临时名避开全局唯一约束", "swap-{role}-{label}" in src, True)
+    # 临时名经 agent_name() 合法化（大写 workspace 也能起），不断言字面量拼接。
+    check("用临时名避开全局唯一约束", "agent_name(f\"swap-{role}\"" in src, True)
 
 
 def test_recap_no_loop_and_next_slice_pushes() -> None:

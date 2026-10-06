@@ -43,6 +43,7 @@ from xteam_lib import (  # noqa: E402
     REPO_KINDS,
     Registry,
     agent_catalog,
+    agent_name,
     load_verified_agents,
     probe_store_path,
     save_verified_agent,
@@ -1129,14 +1130,15 @@ def _swap_block_reason(state: str, force: bool) -> str:
     """换 agent 的安全阀。返回空串=放行，非空=该拒绝的理由。
 
     **working 时换掉等于把没做完的活连同上下文一起扔掉**，所以默认拦住。
-    blocked（它自己停下了）和 unknown（读不到状态）都放行 —— 前者没什么可丢，
+    blocked（它自己停下了）、unknown（读不到状态）和 absent（旧 agent
+    已死——比如用户在 pane 里手退了 omp，根本没有可丢的上下文）都放行。
     后者不该因为读不到就挡住人。抽成纯函数是为了能固定验证：真跑一次 swap 要起
     真 agent，太贵，而冒烟里那条断言是 flaky 的（刚投完章程的 agent 有时
     working、有时 idle，都合法）。
     """
-    if state in ("idle", "blocked", "unknown") or force:
+    if state in ("idle", "blocked", "unknown", "absent") or force:
         return ""
-    return (f"现在是 {state}，换掉会丢掉它正在做的上下文。\n"
+    return (f"{state}：换掉会丢掉它正在做的上下文。\n"
             "  等它 idle 再换；或先 `xteam say <角色> \"停下并写 recap\"`；"
             "确实要强换加 --force。")
 
@@ -1267,7 +1269,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
         die(f"找不到 {role} 的 tab（workspace 可能被手工动过）。先 `xteam status` 看看")
 
     brief = _handover_brief(root, proto, role)      # 交接底稿：旧 tab 关掉前先取
-    tmp_name = f"swap-{role}-{label}"
+    tmp_name = agent_name(f"swap-{role}", label)
     tab = herdr.create_tab(ws_id, str(root), f"swap-{role}",
                            env={"XTEAM_ROLE": role})
     new_tab = (tab.get("tab") or tab).get("tab_id")
@@ -1298,7 +1300,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
 
     # 新 agent 确实活了 → 这时才关旧 tab，并把新 agent 改名成正式名
     herdr.close_tab(tab_id)
-    formal = f"{role}-{label}"
+    formal = agent_name(role, label)
     herdr._run("agent", "rename", pane_id, formal)
     herdr._run("pane", "rename", pane_id, formal)
     herdr._run("tab", "rename", new_tab, formal)
