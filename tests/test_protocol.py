@@ -1844,6 +1844,7 @@ def test_slice_order_and_rules_staleness() -> None:
                 return "ok"
 
         orig_herdr = _cli.Herdr
+        orig_require = _cli._require_herdr          # 见下
         orig_roledir, orig_tpl = _cli.ROLES_DIR, _cli.TEMPLATES
         orig_skills = _cli.SKILLS_DIR
         tmp_inst = Path(tempfile.mkdtemp())
@@ -1858,6 +1859,13 @@ def test_slice_order_and_rules_staleness() -> None:
         (tmp_inst / "skills" / "ste" / "SKILL.md").write_text("规范 v1\n",
                                                               encoding="utf-8")
         _cli.Herdr = _FakeHerdr
+        # **必须把 _require_herdr 也换掉。** cmd_sync 第一件事就是
+        # `_require_herdr()`，它 `shutil.which("herdr")` 查不到就 `die()`。
+        # 本机装了 herdr，所以这条测试在本地一直是过的；CI 上没有 herdr，
+        # 于是它当场 SystemExit —— 而失败点在「基线是干净的」之后，
+        # 与真正被测的 sync 逻辑毫无关系，看日志根本猜不到是这里。
+        # 既然 Herdr 已经整个桩掉，再去要求真 herdr 就没有意义了。
+        _cli._require_herdr = lambda: None
         _cli.ROLES_DIR = tmp_inst / "roles"
         _cli.TEMPLATES = tmp_inst / "templates"
         _cli.SKILLS_DIR = tmp_inst / "skills"
@@ -1925,6 +1933,7 @@ def test_slice_order_and_rules_staleness() -> None:
                   any("contracts" in m for _p, m in sent_log), True)
         finally:
             _cli.Herdr = orig_herdr
+            _cli._require_herdr = orig_require
             _cli.ROLES_DIR, _cli.TEMPLATES = orig_roledir, orig_tpl
             _cli.SKILLS_DIR = orig_skills
             _cli._CLI_SURFACE[:] = []
@@ -2767,6 +2776,57 @@ def test_prompt_blocked_roles_detection() -> None:
           [])
 
 
+def test_confirm_delivery_conditional_enter() -> None:
+    print("\n[70] say 送达判据：转 working 才算；排队占位符才补 enter（F-5 口径）")
+
+    QUEUED = ("────────── (bypass permissions on) ─\n"
+              "❭ Press Enter to send queued messages now\n")
+    BUSY = " ● Thinking · 15m 29s\n"
+
+    class BellHerdr:
+        """agent_status 按序出值；_run/read_pane 记调用，供断言序列。"""
+        def __init__(self, states: list, tails: dict) -> None:
+            self._states = list(states)
+            self._tails = tails
+            self.calls: list = []
+        def agent_status(self, pane_id: str) -> str:
+            self.calls.append("agent_status")
+            return self._states.pop(0) if self._states else "done"
+        def read_pane(self, pane_id: str, lines: int = 60) -> str:
+            self.calls.append("read_pane")
+            return self._tails[pane_id]
+        def _run(self, *args):
+            self.calls.append(" ".join(args))
+            return {}
+
+    # 已经 working：直接算送达，不读尾巴不补 enter。
+    h = BellHerdr(["working"], {"p3": QUEUED})
+    check("已 working → 送达", _cli._confirm_delivery(h, "p3"),
+          (True, "working", False))
+    check("已 working 不读尾巴不补键", h.calls, ["agent_status"])
+
+    # done + 尾巴有占位符 → 补 enter → 复核转 working。
+    h = BellHerdr(["done", "working"], {"p3": QUEUED})
+    check("占位符在 → 补 enter 后送达", _cli._confirm_delivery(h, "p3"),
+          (True, "working", True))
+    check("补键后复核了 agent_status",
+          h.calls,
+          ["agent_status", "read_pane", "pane send-keys p3 enter",
+           "agent_status"])
+
+    # done + 尾巴无占位符（输入行可能有内容）→ 不补，未送达。
+    h = BellHerdr(["done"], {"p3": BUSY})
+    check("无占位符 → 不补、未送达", _cli._confirm_delivery(h, "p3"),
+          (False, "done", False))
+    check("无占位符没有 send-keys",
+          "send-keys" in " ".join(h.calls), False)
+
+    # 补了仍未转 working → 未送达。
+    h = BellHerdr(["done", "done"], {"p3": QUEUED})
+    check("补了仍 done → 未送达", _cli._confirm_delivery(h, "p3"),
+          (False, "done", True))
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -2838,6 +2898,7 @@ def main() -> int:
         test_workspace_belongs_gate,
         test_herdr_missing_converges_and_never_swallows,
         test_prompt_blocked_roles_detection,
+        test_confirm_delivery_conditional_enter,
     ):
         fn()
     print()
