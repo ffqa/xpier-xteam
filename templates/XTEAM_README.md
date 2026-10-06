@@ -9,8 +9,8 @@
 |---|---|---|
 | `PROTOCOL.md` | xteam | 协作协议全文（agent 每次上线先读它）|
 | `QUEUE.md` | pm/tl | 待办队列，唯一待办真相 |
+| `REPORT.md` | pm | 结项报告（全部切片闭合后写，目标/进度/部署/账号/边界） |
 | `tasks/<切片>/` | 三个角色 | 一个切片的完整工件链（见 PROTOCOL.md 的状态机）|
-| `memory/<role>-recap.md` | 各角色 | 切片收尾时写的交接摘要，**跨会话保留** |
 | `watch/events.log` | 巡检 | 巡检事件（告警 / 卡死 / 升级）|
 | `watch/timeline.log` | 各角色 + 巡检 | 三方共享时间线，谁在何时把活交给谁 |
 | `watch/idle.state` | 巡检 | 计时状态 |

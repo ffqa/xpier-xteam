@@ -74,8 +74,10 @@
       ├── PASS → (consumed.json round=m) → (closed.md) → 下一项
       └── FAIL → dev 改完重交 delivered round=n+1 → 回到 TL review
 
+阶段三 · 结项（全部切片闭合后，PM 欠 report）
+  (.xteam/REPORT.md)                 PM 写   ← 按 templates/REPORT-TEMPLATE.md
+
 贯穿全程 · 解阻塞（任何角色卡住都能触发，PM 优先处理）
-  (blocked.json round=p)   TL/DEV 写  ← 门铃 pm
       ↓
   (pm-response.json round=p)  PM 写  能自己定就定；真要人类拍板就 --waiting
 ```

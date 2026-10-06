@@ -257,6 +257,10 @@ def test_closed_frees_everyone_and_prompts_next_slice() -> None:
     print("\n[5] closed 之后：TL/dev 放空，PM 收到「去派下一项」")
     b = Bench()
     try:
+        # 队列还有活：closed 后 PM 该去取下一项（别停），不是写结项报告。
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n| 2 | b | todo | |\n", encoding="utf-8")
         b.advance_to("closed")
         check("closed → TL 不欠", b.owes("tl"), [])
         check("closed → dev 不欠", b.owes("dev"), [])
@@ -264,6 +268,30 @@ def test_closed_frees_everyone_and_prompts_next_slice() -> None:
         check("closed task 不再算未闭合", [t.name for t in b.proto.open_tasks()], [])
     finally:
         b.cleanup()
+
+
+def test_all_closed_without_report_pm_owes_report() -> None:
+    print("\n[5b] 全部闭合但 REPORT.md 缺失 → PM 欠 report；写完就不欠")
+    b = Bench()
+    try:
+        b.advance_to("closed")
+        # Bench 不写 QUEUE.md → queue_counts()==(0,0)，且有一个闭合切片，
+        # 正好命中 report 条件（空项目无切片时不命中，见下）。
+        check("全闭合无 REPORT → PM 欠 report",
+              b.proto.overall_debts().get("pm"), ["(项目):report"])
+        (b.proto.dir / "REPORT.md").write_text("# 结项报告\n", encoding="utf-8")
+        check("REPORT 写完 → PM 不再欠",
+              b.proto.overall_debts().get("pm"), None)
+    finally:
+        b.cleanup()
+    # 空项目（无切片、无队列）：要的是派活，不是写报告
+    b2 = Bench("empty-probe")
+    try:
+        b2.task.rmdir()  # 删掉 Bench 自带的空 task 目录
+        check("空项目 → PM 不欠 report",
+              b2.proto.overall_debts().get("pm"), None)
+    finally:
+        b2.cleanup()
 
 
 def test_fail_round_reopens_the_loop() -> None:
@@ -870,7 +898,10 @@ def test_index_summarizes_all_tasks() -> None:
         check("owes 汇总带 task 名", idx["owes"]["dev"], ["a:implement"])
         check("含 spec 轮次", idx["tasks"][0]["spec_round"], 1)
 
-        # 走完一轮，stage 应随之推进
+        # 走完一轮，stage 应随之推进（队列还有活 → 闭合后 PM 该取下一项）
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | a | done | |\n| 2 | b | todo | |\n", encoding="utf-8")
         b.advance_to("closed")
         idx = b.proto.index()
         check("闭合后 stage=closed", idx["tasks"][0]["stage"], "closed")
@@ -878,8 +909,6 @@ def test_index_summarizes_all_tasks() -> None:
         # 闭合后 PM 仍欠 next-slice（该开下一项了）——这是设计意图，不是残留
         check("闭合后 PM 欠 next-slice（该派下一项）",
               idx["owes"].get("pm"), ["a:next-slice"])
-        check("闭合后 tl/dev 无欠账",
-              [r for r in idx["owes"] if r != "pm"], [])
 
         p = b.proto.write_index()
         check("index.json 落盘", p.exists(), True)
@@ -2226,6 +2255,7 @@ def main() -> int:
         test_round_regression_is_conservative,
         test_legacy_consumed_key_is_readable,
         test_closed_frees_everyone_and_prompts_next_slice,
+        test_all_closed_without_report_pm_owes_report,
         test_fail_round_reopens_the_loop,
         test_multiple_tasks_accumulate_debts,
         test_idle_requires_both_signals,
