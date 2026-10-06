@@ -1935,8 +1935,8 @@ def test_slice_order_and_rules_staleness() -> None:
 
 
 
-def test_version_bump_carries_at_ten() -> None:
-    print("\n[新] 版本号满 10 进 1（十进制进位）")
+def test_version_bump_carries_at_hundred() -> None:
+    print("\n[新] 版本号满 100 进位（十进制，patch 可走到 99）")
     # 直接从 pack.sh 里**抽出真的 bump_version** 来跑，而不是在这里重写一遍 ——
     # 重写的话，测试就只验证了「我以为的规则」，pack.sh 改坏了也不会红。
     #
@@ -1970,23 +1970,36 @@ def test_version_bump_carries_at_ten() -> None:
                 capture_output=True, text=True)
             return r.stdout.strip() or f"<err:{r.stderr.strip()[:40]}>"
 
-        # 十进制进位：patch 到 9 再 +1 就进 minor，而不是走到 0.1.10
-        check("0.1.8 --patch→ 0.1.9", bump("0.1.8", "patch"), "0.1.9")
-        check("0.1.9 --patch→ 0.2.0（满 10 进 1，不产生 0.1.10）",
-              bump("0.1.9", "patch"), "0.2.0")
-        check("0.2.9 --patch→ 0.3.0", bump("0.2.9", "patch"), "0.3.0")
-        check("0.9.3 --minor→ 1.0.0（minor 满 10 也进位）",
-              bump("0.9.3", "minor"), "1.0.0")
-        check("0.1.9 --minor→ 0.2.0", bump("0.1.9", "minor"), "0.2.0")
-        check("0.1.9 --major→ 1.0.0", bump("0.1.9", "major"), "1.0.0")
+        # 频繁发版是常态，所以 patch 必须能一路走到 99 —— 满 10 进位会让人
+        # 每 10 次发版就被动升 minor，或者接受「0.1.10」这种别扭的号。
+        check("0.2.0 --patch→ 0.2.1", bump("0.2.0", "patch"), "0.2.1")
+        check("0.2.9 --patch→ 0.2.10（两位数不是问题）",
+              bump("0.2.9", "patch"), "0.2.10")
+        check("0.2.98 --patch→ 0.2.99", bump("0.2.98", "patch"), "0.2.99")
+        check("0.2.99 --patch→ 0.3.0（满 100 才进位）",
+              bump("0.2.99", "patch"), "0.3.0")
+        # minor/major 只在你主动升、或攒满 99 次时才动
+        check("0.1.99 --minor→ 0.2.0（主动升）", bump("0.1.99", "minor"), "0.2.0")
+        check("0.99.5 --minor→ 1.0.0（minor 也满 100 进位）",
+              bump("0.99.5", "minor"), "1.0.0")
+        check("0.2.0 --major→ 1.0.0（主动升）", bump("0.2.0", "major"), "1.0.0")
         # 越界的号也进位，不继续往上数
-        check("手改成 0.1.12 也能正确进位",
-              bump("0.1.12", "patch"), "0.2.0")
+        check("手改成 0.2.120 也能正确进位",
+              bump("0.2.120", "patch"), "0.3.0")
         check("非 X.Y.Z 被拒", bump("0.1.x", "patch").startswith("<err:"), True)
         check("未知档位被拒", bump("0.1.1", "huge").startswith("<err:"), True)
-        # **版本号绝不能出现 10**：这是本条规则存在的全部理由
-        check("结果里不会出现第 10 个 patch",
-              "0.1.10" in {bump(f"0.1.{i}", "patch") for i in range(20)}, False)
+
+        # 连升 200 次：**每段都不该出现三位数**。这是「上限 99」的全部理由 ——
+        # 三位数版本号会让一部分版本比较器（含 Homebrew 早期解析）措手不及。
+        seq = ["0.2.0"]
+        for _ in range(200):
+            seq.append(bump(seq[-1], "patch"))
+        check("连升 200 次后落在 0.4.0", seq[-1], "0.4.0")
+        three_digit = [v for v in seq
+                       if any(len(seg) > 2 for seg in v.split("."))]
+        check("全程不出现三位数段", three_digit[:3], [])
+        check("确实经过了 99（说明上限不是随手写的）",
+              any(v.endswith(".99") for v in seq), True)
 
 
 def test_model_name_sanity_filter() -> None:
@@ -2619,12 +2632,147 @@ def test_waiting_deps_excludes_cycles_and_typos() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_workspace_belongs_gate() -> None:
+    print("\n[67] status 显式 workspace 的归属闸（F-2 口径）")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root); proto.ensure()
+
+        class FakeHerdr:
+            """只答 detect_by_cwd 的桩——归属判据就认它 + session.json。"""
+            def __init__(self, hits: list) -> None: self._hits = hits
+            def detect_by_cwd(self, cwd: Path): return self._hits
+
+        wb = _cli._workspace_belongs
+        check("pane cwd 落在项目内 → 属于，放行",
+              wb(FakeHerdr([("inside", 4)]), proto, root, "inside"), True)
+        check("detect 查无此 ws → 不属于，要拒",
+              wb(FakeHerdr([]), proto, root, "other"), False)
+        check("detect 命中的是别的 ws，也不算属于",
+              wb(FakeHerdr([("inside", 4)]), proto, root, "other"), False)
+        (proto.dir / "session.json").write_text(
+            json.dumps({"workspace": "seen"}), encoding="utf-8")
+        check("session.json 记过的 workspace → 属于",
+              wb(FakeHerdr([]), proto, root, "seen"), True)
+        check("session.json 记的不是它 → 仍不属于",
+              wb(FakeHerdr([]), proto, root, "other"), False)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_herdr_missing_converges_and_never_swallows() -> None:
+    print("\n[68] herdr 缺失收敛到地基提示，且不吞其他异常（F-3 口径）")
+    import contextlib
+    import io
+
+    def func_raising(exc: Exception):
+        def _f(_a: argparse.Namespace) -> int:
+            raise exc
+        return _f
+
+    def func_ok(_a: argparse.Namespace) -> int:
+        return 7
+
+    ns = argparse.Namespace()
+
+    # herdr 抛的 FileNotFoundError → die（SystemExit(1)）+ 地基文案。
+    ns.func = func_raising(FileNotFoundError(2, "No such file or directory",
+                                             "herdr"))
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            _cli._dispatch(ns)
+        check("herdr FNF 应转成 die", "no-exit", "SystemExit")
+    except SystemExit as exc:
+        check("herdr FNF → SystemExit(1)", exc.code, 1)
+        check("提示含地基文案", "找不到 herdr" in buf.getvalue(), True)
+
+    # 别的 FileNotFoundError（项目文件丢了）照常抛出去，不吞。
+    ns.func = func_raising(FileNotFoundError(2, "No such file or directory",
+                                             str(Path("x") / "gone.txt")))
+    try:
+        _cli._dispatch(ns)
+        check("非 herdr FNF 应传播", "no-raise", "propagate")
+    except FileNotFoundError:
+        check("非 herdr FNF 不被收敛点吞掉", True, True)
+    except SystemExit:
+        check("非 herdr FNF 被误吞成 herdr 提示", False, True)
+
+    # 其他异常（编程错误）也不被吞。
+    ns.func = func_raising(ValueError("boom"))
+    try:
+        _cli._dispatch(ns)
+        check("ValueError 应传播", "no-raise", "propagate")
+    except ValueError:
+        check("ValueError 不被吞", True, True)
+
+    # 正常分发不受影响。
+    ns.func = func_ok
+    check("正常命令透传 rc", _cli._dispatch(ns), 7)
+
+    # 入口预检：which 查无 herdr → die；桩 which 而非环境，免得依赖本机装没装。
+    orig = _cli.shutil.which
+    try:
+        _cli.shutil.which = lambda _c: None
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                _cli._require_herdr()
+            check("预检应 die", "no-exit", "SystemExit")
+        except SystemExit as exc:
+            check("预检 herdr 缺失 → SystemExit(1)", exc.code, 1)
+            check("预检提示同一句地基文案",
+                  "找不到 herdr" in buf.getvalue(), True)
+    finally:
+        _cli.shutil.which = orig
+
+
+def test_prompt_blocked_roles_detection() -> None:
+    print("\n[69] status 的 blocked 判定：停在权限框的角色被标出（F-4 口径）")
+
+    PROMPT_TAIL = (" ● Running command\n"
+                   "❭ 1 Yes, allow `wc` commands\n"
+                   "  8 No\n"
+                   "↑↓ select · ↵ confirm · esc cancel\n")
+    PLAIN_TAIL = " ● Thinking · 15m 29s\n"
+
+    class PaneHerdr:
+        """只答 read_pane 的桩——判定的全部输入就是 pane 尾巴文本。"""
+        def __init__(self, tails: dict, fail: tuple = ()) -> None:
+            self._tails, self._fail = tails, set(fail)
+        def read_pane(self, pane_id: str, lines: int = 60) -> str:
+            if pane_id in self._fail:
+                raise RuntimeError("pane gone")
+            return self._tails[pane_id]
+
+    rows = [("pm",  "经理", "idle", "none", "", "p1"),
+            ("dev", "开发", "done", "implement", "cur", "p3")]
+
+    check("停在权限框的 dev 被标出",
+          _cli._prompt_blocked_roles(
+              PaneHerdr({"p1": PLAIN_TAIL, "p3": PROMPT_TAIL}), rows),
+          ["dev"])
+    check("无框不误报",
+          _cli._prompt_blocked_roles(
+              PaneHerdr({"p1": PLAIN_TAIL, "p3": PLAIN_TAIL}), rows),
+          [])
+    check("pane read 失败降级为无框、不抛错",
+          _cli._prompt_blocked_roles(
+              PaneHerdr({"p1": PLAIN_TAIL}, fail=("p3",)), rows),
+          [])
+    check("无 pane_id 的角色直接跳过",
+          _cli._prompt_blocked_roles(
+              PaneHerdr({}),
+              [("dev", "开发", "done", "implement", "cur", "")]),
+          [])
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
         test_unconsumed_verdict_keeps_dev_busy,
         test_round_regression_is_conservative,
-        test_version_bump_carries_at_ten,
+        test_version_bump_carries_at_hundred,
         test_legacy_consumed_key_is_readable,
         test_closed_frees_everyone_and_prompts_next_slice,
         test_all_closed_without_report_pm_owes_report,
@@ -2687,6 +2835,9 @@ def main() -> int:
         test_status_queue_count_matches_queue_items,
         test_blocked_answer_failure_escalates_not_answered,
         test_waiting_deps_excludes_cycles_and_typos,
+        test_workspace_belongs_gate,
+        test_herdr_missing_converges_and_never_swallows,
+        test_prompt_blocked_roles_detection,
     ):
         fn()
     print()

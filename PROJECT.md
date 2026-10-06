@@ -203,6 +203,18 @@ make release MINOR=1      # 升 minor
 make check                # 只跑门禁前两层 + 打包自证（不想发版时用）
 ```
 
+版本号**满 100 进位**（十进制）：`0.2.5 → … → 0.2.99 → 0.3.0`。这个项目发版频繁，
+满 10 进位会让人每 10 次发版就被动升 minor；`minor` / `major` 留给你主动升。
+每段上限 99 是刻意的 —— 三位数版本号会让部分版本比较器措手不及。
+
+**注意 `pack.sh --bump` 会自动提交 VERSION**（`make release` / `make bump` 都走它），
+升版本即落盘、不可逆 —— 所以**失败的版尝试也会烧掉一个版本号**（实测：两次失败的
+`make release` 把 0.1.9 推到了 0.2.1，一次都没发出去）。
+
+目前**没有**「只升版本不提交」的入口。要自己掌控节奏，只能手改 `VERSION` 再
+`make release`（它会再 +1，所以手改成 `x.y.(z-1)`），或者先 `git revert` 掉那次提交。
+如果这个摩擦反复出现，值得加一个 `make bump-version`（只改 VERSION、不提交）。
+
 CI（`.github/workflows/release.yml`）会：核对 tag 与 `VERSION` 一致 → 打包并自证可用
 → 建 Release（正文只取 CHANGELOG 当前版本那一段）→ 更新 `ffqa/homebrew-tap` 的 Formula。
 

@@ -306,12 +306,15 @@ assert_line "MP-12.6 api-side 行照常推进"  "api-side  →" "tl:assess"
 
 # status 要读到 workspace 才走到依赖段：替身升级为同时回答
 # workspace list 与 agent list（spec AC-S 注；agent 名必须是 pm-/tl-/dev-<label>）。
+# F-2 起归属判据还查 pane list 的 panes[].cwd —— 这里让 pane 的 cwd 落在仓内，
+# 否则正例会被当成外来 workspace 拒掉。
 mkdir -p "$BASE/bin12"
 cat > "$BASE/bin12/herdr" <<'EOF'
 #!/bin/sh
 case "$1 $2" in
   "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wS","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wS:t1","agent_status":"idle","focused":false}]}}' ;;
   "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wS:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wS:p1","cwd":"'"$ROOT"'"},{"pane_id":"wS:p2","cwd":"'"$ROOT"'"},{"pane_id":"wS:p3","cwd":"'"$ROOT"'"}]}}' ;;
   *) printf '%s\n' '{"result": {}}' ;;
 esac
 EOF
@@ -338,6 +341,195 @@ for n in a b bad fe-side api-side; do
     && ok "MP-12.9 未闭合清单含 $n" \
     || bad "MP-12.9 未闭合清单缺 $n" "$LINE9"
 done
+
+step "MP-13" "显式 --workspace 不属于本项目时 status 拒绝"
+# 复用 mp12 fixture（a↔b / bad→ap-side / fe-side→api-side / api-side 仍在）。
+T="$BASE/mp12"
+# 归属判据走 pane list 的 panes[].cwd（spec §2.2 注），替身必须答三个子命令；
+# PCWD 是三个 pane 的 cwd：反例指向别的目录，正例指向 A 自己。
+mkdir -p "$BASE/bin13" "$BASE/other-proj"
+cat > "$BASE/bin13/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wX","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wX:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wX:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$PCWD"'","workspace_id":"wX","tab_id":"wX:t1"},{"pane_id":"wX:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$PCWD"'","workspace_id":"wX","tab_id":"wX:t1"},{"pane_id":"wX:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$PCWD"'","workspace_id":"wX","tab_id":"wX:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wX:p1","cwd":"'"$PCWD"'"},{"pane_id":"wX:p2","cwd":"'"$PCWD"'"},{"pane_id":"wX:p3","cwd":"'"$PCWD"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin13/herdr"
+# 同 xin12，但 LABEL 与 pane 的 cwd 都可参数化（反例/正例共用一份替身）。
+xin13() {
+  local t="$1" lbl="$2" pcwd="$3"; shift 3
+  (cd "$t" && PATH="$BASE/bin13:$PATH" LABEL="$lbl" PCWD="$pcwd" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace "$lbl" "$@" </dev/null)
+}
+# macOS 上 /var → /private/var，断言「含 A 路径」要用解析后的真路径。
+ROOT13="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$T")"
+run xin13 "$T" other "$BASE/other-proj" status
+assert_rc   "MP-13.1 外来 workspace 被拒 rc≠0" nz
+assert_has  "MP-13.2 输出含 workspace 名 other" "other"
+assert_has  "MP-13.2 输出含项目 A 路径" "$ROOT13"
+printf '%s' "$LAST_OUT" | grep -qF 'xteam say' \
+  && bad "MP-13.3 输出不该含 xteam say（会叫错 pane）" "$LAST_OUT" \
+  || ok  "MP-13.3 输出不含 xteam say"
+printf '%s' "$LAST_OUT" | grep -qF '欠 ' \
+  && bad "MP-13.4 输出不该含「欠 」义务行" "$LAST_OUT" \
+  || ok  "MP-13.4 输出不含「欠 」义务行"
+printf '%s' "$LAST_OUT" | grep -qE 'restore|projects' \
+  && ok  "MP-13.5 输出给出下一步命令（restore/projects）" \
+  || bad "MP-13.5 输出缺下一步命令" "$LAST_OUT"
+run xin13 "$T" inside "$T" status
+assert_rc   "MP-13.6 属于本项目的 workspace 放行 rc=0" 0
+assert_line "MP-13.6 角色表照常：tl 欠 wait-dep" "tl " "wait-dep"
+assert_line "MP-13.6 等前置行含 fe-side←api-side" \
+  "等前置（不是卡住）" "fe-side←api-side"
+assert_line "MP-13.6 等前置行不含 bad←" "等前置（不是卡住）" "" "bad←"
+assert_line "MP-13.6 等前置行不含 a←"   "等前置（不是卡住）" "" "a←"
+assert_line "MP-13.6 等前置行不含 b←"   "等前置（不是卡住）" "" "b←"
+run xin "$T" status
+assert_rc  "MP-13.7 不显式给 --workspace 时行为不变 rc≠0" nz
+assert_has "MP-13.7 仍走「还没有在跑的 workspace」提示" "还没有在跑的 workspace"
+
+# ---------------------------------------------------------------- MP-14
+step "MP-14" "herdr 不在 PATH：六条命令给地基提示（rc≠0，无 traceback）"
+
+# 布景必须是「已 init」的项目：空目录走的是 .xteam-缺失路径，跟本片无关。
+T="$BASE/mp14"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-14.0 init 布景 rc=0" 0
+
+# env -i 把环境清空再显式给回 PATH/HOME：PATH 里既没有真 herdr 也没有
+# 上面的替身；HOME 留着是因为 python/xteam 会读它（spec AC-1 布景要求）。
+# down / swap 只许打临时仓 —— T 正是 BASE 下的 mktemp 仓，脚本结束随 trap 清掉。
+for c in "restore" "status" "watch once" "sync" "down" "swap pm pi"; do
+  run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+    python3 "$REPO/bin/xteam" --project "$T" $c
+  assert_rc "MP-14.1 $c rc≠0" nz
+  printf '%s' "$LAST_OUT" | grep -qF 'Traceback (most recent call last)' \
+    && bad "MP-14.2 $c 抛了 traceback" "$LAST_OUT" \
+    || ok  "MP-14.2 $c 不含 traceback"
+  assert_has "MP-14.3 $c 含地基提示" "找不到 herdr"
+done
+
+# AC-2 旁路：同环境下不依赖 herdr 的命令照常。
+run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+  python3 "$REPO/bin/xteam" --project "$T" projects
+assert_rc "MP-14.4 projects rc=0" 0
+run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+  python3 "$REPO/bin/xteam" --project "$T" doctor
+assert_rc "MP-14.5 doctor rc=0" 0
+run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+  python3 "$REPO/bin/xteam" --project "$T" agents
+assert_rc "MP-14.6 agents rc=0" 0
+run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+  python3 "$REPO/bin/xteam" --project "$T" stamp pm x
+assert_rc "MP-14.7 stamp pm x rc=0" 0
+
+# ---------------------------------------------------------------- MP-15
+step "MP-15" "status：pane 停在权限框上的角色显示 blocked（不是 done）"
+
+T="$BASE/mp15"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-15.0 init 布景 rc=0" 0
+# request.md 落盘 → 阶段 implement → dev 欠 implement（布景三场景共用这笔欠账）。
+mk_task "$T" cur '{}'
+printf '# request\n' > "$T/.xteam/tasks/cur/request.md"
+
+# 三段尾巴原文逐字抄自 spec §2.1（PM 实抓）。检测器只认完整形态：
+# 只留两行选项会返回 False，替身必须带 footer 或命令上下文（spec 已警示）。
+cat > "$BASE/tailA.txt" <<'EOF'
+ ● Running command
+ │ $ cd /Users/gouki/server/wwwroot/xpier/xteam && grep -n "lint_shell\|e2e\|smoke" pack.sh | head -20; echo "=== wc ==="; wc -l pack.sh tests/
+ └   lint_shell.py bin/xteam bin/xteam_lib.py PROJECT.md
+
+❭ 1 Yes  (Approve once)
+  2 Yes, allow `wc` commands
+  3 Yes, always allow `wc` commands in `xteam`
+  4 Yes, always allow `wc` commands in all projects
+  5 Yes, switch to bypass mode
+  6 Edit command
+  7 Describe change to command
+  8 No
+↑↓ select · ↵ confirm · esc cancel
+EOF
+cat > "$BASE/tailB.txt" <<'EOF'
+ ● Read lines 1095-1244 in ./bin/xteam_lib.py
+ └ 150 lines
+⢠⡀ Thinking · 15m 29s (esc twice to interrupt)
+❭ Guide Devin while it works
+EOF
+cat > "$BASE/tailC.txt" <<'EOF'
+────────────────────────────── (bypass permissions on) ─
+❭ Press Enter to send queued messages now
+────────────────────────────────────────────────────────
+SWE-2 Max
+EOF
+
+# 替身答四个子命令（spec §2.1）：workspace/agent/pane list + pane read。
+# pane read 返回纯文本（read_pane 取 stdout 原样）；dev 的尾巴由 TAIL 环境变量
+# 切换，三个布景共用同一替身。pm/tl 回一行中性文本（不含权限标记）。
+mkdir -p "$BASE/bin15"
+cat > "$BASE/bin15/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wS","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wS:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wS:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p3","name":"dev-'"$LABEL"'","agent_status":"done","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wS:p1","cwd":"'"$ROOT"'"},{"pane_id":"wS:p2","cwd":"'"$ROOT"'"},{"pane_id":"wS:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  "pane read")      case "$3" in
+                      "wS:p3") cat "$TAIL" ;;
+                      *) printf ' ● Thinking · 1m 0s\n' ;;
+                    esac ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin15/herdr"
+xin15() {
+  local t="$1"; local tail="$2"; shift 2
+  (cd "$t" && PATH="$BASE/bin15:$PATH" LABEL=e2ews ROOT="$t" TAIL="$tail" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace e2ews "$@" </dev/null)
+}
+
+# 布景 A：dev agent_status=done + 欠 implement + pane 尾巴是权限框。
+run xin15 "$T" "$BASE/tailA.txt" status
+assert_rc "MP-15.A status rc=0" 0
+DEVLINE="$(printf '%s\n' "$LAST_OUT" | grep -E '^dev ' | head -1)"
+printf '%s' "$DEVLINE" | grep -qE '(^|[[:space:]])blocked([[:space:]]|$)' \
+  && ok  "MP-15.1 dev 行状态列为整词 blocked" \
+  || bad "MP-15.1 dev 行未见整词 blocked" "$DEVLINE"
+assert_has "MP-15.2 输出含「停在」说明" "停在"
+printf '%s' "$LAST_OUT" | grep -qF 'dev (idle 自' \
+  && bad "MP-15.3 仍把 dev 报成普通空闲" "$LAST_OUT" \
+  || ok  "MP-15.3 不含 dev (idle 自"
+printf '%s' "$LAST_OUT" | grep -qF 'dev (done 自' \
+  && bad "MP-15.3 仍把 dev 报成已完成" "$LAST_OUT" \
+  || ok  "MP-15.3 不含 dev (done 自"
+
+# 布景 B：正常干活的尾巴 → 不许误报。
+run xin15 "$T" "$BASE/tailB.txt" status
+assert_rc "MP-15.B status rc=0" 0
+DEVLINE="$(printf '%s\n' "$LAST_OUT" | grep -E '^dev ' | head -1)"
+printf '%s' "$DEVLINE" | grep -q 'blocked' \
+  && bad "MP-15.4 正常干活被误报 blocked" "$DEVLINE" \
+  || ok  "MP-15.4 dev 行不含 blocked"
+printf '%s' "$DEVLINE" | grep -q 'done' \
+  && ok  "MP-15.4 dev 行仍是 done（渲染其余内容不变）" \
+  || bad "MP-15.4 dev 行丢了 done" "$DEVLINE"
+
+# 布景 C：排队消息框 → 边界断言，本片不许覆盖（F-5 另做）。
+run xin15 "$T" "$BASE/tailC.txt" status
+assert_rc "MP-15.C status rc=0" 0
+DEVLINE="$(printf '%s\n' "$LAST_OUT" | grep -E '^dev ' | head -1)"
+printf '%s' "$DEVLINE" | grep -q 'blocked' \
+  && bad "MP-15.6 排队消息框被误报 blocked（越界进了 F-5）" "$DEVLINE" \
+  || ok  "MP-15.6 dev 行不含 blocked"
+printf '%s' "$LAST_OUT" | grep -qF '停在' \
+  && bad "MP-15.6 排队消息框不该产生「停在」说明" "$LAST_OUT" \
+  || ok  "MP-15.6 输出不含「停在」说明"
+
+# MP-15.5 回归：本文件 112 条既有断言全部继续通过即自动满足（末行 N/N）。
 
 # ---------------------------------------------------------------- 收尾
 printf '\n'

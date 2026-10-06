@@ -977,6 +977,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
     proto = Protocol(root)
     if not proto.dir.is_dir():
         die(f"{proto.dir} 不存在，这个项目没用 xteam 起过。先 xteam up .")
+    _require_herdr()
     label, _ = resolve_ws_label(root, args.workspace)
     herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
@@ -1111,6 +1112,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     """
     root = Path(args.project).resolve()
     proto = Protocol(root)
+    _require_herdr()
     proto.ensure()
     label, _ws_why = resolve_ws_label(root, args.workspace)
     herdr = Herdr(scope=label)
@@ -1333,6 +1335,7 @@ def cmd_swap(args: argparse.Namespace) -> int:
     kind = normalize_kind(args.agent) if args.agent else base.kind
     spec = _with_default_model(RoleSpec(role, kind, base.cn, args.model or base.model))
 
+    _require_herdr()
     herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
     if not ws:
@@ -1631,6 +1634,31 @@ def cmd_up(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- say
 
 
+def _confirm_delivery(herdr: Herdr, pane: str) -> tuple[bool, str, bool]:
+    """门铃送达判据：目标 agent_status 转 working（PROTOCOL.md:201）。
+
+    返回 (已送达, 最新状态, 是否补过 enter)。只有 pane 尾巴出现排队占位符行
+    `❭ Press Enter to send queued messages now`（= 输入行为空）才补一次
+    send-keys enter 再复核；输入行有内容时不抢按回车——会把用户打了一半的
+    字一起提交（Herdr.doorbell() 注释钉的那条实测）。
+    """
+    cur = herdr.agent_status(pane)
+    if cur == "working":
+        return True, cur, False
+    try:
+        tail = herdr.read_pane(pane)
+    except Exception:                            # noqa: BLE001
+        tail = ""
+    if "❭ Press Enter to send queued messages now" not in tail:
+        return False, cur, False
+    try:
+        herdr._run("pane", "send-keys", pane, "enter")
+    except RuntimeError:
+        pass                                     # 补键失败落到复核：仍非 working 即未送达
+    cur = herdr.agent_status(pane)
+    return cur == "working", cur, True
+
+
 def cmd_say(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     proto = Protocol(root)
@@ -1658,11 +1686,20 @@ def cmd_say(args: argparse.Namespace) -> int:
     log_event(proto.dir / "watch" / "doorbell.log", f"-> {args.role}: {args.message[:80]}")
     # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
     # 「刚才那声门铃到底有没有把它叫醒、什么时候叫的」。
-    print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
     if status.startswith("prompt-failed"):
+        print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
         print("  ⚠ 投递失败，角色可能不可达（pane 崩了 / 停在审批 UI）", file=sys.stderr)
         return 1
-    return 0
+    prev = status.removeprefix("status=")
+    delivered, cur, pressed = _confirm_delivery(herdr, pane)
+    if delivered:
+        print(f"[{now()}] 门铃 → {args.role} ({pane})  已送达（{prev} → working）")
+        return 0
+    why = (f"补 enter 后仍是 {cur}" if pressed
+           else "尾巴无排队占位符，不抢按回车")
+    print(f"[{now()}] 门铃 → {args.role} ({pane})  未送达（{why}）")
+    print(f"  ⚠ 未送达：{why}", file=sys.stderr)
+    return 1
 
 
 # ---------------------------------------------------------------- status
@@ -1725,8 +1762,67 @@ def _waiting_deps(proto: Protocol, tasks: list[Path]) -> dict[str, list[str]]:
             and not proto.missing_deps(t)}
 
 
+def _workspace_belongs(herdr: Herdr, proto: Protocol, root: Path,
+                     label: str) -> bool:
+    """显式指定的 workspace 是否属于本项目。
+
+    复用 resolve_ws_label 的既有口径，不新造判据：session.json 记过它，
+    或它的 pane 的 cwd 落在项目目录内（detect_by_cwd）。任一命中即属于。
+    """
+    if _read_json(proto.dir / "session.json").get("workspace") == label:
+        return True
+    return any(lbl == label for lbl, _ in herdr.detect_by_cwd(root))
+
+
+def _prompt_blocked_roles(herdr: Herdr, rows: list[tuple]) -> list[str]:
+    """哪些角色的 pane 正停在权限/选项框上（此时 agent_status 可能是 done/idle）。
+
+    每角色至多一次 pane read，不新增阻塞等待；读失败（pane 没了等）当作无框
+    降级——herdr 在不在由入口 _require_herdr 把关，走到这里只是单个 pane 的事。
+    """
+    out = []
+    for role, _cn, _st, _ow, _wh, pane in rows:
+        if not pane:
+            continue
+        try:
+            det = detect_permission_prompt(herdr.read_pane(pane))
+        except Exception:                            # noqa: BLE001
+            continue
+        if det["is_permission"]:
+            out.append(role)
+    return out
+
+
+# 与 RoleSpec.preflight_env（bin/xteam_lib.py:356）同一措辞——herdr 缺失是
+# 「地基不在」，不是命令失败，六个依赖它的入口共用这一句 + 一个提示下一步。
+HERDR_MISSING = ("找不到 herdr —— 它是 xteam 的地基（管 pane / agent 状态 / 门铃）。\n"
+                 "  装好并启动它的 server 后再试：herdr")
+
+
+def _require_herdr() -> None:
+    """herdr 不在 PATH 就一句人话拒掉，别让 subprocess 的 FileNotFoundError 见人。"""
+    if shutil.which("herdr") is None:
+        die(HERDR_MISSING)
+
+
+def _dispatch(args: argparse.Namespace) -> int:
+    """分发 + FileNotFoundError('herdr') 收敛点。
+
+    预检（_require_herdr）之外的 herdr 调用点（doorbell / read_pane 等）走到
+    subprocess 时仍会抛 FileNotFoundError——只接 filename 是 herdr 的这一条
+    已知路径，别的 FileNotFoundError（项目文件丢了之类）照常炸出来。
+    """
+    try:
+        return args.func(args)
+    except FileNotFoundError as exc:
+        if Path(str(exc.filename or "")).name == "herdr":
+            die(HERDR_MISSING)
+        raise
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
+    _require_herdr()
     label, _ws_why = resolve_ws_label(root, args.workspace)
     proto = Protocol(root)
     # 章程/协议/输出规范改了但没投给正在跑的 pane —— 主动提示，别让人自己想起来 sync
@@ -1740,6 +1836,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"  开跑：xteam --project {root} up . --watch")
         print(f"  看协议层现状（不需要 workspace）：xteam --project {root} projects")
         return 1
+
+    # 显式点了不属于本项目的 workspace：继续走下去会把 A 的欠账算到 B 的 pane
+    # 上，输出的 xteam say 会叫错人 —— 不如直接拒，指一条正确的路。
+    if args.workspace and not _workspace_belongs(herdr, proto, root, label):
+        print(f"[{now()}] workspace {label!r} 不属于本项目（{root}）："
+              "它的 pane 都不在这个目录里。")
+        print(f"  本项目现场：xteam --project {root} restore")
+        print(f"  协议层现状：xteam --project {root} projects")
+        return 1
+
     role_map = herdr.role_map(ws["workspace_id"])
     if not role_map:
         # **workspace 在 ≠ 在跑。** down 之后 workspace 是保留的，所以
@@ -1775,6 +1881,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     for row in rows:
         tracker.observe(row[0], row[2], role_map[row[0]].get("state_change_seq"))
 
+    # 停在权限/选项框上的 pane 会被 agent_status 报成 done/idle，与「真做完」
+    # 同形。tracker.observe 用的是原始 status——「blocked」只是显示层标记，
+    # 不落 idle.state，巡检的判定链不受它影响。
+    blocked_on_prompt = _prompt_blocked_roles(herdr, rows)
+    if blocked_on_prompt:
+        rows = [r[:2] + ("blocked",) + r[3:] if r[0] in blocked_on_prompt else r
+                for r in rows]
+
     width = max(len(r[0]) for r in rows)
     print(f"xteam status  {now()}   workspace={args.workspace!r} ({ws['workspace_id']})")
     print(f"project={root}")
@@ -1801,7 +1915,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"{'role'.ljust(width)}  {'状态':<8}  {'持续':<8}  {'起始于':<14}  {'最后活动':<14}  义务 / 在哪")
     print("-" * (width + 74))
     for role, cn, status, owes, where, pane in rows:
-        if tracker.is_fake_working(role):
+        # blocked 优先于 假working：停在框上时 seq 必然停滞，两种判定会同时命中，
+        # 但真相是「被框卡住」，不是「声称在干活」。
+        if status != "blocked" and tracker.is_fake_working(role):
             status = "假working"       # 声称在干活但 seq 停滞
         held = fmt_duration(stamp_now - tracker.state_since(role))
         since_at = fmt_epoch(tracker.state_since(role))
@@ -1816,12 +1932,15 @@ def cmd_status(args: argparse.Namespace) -> int:
         if owes != "none":
             idle_hits.append((role, status, owes, where,
                               fmt_epoch(tracker.state_since(role))))
+    if blocked_on_prompt:
+        print(f"\n⚠ {'、'.join(blocked_on_prompt)} 停在权限/选项框上（不是做完）"
+              " —— 去它的 pane 里作答，或 `xteam watch once` 让巡检处理")
     if idle_hits:
         print("\n⚠ 该动没动：")
         for role, status, owes, where, since_at in idle_hits:
             print(f"   {role} ({status} 自 {since_at}) 欠 {owes} @ {where}")
             print(f"      → xteam say {role} \"{OBLIGATIONS.get(owes, '')}\"")
-    else:
+    elif not blocked_on_prompt:
         print("\n✓ 无欠账角色。真 idle 且 owes:none 是合法终态（做完了在等下一项）。")
 
     queue = proto.dir / "QUEUE.md"
@@ -2697,6 +2816,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 0
 
     if args.action == "once":
+        _require_herdr()
         herdr = Herdr(scope=label)
         _watch_cycle(root, herdr, tracker, logf)
         print(logf.read_text(encoding="utf-8").splitlines()[-1] if logf.exists() else "(无事件)")
@@ -2863,6 +2983,7 @@ def _stop_watchdog(root: Path, project: str) -> None:
 
 def cmd_down(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
+    _require_herdr()
     label, _ws_why = resolve_ws_label(root, args.workspace)
     herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
@@ -3119,7 +3240,7 @@ def main() -> int:
         args.project = args.dir
     elif getattr(args, "project", None) in (None, ""):
         args.project = "."
-    return args.func(args)
+    return _dispatch(args)
 
 def _detect_role() -> str:
     """从 herdr 环境变量推断当前角色，省得 agent 手打自己的名字。
