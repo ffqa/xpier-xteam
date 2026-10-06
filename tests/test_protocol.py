@@ -2054,6 +2054,21 @@ def test_recap_no_loop_and_next_slice_pushes() -> None:
               "不是阻塞理由" in tl_charter, True)
         check("TL 章程列举了不算阻塞的实现选择",
               "全是实现选择" in tl_charter, True)
+        # 任务边界：spec 范围节 → request 禁区节 → review 先核禁区 → dev 多一点都不写。
+        # 缺任何一环，超范围改动都只在事后被发现（甚至不被发现）。
+        check("PM 章程要求 spec 写「范围」节",
+              "「范围」节" in pm_charter, True)
+        check("PM 章程写明 spec 没写的一律不做",
+              "spec 没写的，一律不做" in pm_charter, True)
+        check("TL 章程缺范围节的 spec 直接打回",
+              "缺范围节" in tl_charter, True)
+        check("TL 章程要求 request 写「禁区」节",
+              "「禁区」节" in tl_charter, True)
+        check("TL 章程 review 先核禁区",
+              "先核禁区" in tl_charter, True)
+        dev_charter = (repo_doc("roles/dev.md")).read_text(encoding="utf-8")
+        check("DEV 章程禁区是硬线多一点都不写",
+              "多一点都不写" in dev_charter, True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
