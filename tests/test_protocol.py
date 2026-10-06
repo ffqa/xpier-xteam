@@ -1939,8 +1939,16 @@ def test_version_bump_carries_at_ten() -> None:
     print("\n[新] 版本号满 10 进 1（十进制进位）")
     # 直接从 pack.sh 里**抽出真的 bump_version** 来跑，而不是在这里重写一遍 ——
     # 重写的话，测试就只验证了「我以为的规则」，pack.sh 改坏了也不会红。
-    pack = (Path(__file__).resolve().parent.parent / "pack.sh").read_text(
-        encoding="utf-8")
+    #
+    # pack.sh 只存在于**源码布局**：install.sh 装的是 bin/ roles/ templates/
+    # tests/ docs/，不含 pack.sh（它是发版工具，不是运行时）。所以装完的副本里
+    # 跑不到这条 —— **必须跳过而不是崩**。崩掉的话，`pack.sh --worktree` 的
+    # 自证会失败，而那条链路正是发版前的最后一道闸。
+    pack_path = Path(__file__).resolve().parent.parent / "pack.sh"
+    if not pack_path.exists():
+        print("     （本机是安装布局，没有 pack.sh —— 跳过版本进位检查）")
+        return
+    pack = pack_path.read_text(encoding="utf-8")
     m = re.search(r"^bump_version\(\) \{.*?^\}", pack, re.S | re.M)
     check("pack.sh 里找得到 bump_version", bool(m), True)
     if not m:
