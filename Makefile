@@ -81,30 +81,34 @@ release: verify
 	@echo
 	@echo '▸ 升版本并提交'
 	@bash pack.sh $(BUMP_FLAG)
-	@NEWV=$$(tr -d '[:space:]' < VERSION); \
-	if [ -z "$$(git status --porcelain)" ]; then \
-		echo '  工作区干净'; \
-	else \
-		echo '  还有未提交改动，一并提交：'; git status --short; \
-		git add -A && git commit -q -m "release: $$NEWV"; \
-	fi
+	@echo
+	@echo '▸ 提交剩余改动（如果有）'
+	@bash -c 'set -euo pipefail; \
+	  if [ -z "$$(git status --porcelain)" ]; then \
+	    echo "  工作区干净"; \
+	  else \
+	    echo "  还有未提交改动，一并提交："; git status --short; \
+	    git add -A; git commit -q -m "release: $$(tr -d "[:space:]" < VERSION)"; \
+	  fi'
 	@echo
 	@echo '▸ 打包自证（确认这个包真能用）'
 	@bash pack.sh
-	@NEWV=$$(tr -d '[:space:]' < VERSION)
 	@echo
-	@echo '▸ 打 tag 并推送'
-	@git tag -a "xteam-v$$NEWV" -m "release $$NEWV"
-	@git push origin main
-	@git push origin "xteam-v$$NEWV"
-	@echo
-	@echo '✓ tag xteam-v$$NEWV 已推送'
-	@echo '  CI 会接着：核对 tag 与 VERSION → 打包 → 建 Release → 更新 $(TAP)'
-	@echo '  看进度：gh run watch  （或 gh run list）'
-	@echo
-	@echo '  发完后：'
-	@echo '    brew tap ffqa/tap'
-	@echo '    brew install ffqa/tap/xteam'
+	@bash -c 'set -euo pipefail; \
+	  NEWV=$$(tr -d "[:space:]" < VERSION); \
+	  if [ -z "$$NEWV" ]; then echo "VERSION 是空的" >&2; exit 1; fi; \
+	  if ! grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$$" <<<"$$NEWV"; then \
+	    echo "VERSION 不是 X.Y.Z 形式：$$NEWV" >&2; exit 1; fi; \
+	  echo "▸ 打 tag 并推送"; \
+	  git tag -a "xteam-v$$NEWV" -m "release $$NEWV"; \
+	  git push origin main; \
+	  git push origin "xteam-v$$NEWV"; \
+	  echo; echo "✓ tag xteam-v$$NEWV 已推送"; \
+	  echo "  CI 会接着：核对 tag 与 VERSION → 打包 → 建 Release → 更新 $(TAP)"; \
+	  echo "  看进度：gh run watch  （或 gh run list）"; \
+	  echo; echo "  发完后："; \
+	  echo "    brew tap ffqa/tap"; \
+	  echo "    brew install ffqa/tap/xteam"'
 
 clean:
 	@rm -rf dist
