@@ -94,6 +94,15 @@ from xteam_lib import (  # noqa: E402
     rules_fingerprint,
     save_rules_state,
     stale_rules,
+    cli_drift,
+    injected_meta,
+    is_protocol_drift,
+    load_update_cache,
+    newer_than,
+    refresh_update_cache,
+    update_hint,
+    display_version,
+    UPSTREAM_REPO,
 )
 
 def _ensure_xteam_readme(root: Path, team_dir: Path) -> None:
@@ -187,6 +196,51 @@ def _version() -> str:
 HERE = _find_root()
 ROLES_DIR = HERE / "roles"
 TEMPLATES = HERE / "templates"
+SKILLS_DIR = HERE / "skills"
+# 由 main() 建完 subparsers 时填充（见 _cli_surface 的说明）
+_CLI_SURFACE: list[str] = []
+
+
+def _installed_version() -> str:
+    """本机跑的是哪个版本的 xteam。
+
+    **直接复用 `_version()`，不自己再写一份。** 之前单独读 `HERE/VERSION`，
+    结果在开发布局下拿到空串 —— 因为 `_find_root()` 优先选**已安装**的
+    `~/.local/share/xteam`，而那份可能是 0.1.5 之前的旧副本（那时还不装
+    VERSION），于是 `xteam update` 打印「本机 xteam ?」。
+    `_version()` 早就把「脚本所在包 → HERE → HERE.parent」这几处都试过了。
+    """
+    v = _version()
+    return "" if v == "未知" else v
+
+
+def _cli_surface() -> list[str]:
+    """CLI 暴露的子命令名（排序）。
+
+    存进 rules.json 当作「投进去那次的面」：新增子命令属于**工具能力**变化，
+    章程一个字没动，所以 sync 只告知、不重投章程。靠这份快照做差集。
+
+    数据由 main() 建完 subparsers 时写进 _CLI_SURFACE —— **不在这里重新解析**，
+    因为解析器是在 main() 里现搭的；另写一份「命令清单」常量必然会和实际漂移。
+    """
+    return sorted(_CLI_SURFACE)
+
+
+def _skills_display(key: str) -> str:
+    """指纹键 `skills/ste/SKILL.md` → 给 agent 看的可读路径（安装目录里）。"""
+    rel = key[len("skills/"):]
+    try:
+        return str(SKILLS_DIR / rel)
+    except (TypeError, ValueError):
+        return key
+
+
+def _save_sync_state(root: Path) -> None:
+    """落「投进去的是哪一版」：指纹 + 版本号 + CLI 面。"""
+    save_rules_state(root,
+                     rules_fingerprint(ROLES_DIR, TEMPLATES / "PROTOCOL.md",
+                                       SKILLS_DIR),
+                     version=_installed_version(), cli=_cli_surface())
 
 
 def check_assets() -> None:
@@ -1047,7 +1101,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if not ws:
         die(f"找不到 workspace {args.workspace!r}（先跑 xteam up）")
     # 检测哪些规则改了还没投给正在跑的 pane
-    stale = set(stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+    stale = set(stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md",
+                            SKILLS_DIR))
+    new_cmds = cli_drift(root, _cli_surface())
     role_map = herdr.role_map(ws["workspace_id"])
 
     src = TEMPLATES / "PROTOCOL.md"
@@ -1061,21 +1117,55 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"[{now()}] 检测到变更：{'、'.join(sorted(stale))}")
     else:
         print(f"[{now()}] 章程与协议都没变化，不打扰正在跑的 pane")
+
+    # 协议/输出规范变了 → **所有人都得知道**，哪怕他自己的章程一个字没动。
+    # 这就是原来那个 bug：stale 里只有 "PROTOCOL" 时，三个角色都不在 stale 里，
+    # `if stale and role not in stale: continue` 于是把所有人都跳过了。
+    shared = sorted(k for k in stale if is_protocol_drift(k))
     sent = 0
     for role in targets:
         # **只重投真的变了的。** 原来每次 sync 都把三份章程全推一遍，agent 得
         # 重读没变的内容——既噪音，又把真正的变更淹掉。
-        if stale and role not in stale:
+        charter_changed = role in stale
+        # 三类都要算进来。漏掉 new_cmds 的后果是：**只新增了子命令时一个角色都
+        # 不会被通知** —— 而 agent 不知道新命令存在，就永远不会去用。
+        if not charter_changed and not shared and not new_cmds:
             continue
-        charter = (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
-        msg = (f"【协议更新】你的角色章程已更新，请重读并立即生效：\n"
-               f"{charter}")
-        result = herdr.doorbell(role_map[role]["pane_id"], msg, wait_s=3)
-        print(f"[{now()}] 章程已重投 {role}：{result}")
+        parts = []
+        if charter_changed:
+            # 章程变了要**重投全文**：规则要重新通读，摘一句摘要等于让 agent
+            # 拿旧理解去做事 —— 这正是章程存在的意义。
+            parts.append("【协议更新】你的角色章程已更新，请重读并立即生效：\n"
+                         + (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8"))
+        if shared:
+            # 协议/规范变了**只给路径**，不转发全文：全文很长，而 agent 本来就会
+            # cat .xteam/PROTOCOL.md。塞进来只是把真正的变更淹掉。
+            files = [".xteam/PROTOCOL.md"] if "PROTOCOL" in stale else []
+            files += [_skills_display(k) for k in shared
+                      if k.startswith("skills/")]
+            parts.append(
+                "【协议更新】以下规则文件已更新，请自己重读并立即生效：\n"
+                + "\n".join(f"  · {f}" for f in files)
+                + "\n（章程本身没变，不用重读。）")
+        if new_cmds:
+            # 工具能力变化 → 告知即可，**不重投章程**。agent 靠 `xteam <cmd> --help`
+            # 就拿得到，说明它知道有这些命令即可。
+            parts.append(
+                f"【工具更新】xteam 新增了这些子命令，用法见 `xteam <命令> --help`："
+                f"{'、'.join(new_cmds)}")
+        result = herdr.doorbell(role_map[role]["pane_id"], "\n\n".join(parts),
+                                wait_s=3)
+        what = ("章程+协议" if charter_changed and shared else
+                "章程" if charter_changed else
+                "协议/规范" if shared else "工具")
+        print(f"[{now()}] {what}已重投 {role}：{result}")
         sent += 1
-    if sent:
-        save_rules_state(root, rules_fingerprint(
-            ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+
+    # **只要检测到变更就落状态，哪怕一个角色都没通知。** 原来 `if sent:` 才保存，
+    # 于是「只改 PROTOCOL.md」这种（谁都无须重投、文件已刷盘）路径永远不更新
+    # 指纹 → status 一直报警，而 sync 反复跑也修不掉。
+    if stale:
+        _save_sync_state(root)
     if not targets:
         print("没有可同步的角色")
     return 0
@@ -1470,9 +1560,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         result = herdr.send_initial_prompt(started[role], intro, wait_s=15)
         print(f"[{now()}] 章程+现状已投 {role}：{result}")
 
-    # 记下投进 pane 的是哪一版章程/协议，之后 status 才能提醒「改了没生效」
-    save_rules_state(root, rules_fingerprint(
-        ROLES_DIR, TEMPLATES / "PROTOCOL.md"))
+    # 记下投进 pane 的是哪一版（章程 + 协议 + 输出规范 + 版本号 + CLI 面），
+    # 之后 status 才能提醒「改了没生效 / 该更新了」
+    _save_sync_state(root)
 
     state = {
         "workspace": label,
@@ -1561,12 +1651,60 @@ def cmd_say(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- status
 
 
+def _print_update_hint(root: Path) -> None:
+    """上游新版本提示。**只读缓存，不联网** —— status 要保持快且离线可用。
+
+    联网那一次交给门狗（24h 冷却）或 `xteam update --check`。
+    """
+    hint = update_hint(root, _installed_version())
+    if not hint:
+        return
+    print(f"  ⬆ {hint}")
+    cache = load_update_cache(root)
+    if cache.get("checked_at"):
+        print(f"     （检查于 {cache['checked_at']}；"
+              f"手动刷新：xteam update --check）")
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """查上游有没有新版本。
+
+    **只查版本，不自动升级。** 自动升级意味着在你正跑着三个 pane 的时候换掉
+    底下的代码 —— 而 pane 里那份章程/上下文是按旧版规则养成的。所以这里只回答
+    「有没有新的」，怎么换由你决定（brew upgrade / git pull），换完再跑
+    `xteam sync` 把新规则投给正在跑的 agent。
+    """
+    root = Path(args.project).resolve()
+    mine = _installed_version()
+    print(f"本机 xteam {mine or '?'}")
+    if os.environ.get("XTEAM_NO_UPDATE_CHECK"):
+        print("  已通过 XTEAM_NO_UPDATE_CHECK 禁用上游检查。")
+        return 0
+    print(f"  正在查 {UPSTREAM_REPO} …")
+    cache = refresh_update_cache(root, ttl=0)          # ttl=0 → 强制刷新
+    latest = str(cache.get("latest") or "")
+    err = str(cache.get("error") or "")
+    if err:
+        print(f"  ✗ 查不到：{err}（离线、或 GitHub 限流。不影响 xteam 本身使用。）")
+        return 0
+    if not latest:
+        print("  ? 上游没给出版本号")
+        return 0
+    if newer_than(mine, latest):
+        print(f"  ⬆ 有新版本：{display_version(latest)}")
+        print(f"     {update_hint(root, mine) or ''}".rstrip())
+        print("     换完之后跑 `xteam sync`，把新规则投给正在跑的 pane。")
+        return 0
+    print(f"  ✓ 已是最新（上游也是 {display_version(latest)}）")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     label, _ws_why = resolve_ws_label(root, args.workspace)
     proto = Protocol(root)
-    # 章程/协议改了但没投给正在跑的 pane —— 主动提示，别让人自己想起来 sync
-    stale = stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md")
+    # 章程/协议/输出规范改了但没投给正在跑的 pane —— 主动提示，别让人自己想起来 sync
+    stale = stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md", SKILLS_DIR)
     herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
     if not ws:
@@ -1613,10 +1751,27 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     width = max(len(r[0]) for r in rows)
     print(f"xteam status  {now()}   workspace={args.workspace!r} ({ws['workspace_id']})")
-    print(f"project={root}\n")
+    print(f"project={root}")
+    # 顺手把「你跑的是哪版、pane 里投的是哪版」摆出来。xteam 不是常驻进程，
+    # 用户没有任何时刻会收到「它变了」的通知 —— 所以这一行是他唯一能一眼看到
+    # 差异的地方。面板 0.1.5、章程是 0.1.8 写的，就该 sync 了。
+    meta = injected_meta(root)
+    mine = _installed_version()
+    theirs = str(meta.get("xteam_version") or "?")
+    print(f"xteam {mine or '?'}  ·  pane 里投的是 {theirs}"
+          + (f"（{meta.get('injected_at')}）" if meta.get("injected_at") else ""))
+    print()
     if stale:
-        print(f"  ⚠ 规则改了但正在跑的 pane 还是旧的：{'、'.join(sorted(stale))}"
+        shared = [k for k in sorted(stale) if is_protocol_drift(k)]
+        chars = [k for k in sorted(stale) if not is_protocol_drift(k)]
+        what = "、".join(chars + (["协议/输出规范"] if shared else []))
+        print(f"  ⚠ 规则改了但正在跑的 pane 还是旧的：{what}"
               f" —— 跑 xteam sync 让它生效")
+    new_cmds = cli_drift(root, _cli_surface())
+    if new_cmds:
+        print(f"  ⚠ pane 起起来之后 xteam 新增了这些子命令：{'、'.join(new_cmds)}"
+              f" —— xteam sync 会告知它")
+    _print_update_hint(root)
     print(f"{'role'.ljust(width)}  {'状态':<8}  {'持续':<8}  {'起始于':<14}  {'最后活动':<14}  义务 / 在哪")
     print("-" * (width + 74))
     for role, cn, status, owes, where, pane in rows:
@@ -1676,6 +1831,43 @@ def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- watch
 
 
+# 门狗提醒的冷却（秒）。规则变更 30 分钟、上游版本 24 小时。
+NAG_DRIFT_TTL = 30 * 60
+NAG_UPDATE_TTL = 24 * 3600
+
+
+def _nag_drift(root: Path, logf: Path, tracker: IdleTracker) -> None:
+    """规则过期 / 上游有新版 → 落事件日志（带冷却）。绝不打断 agent。
+
+    冷却状态放在巡检自己的 idle.state 里，而不是另开一个文件 —— 那是它已经在维护的
+    状态文件，`nag_gate` 复用它的落盘路径，不必再加一个需要考虑「什么时候清理」
+    的新文件。
+    """
+    stale = stale_rules(root, ROLES_DIR, TEMPLATES / "PROTOCOL.md", SKILLS_DIR)
+    if stale:
+        if tracker.nag_gate("nag:drift", NAG_DRIFT_TTL):
+            log_event(logf, "RULES-STALE " + "、".join(sorted(stale))
+                      + " —— 跑 xteam sync 让正在跑的 pane 生效")
+    else:
+        # 清掉冷却：规则恢复正常后再变脏，应该**立刻**提醒，而不是等上一个
+        # 30 分钟窗口走完。
+        tracker.clear_nag("nag:drift")
+
+    # 上游检查：带 24h 冷却顺带做掉联网那一次，status 之后只读缓存。
+    try:
+        cache = refresh_update_cache(root, ttl=NAG_UPDATE_TTL)
+    except Exception as exc:                 # 网络相关一律降级，不外泄
+        log_event(logf, f"UPDATE-CHECK-FAILED {type(exc).__name__}")
+        return
+    latest = str(cache.get("latest") or "")
+    if latest and newer_than(_installed_version(), latest):
+        if tracker.nag_gate("nag:update", NAG_UPDATE_TTL):
+            log_event(logf, f"UPSTREAM-NEWER 本机 {_installed_version()} → "
+                      f"上游 {latest}（换完跑 xteam sync）")
+    else:
+        tracker.clear_nag("nag:update")
+
+
 def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> None:
     proto = Protocol(root)
     proto.ensure()
@@ -1686,6 +1878,20 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
         return
     role_map = herdr.role_map(ws["workspace_id"])
     debts = proto.obligations()
+
+    # 规则/上游变更的低频提醒。xteam 不是常驻进程，用户没有任何时刻会收到
+    # 「它变了」—— 门狗是唯一一直在跑的东西，所以提醒放这里，而不是指望人
+    # 想起来看 status。
+    #
+    # 两条纪律：
+    #   · **不打断 agent**。只落事件日志 + 记事件，真要生效由人跑 `xteam sync`。
+    #     自动重投会烧掉一个门铃回合，而且可能正好插在 agent 干活中间。
+    #   · **有冷却**。规则变更和上游版本都不该每轮都喊；门狗一分钟一轮，
+    #     不冷却的话一晚上能把人吵醒很多次。
+    try:
+        _nag_drift(root, logf, tracker)
+    except Exception as exc:                 # 提醒失败绝不能带倒巡检
+        log_event(logf, f"DRIFT-CHECK-FAILED {type(exc).__name__}")
     # 「本来该有哪些角色」以 session.json 为准，而不是「BOOT_ORDER 全都算」。
     # up 起了哪几个，巡检就只盯哪几个。
     expected = set(BOOT_ORDER[:3])
@@ -2696,6 +2902,9 @@ def main() -> int:
     # 不能 required=True —— 那样 `xteam --version` / `xteam -h` 会先被
     # 「必须给子命令」拦下，用户根本看不到版本信息。改为缺命令时自己提示。
     sub = ap.add_subparsers(dest="cmd")
+    # 命令面在这里定型，所以就在这里快照 —— 任何新加的子命令自动被算进
+    # 「上次投给 pane 的那版 CLI 面」的差集里（见 _cli_surface）。
+    _CLI_SURFACE[:] = sorted(sub.choices)
 
     p = sub.add_parser("agents", help="列出可编排的 agent 及其模型能力（本机实测）")
     p.set_defaults(func=cmd_agents)
@@ -2784,6 +2993,11 @@ def main() -> int:
 
     p = sub.add_parser("sync", help="把最新角色章程/协议同步到已在跑的 pane")
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("update", help="查上游有没有新版本（不自动升级）")
+    p.add_argument("--check", action="store_true",
+                   help="兼容写法；默认行为就是检查")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("up", help="建 .xteam/ 并拉起三个 pane")
     # **不能叫 project**：argparse 里子解析器的同名参数会**覆盖**全局

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
@@ -65,6 +66,11 @@ from xteam_lib import (  # noqa: E402
     rules_fingerprint,
     save_rules_state,
     stale_rules,
+    is_protocol_drift,
+    cli_drift,
+    injected_meta,
+    newer_than,
+    _parse_version,
     parse_contract_name,
     contracts_dir,
     contract_path,
@@ -1696,10 +1702,235 @@ def test_slice_order_and_rules_staleness() -> None:
         pfile.write_text("协议改了", encoding="utf-8")
         check("协议变更也算", "PROTOCOL" in stale_rules(root, rdir, pfile), True)
         check("状态已落盘", (root / ".xteam" / "rules.json").exists(), True)
+
+        # ---- skills/（输出规范）也必须算进指纹
+        # STE 输出规范住在 skills/ste/SKILL.md，PROTOCOL.md 里只有 8 条精简版。
+        # 指纹不覆盖 skills/ 的话，「只改了输出规范」这种发版会让 stale 为空 →
+        # sync 说「没变化」→ agent 继续按旧规范输出，而 status 看不出异常。
+        sdir = Path(tempfile.mktemp())
+        (sdir / "ste").mkdir(parents=True)
+        sk = sdir / "ste" / "SKILL.md"
+        sk.write_text("规范 v1", encoding="utf-8")
+        # 干净基线：章程+协议+skills 一起记
+        save_rules_state(root, rules_fingerprint(rdir, pfile, sdir))
+        check("skills 干净时无变更",
+              stale_rules(root, rdir, pfile, sdir), [])
+        sk.write_text("规范 v2 —— 输出契约改了", encoding="utf-8")
+        got = stale_rules(root, rdir, pfile, sdir)
+        check("只改 skills/ 也算变更", got, ["skills/ste/SKILL.md"])
+        check("skills 键被识别为「协议类」（影响所有人）",
+              [is_protocol_drift(k) for k in got], [True])
+        check("角色名不算协议类",
+              [is_protocol_drift("pm"), is_protocol_drift("tl")], [False, False])
+        shutil.rmtree(sdir, ignore_errors=True)
+
+        # ---- 版本号 / CLI 面：回答「该不该更新」的那一半
+        # 指纹是不透明哈希，答不了「这是哪版投的」。所以 rules.json 里另记版本与
+        # 命令面：面板 0.1.5、章程是 0.1.8 写的，人一眼能看出该 sync 了。
+        save_rules_state(root, {}, version="0.1.7",
+                         cli=["say", "status", "watch"])
+        meta = injected_meta(root)
+        check("记下了 xteam 版本", meta.get("xteam_version"), "0.1.7")
+        check("记下了 CLI 面", meta.get("cli"), ["say", "status", "watch"])
+        check("新增子命令被算成 CLI 面变化",
+              cli_drift(root, ["say", "status", "watch", "contracts"]),
+              ["contracts"])
+        check("没有新增就不算变化",
+              cli_drift(root, ["say", "status", "watch"]), [])
+        # 「没有基线」要用**另一个空项目**来验：fresh 项目没投过任何东西，
+        # 此时整个命令面都算「新增」是没有意义的噪声 —— pane 还没起呢。
+        fresh = Path(tempfile.mkdtemp())
+        try:
+            check("首次 up 之前没有基线 → 不算变化",
+                  cli_drift(fresh, ["a", "b", "c"]), [])
+        finally:
+            shutil.rmtree(fresh, ignore_errors=True)
+
+        # ---- 只改 PROTOCOL.md 时，sync 必须也能把它修好
+        # 起因是一个真 bug：重投循环是 `if stale and role not in stale: continue`，
+        # 而只改 PROTOCOL 时 stale={"PROTOCOL"}、三个角色都不在里面 → 一个都不重投
+        # → sent=0 → save_rules_state 不执行 → 指纹永不更新 → **status 永久报警，
+        # 而 sync 反复跑也修不掉**。
+        # 这里验的是「sync 之后指纹必须前进」这个可观察后果 —— 比断言内部
+        # 有没有调用某个函数更耐改。
+        r2 = Path(tempfile.mkdtemp())
+        p2 = Path(tempfile.mkdtemp()) / "PROTOCOL.md"
+        p2.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            (r2 / "pm.md").write_text("pm 章程", encoding="utf-8")
+            p2.write_text("协议 v1", encoding="utf-8")
+            save_rules_state(r2, rules_fingerprint(r2, p2))
+            p2.write_text("协议 v2", encoding="utf-8")
+            check("只改协议 → stale 里只有 PROTOCOL",
+                  stale_rules(r2, r2, p2), ["PROTOCOL"])
+            check("PROTOCOL 判为影响所有人",
+                  is_protocol_drift("PROTOCOL"), True)
+            # 模拟 sync 的核心：检测到变更就落状态（不论是否重投了谁）
+            if stale_rules(r2, r2, p2):
+                save_rules_state(r2, rules_fingerprint(r2, p2))
+            check("sync 之后不再报警（指纹已前进）",
+                  stale_rules(r2, r2, p2), [])
+        finally:
+            shutil.rmtree(r2, ignore_errors=True)
+            shutil.rmtree(p2.parent, ignore_errors=True)
+
+        # ---- 门狗提醒的冷却门
+        # 用 observe() 凑冷却有个坑：它只在 seq 变化时重置 since，于是
+        # 「先 clean 后 stale」这条路上第一次提醒会被压到下一个窗口之后 ——
+        # 恰好是最该立刻喊的那次被吞掉。nag_gate 显式记「上次提醒时刻」。
+        tr_root = Path(tempfile.mkdtemp())
+        try:
+            tk = IdleTracker(tr_root / "idle.state")
+            check("第一次提醒放行", tk.nag_gate("nag:x", 1800), True)
+            check("冷却内不再喊", tk.nag_gate("nag:x", 1800), False)
+            check("冷却过了再喊（用 stamp 推进时间，不 sleep）",
+                  tk.nag_gate("nag:x", 1800,
+                              stamp=int(time.time()) + 1801), True)
+            tk.clear_nag("nag:x")
+            check("清掉冷却后立刻又能喊（clean→stale 那条路）",
+                  tk.nag_gate("nag:x", 1800), True)
+            check("nag 状态写在巡检自己的状态文件里",
+                  (tr_root / "idle.state").exists(), True)
+        finally:
+            shutil.rmtree(tr_root, ignore_errors=True)
+
         shutil.rmtree(rdir, ignore_errors=True)
         shutil.rmtree(proto_dir, ignore_errors=True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+    # ---- 上游版本比较
+    # 两个具体的坑，都属于「不报错、只是永远不提示」那一类：
+    #  1. tag 是 `xteam-v0.1.8`，而 lstrip("v") 对首字符是 x 的字符串无效
+    #     → 版本号被当成非数字 → 恒为 0 → 「有新版」永远不显示
+    #  2. 字符串比较会把 0.1.10 判成比 0.1.8 小（'1' < '8'）
+    check("认得 xteam-v 前缀", _parse_version("xteam-v0.1.8"), (0, 1, 8))
+    check("认得 v 前缀", _parse_version("v0.2.0"), (0, 2, 0))
+    check("缺段补 0", _parse_version("1.2"), (1, 2, 0))
+    check("0.1.10 比 0.1.8 新（不是字符串比较）",
+          newer_than("0.1.8", "0.1.10"), True)
+    check("拿 tag 原文也能比", newer_than("0.1.8", "xteam-v0.1.9"), True)
+    check("本机更新时不报", newer_than("0.1.10", "xteam-v0.1.8"), False)
+    check("版本缺失时不乱报", newer_than("", "0.1.9"), False)
+
+    # ---- 真调 cmd_sync（不 inline 模拟）
+    # 上面那条「sync 之后不再报警」是**在测试里重演了一遍 sync 的逻辑**，所以它是
+    # 自证的：把 bin/xteam 改回原样，它照样通过。这里必须真跑 cmd_sync（桩掉
+    # herdr），断言「通知到了谁」和「指纹有没有前进」。
+    #
+    # 验证过：把两处一起退回原样（continue 条件 + `if sent:`）→ 7 条断言失败。
+    # 单退回其中一处反而抓不到 —— 因为「通知所有人」和「有变更就落状态」是
+    # 冗余的两道防线，任一道单独就能让 status 不再报警。这是有意的：两道都留着。
+    sync_root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(sync_root)
+        proto.ensure()
+        sent_log: list[tuple[str, str]] = []
+
+        class _FakeHerdr:
+            def __init__(self, scope: str = "") -> None:
+                self.scope = scope
+
+            def find_workspace(self, label: str):
+                return {"workspace_id": "w1"}
+
+            def role_map(self, ws_id: str):
+                return {r: {"pane_id": f"p-{r}"} for r in ("pm", "tl", "dev")}
+
+            def doorbell(self, pane, msg, wait_s=0):
+                sent_log.append((str(pane), str(msg)))
+                return "ok"
+
+        orig_herdr = _cli.Herdr
+        orig_roledir, orig_tpl = _cli.ROLES_DIR, _cli.TEMPLATES
+        orig_skills = _cli.SKILLS_DIR
+        tmp_inst = Path(tempfile.mkdtemp())
+        for r in ("pm", "tl", "dev"):
+            (tmp_inst / "roles").mkdir(exist_ok=True)
+            (tmp_inst / "roles" / f"{r}.md").write_text(f"# {r} 章程\n",
+                                                       encoding="utf-8")
+        (tmp_inst / "templates").mkdir(exist_ok=True)
+        (tmp_inst / "templates" / "PROTOCOL.md").write_text("协议 v1\n",
+                                                            encoding="utf-8")
+        (tmp_inst / "skills" / "ste").mkdir(parents=True)
+        (tmp_inst / "skills" / "ste" / "SKILL.md").write_text("规范 v1\n",
+                                                              encoding="utf-8")
+        _cli.Herdr = _FakeHerdr
+        _cli.ROLES_DIR = tmp_inst / "roles"
+        _cli.TEMPLATES = tmp_inst / "templates"
+        _cli.SKILLS_DIR = tmp_inst / "skills"
+        try:
+            # 先建立一个「刚投过、干净」的状态
+            save_rules_state(sync_root, rules_fingerprint(
+                _cli.ROLES_DIR, _cli.TEMPLATES / "PROTOCOL.md",
+                _cli.SKILLS_DIR), version="0.1.8", cli=["say", "status"])
+            check("基线是干净的",
+                  stale_rules(sync_root, _cli.ROLES_DIR,
+                              _cli.TEMPLATES / "PROTOCOL.md", _cli.SKILLS_DIR),
+                  [])
+
+            # **只改 PROTOCOL.md**，章程和 skills 都不动
+            (_cli.TEMPLATES / "PROTOCOL.md").write_text("协议 v2\n",
+                                                        encoding="utf-8")
+            sent_log.clear()
+            ns = argparse.Namespace(project=str(sync_root), workspace=None)
+            _cli.cmd_sync(ns)
+            check("只改协议：三个角色都被通知（不能让一个人都不重投）",
+                  sorted(p for p, _m in sent_log), ["p-dev", "p-pm", "p-tl"])
+            check("通知里指明了要重读哪个文件",
+                  any(".xteam/PROTOCOL.md" in m for _p, m in sent_log), True)
+            check("通知里说清章程本身没变（不用重读全文）",
+                  any("章程本身没变" in m for _p, m in sent_log), True)
+            # **关键**：指纹必须前进，否则 status 永久报警且 sync 修不掉
+            check("sync 之后 status 不再报警",
+                  stale_rules(sync_root, _cli.ROLES_DIR,
+                              _cli.TEMPLATES / "PROTOCOL.md", _cli.SKILLS_DIR),
+                  [])
+            check("重跑一次不再打扰", _cli.cmd_sync(ns), 0)
+            check("第二次没有重复通知", len(sent_log), 3)
+
+            # **只改 skills/**：也算协议类变更，且提示给的是文件路径
+            (_cli.SKILLS_DIR / "ste" / "SKILL.md").write_text("规范 v2\n",
+                                                              encoding="utf-8")
+            sent_log.clear()
+            _cli.cmd_sync(ns)
+            check("只改 skills/ 也会通知到人",
+                  sorted(p for p, _m in sent_log), ["p-dev", "p-pm", "p-tl"])
+            check("提示里给了 skills 的可读路径",
+                  any("SKILL.md" in m for _p, m in sent_log), True)
+
+            # **只改一个角色的章程**：只有那个角色重投全文，其他人不被噪音打扰
+            (_cli.ROLES_DIR / "pm.md").write_text("# pm 章程 v2\n",
+                                                  encoding="utf-8")
+            sent_log.clear()
+            _cli.cmd_sync(ns)
+            check("只改 pm 章程 → 只有 pm 被通知",
+                  [p for p, _m in sent_log], ["p-pm"])
+            check("pm 收到的是章程全文",
+                  any("pm 章程 v2" in m for _p, m in sent_log), True)
+
+            # **CLI 新增子命令**：只告知、不重投章程全文
+            save_rules_state(sync_root, {}, version="0.1.8",
+                             cli=["say", "status"])
+            sent_log.clear()
+            _cli._CLI_SURFACE[:] = ["say", "status", "contracts"]
+            _cli.cmd_sync(ns)
+            check("新增子命令 → 仍然通知（否则 agent 永远不知道）",
+                  sorted(p for p, _m in sent_log), ["p-dev", "p-pm", "p-tl"])
+            check("新增子命令只是告知，不重投章程全文",
+                  any("新增了这些子命令" in m for _p, m in sent_log), True)
+            check("告知里点名了 contracts",
+                  any("contracts" in m for _p, m in sent_log), True)
+        finally:
+            _cli.Herdr = orig_herdr
+            _cli.ROLES_DIR, _cli.TEMPLATES = orig_roledir, orig_tpl
+            _cli.SKILLS_DIR = orig_skills
+            _cli._CLI_SURFACE[:] = []
+            shutil.rmtree(tmp_inst, ignore_errors=True)
+    finally:
+        shutil.rmtree(sync_root, ignore_errors=True)
+
+
 
 
 def test_model_name_sanity_filter() -> None:

@@ -1838,12 +1838,25 @@ def _sha256(path: Path) -> str:
         return ""
 
 
-def rules_fingerprint(roles_dir: Path, protocol: Path) -> dict[str, str]:
-    """当前章程与协议的指纹。缺文件记空串（= 那一刻的状态）。"""
+def rules_fingerprint(roles_dir: Path, protocol: Path,
+                      skills_dir: Path | None = None) -> dict[str, str]:
+    """当前章程、协议与输出规范的指纹。缺文件记空串（= 那一刻的状态）。
+
+    **skills/ 必须一起算。** STE 输出规范（skills/ste/）是 0.1.6 起新增的，
+    而 PROTOCOL.md 里只放了 8 条精简版、正文写「完整规范见 skills/ste/SKILL.md」。
+    也就是说**真正的输出契约住在 skills/ 里**。指纹不覆盖它，就出现这种情况：
+    某次发版只改了 skills/ste/ → stale 为空 → sync 说「没变化，不打扰」→
+    正在跑的 agent 继续按旧规范输出，而它在 status 里看不出任何异常。
+    """
     out = {}
     for path in sorted(roles_dir.glob("*.md")) if roles_dir.exists() else []:
         out[path.stem] = _sha256(path)
     out["PROTOCOL"] = _sha256(protocol)
+    # 用 rglob：规范文件在 skills/<name>/ 下面一层，不只平铺在 skills/ 里。
+    if skills_dir is not None and skills_dir.exists():
+        for path in sorted(skills_dir.rglob("*.md")):
+            rel = path.relative_to(skills_dir).as_posix()
+            out[f"skills/{rel}"] = _sha256(path)
     return out
 
 
@@ -1852,19 +1865,40 @@ def rules_state_path(root: Path) -> Path:
 
 
 def load_rules_state(root: Path) -> dict:
+    """读回「投进 pane 的那一版」。只有 fingerprint 那部分，没有记录时返回空。"""
     data = _read_json(rules_state_path(root))
     fp = data.get("fingerprint")
     return fp if isinstance(fp, dict) else {}
 
 
-def save_rules_state(root: Path, fingerprint: dict[str, str]) -> None:
-    """记下「投进 pane 的是哪一版」。下次好比对是不是过期。"""
+def injected_meta(root: Path) -> dict:
+    """投进去那次的元信息：xteam 版本、CLI 面（有哪些子命令）。
+
+    指纹只能回答「文件变没变」，答不了「**这是哪个版本投的**」。而后者才是人能
+    直接用的答案：面板里 0.1.5、协议是 0.1.8 写的，一眼就看出该 sync 了。
+    """
+    data = _read_json(rules_state_path(root))
+    return {k: v for k, v in data.items() if k != "fingerprint"}
+
+
+def save_rules_state(root: Path, fingerprint: dict[str, str],
+                     version: str = "", cli: list[str] | None = None) -> None:
+    """记下「投进 pane 的是哪一版」。下次好比对是不是过期。
+
+    `version` / `cli` 是给人看的：指纹是不透明哈希，回答不了「该更新了没有」。
+    """
     path = rules_state_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_json(path, {"fingerprint": fingerprint, "injected_at": now()}, indent=2)
+    payload = {"fingerprint": fingerprint, "injected_at": now()}
+    if version:
+        payload["xteam_version"] = version
+    if cli is not None:
+        payload["cli"] = cli
+    write_json(path, payload, indent=2)
 
 
-def stale_rules(root: Path, roles_dir: Path, protocol: Path) -> list[str]:
+def stale_rules(root: Path, roles_dir: Path, protocol: Path,
+                skills_dir: Path | None = None) -> list[str]:
     """哪些规则改了但还没投给正在跑的 pane。返回名字列表。
 
     **没有记录时返回空** —— 首次 up 之前不该报「过期」，那是噪声。
@@ -1872,8 +1906,174 @@ def stale_rules(root: Path, roles_dir: Path, protocol: Path) -> list[str]:
     seen = load_rules_state(root)
     if not seen:
         return []
-    now_fp = rules_fingerprint(roles_dir, protocol)
+    now_fp = rules_fingerprint(roles_dir, protocol, skills_dir)
     return [k for k, v in now_fp.items() if seen.get(k) != v]
+
+
+# 指纹里的键分三类，sync 对它们的处理**必须**不一样 ——
+# 起因是一个真 bug：只改 PROTOCOL.md 时，stale = {"PROTOCOL"}，
+# 而重投循环是 `if stale and role not in stale: continue`，三个角色都不在
+# stale 里 → 一个都不重投 → sent=0 → save_rules_state 不执行 →
+# 指纹永不更新 → status 永久报警，而 sync 修不好它。
+#
+#   · 角色名（pm/tl/dev）  章程全文变了 → 重投全文（agent 需重新通读）
+#   · PROTOCOL             协议变了     → 所有人都受影响 → 都要通知
+#   · skills/…             输出规范变了 → 都要通知（agent 按需自读那个文件）
+def is_protocol_drift(key: str) -> bool:
+    return key == "PROTOCOL" or key.startswith("skills/")
+
+
+# ------------------------------------------------------- 上游版本检查
+#
+# **为什么不每次都查。** xteam 的 status / 门狗都要求「快」，而一次 HTTPS 往返
+# 在正常网络下 200–800ms、离线时更久。把网络放进 status 的关键路径，等于让一个
+# 用来做判断的命令变成一个会卡住的东西。所以：
+#   · 结果**缓存**到 .xteam/update-check.json，status 只读缓存（不联网）
+#   · 只有门狗（本来就在后台跑）才按 24h 冷却去刷一次
+#   · 任何失败都只记进缓存的 error 字段，**绝不影响 xteam 本身**
+#
+# 为什么值得查：xteam 不是常驻进程，用户没有任何时刻会收到「上游有新版本」。
+# 而「该不该更新」这个问题，只有对照上游版本才答得出来。
+UPSTREAM_REPO = "ffqa/xpier-xteam"
+UPDATE_CHECK_TTL = 24 * 3600
+
+
+def update_check_path(root: Path) -> Path:
+    return root / XTEAM_DIRNAME / "update-check.json"
+
+
+def _parse_version(v: str) -> tuple:
+    """'0.1.10' → (0,1,10)；也认 'xteam-v0.1.10' / 'v0.1.10'。
+
+    **不能只用 lstrip("v")**：tag 是 `xteam-v0.1.8`，首字符是 `x`，
+    lstrip 对它完全无效 → 版本号被当成非数字 → 恒等于 0 → 于是
+    「上游有新版」永远显示不出来（而且不报错，最难发现的那种）。
+    所以这里**从头剥掉所有非数字、非点的前缀**，再按点分段。
+    """
+    s = str(v).strip()
+    i = 0
+    while i < len(s) and not (s[i].isdigit() or s[i] == "."):
+        i += 1
+    s = s[i:]
+    out = []
+    for part in s.split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+def newer_than(mine: str, latest: str) -> bool:
+    """latest 是否比 mine 新。任一为空/解析不了 → False（不乱报）。"""
+    if not mine or not latest:
+        return False
+    try:
+        return _parse_version(latest) > _parse_version(mine)
+    except (TypeError, ValueError):
+        return False
+
+
+def fetch_latest_release(repo: str = UPSTREAM_REPO,
+                         timeout: float = 4.0) -> tuple[str, str]:
+    """查上游最新 release。返回 (版本号, 错误说明)，成功时错误为空串。
+
+    刻意用 urllib 而不是 `gh`：gh 不一定装在用户机器上，而这是 xteam 唯一的
+    外部依赖面 —— 不该为一个提示信息引入一个 CLI 依赖。
+    """
+    import urllib.error
+    import urllib.request
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github+json",
+                      "User-Agent": "xteam-update-check"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "")
+        return (tag, "")          # 保留原样，交给 _parse_version 剥前缀
+    except urllib.error.HTTPError as exc:
+        return ("", f"HTTP {exc.code}")
+    except Exception as exc:                     # 离线 / 超时 / DNS / JSON 坏
+        return ("", type(exc).__name__)
+
+
+def load_update_cache(root: Path) -> dict:
+    data = _read_json(update_check_path(root))
+    return data if isinstance(data, dict) else {}
+
+
+def refresh_update_cache(root: Path, ttl: int = UPDATE_CHECK_TTL) -> dict:
+    """按冷却刷新缓存。返回缓存内容（无论刷没刷）。"""
+    cache = load_update_cache(root)
+    if os.environ.get("XTEAM_NO_UPDATE_CHECK"):
+        return cache
+    checked = float(cache.get("checked_epoch") or 0)
+    if checked and (time.time() - checked) < ttl:
+        return cache
+    latest, err = fetch_latest_release()
+    cache = {
+        "checked_at": now(),
+        "checked_epoch": time.time(),
+        "latest": latest,
+        "error": err,
+    }
+    path = update_check_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, cache, indent=2)
+    return cache
+
+
+def display_version(v: str) -> str:
+    """把 tag / 版本号统一显示成 '0.1.8'。认不出数字就原样返回（别显示空）。"""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    parsed = _parse_version(s)
+    if not any(parsed):
+        return s
+    return ".".join(str(x) for x in parsed)
+
+
+def update_hint(root: Path, mine: str) -> str:
+    """「该不该更新」的一句话答案。缓存里没结果就返回空串。"""
+    cache = load_update_cache(root)
+    latest = str(cache.get("latest") or "")
+    if not latest:
+        return ""
+    if not newer_than(mine, latest):
+        return ""
+    return (f"上游有新版本 {display_version(latest)}（本机 {display_version(mine) or '?'}）"
+            + _how_to_update())
+
+
+def _how_to_update() -> str:
+    """按安装方式给不同的更新指令 —— 说错比不说更糟。
+
+    判断依据是**安装目录在不在 Homebrew 的路径形状里**：brew 装的会落在
+    `.../Cellar/xteam/<版本>/...`（而版本目录名每次升级都变，正好也说明
+    「现在这版是 brew 什么时候装的」）。认不出就只说「去你的安装方式更新」，
+    不硬猜命令。
+    """
+    here = Path(__file__).resolve().parent.parent
+    h = str(here)
+    if "Cellar" in h or "/opt/homebrew/" in h or "/usr/local/" in h:
+        return " —— 更新：brew upgrade ffqa/tap/xteam"
+    return " —— 更新：在 xteam 源码目录里 git pull"
+
+
+def cli_drift(root: Path, current_cli: list[str]) -> list[str]:
+    """CLI 面（子命令集合）相对上次投进去的增量。
+
+    **为什么单列一类**：新增子命令/新 flag 属于「工具能力」变化，章程一个字没动。
+    这类变更**不该**重投章程 —— agent 靠跑 `xteam <cmd> --help` 自然就能拿到，
+    而章程全文重投会把真正的变更淹掉。只告知「多了哪些命令」即可。
+    """
+    prev = injected_meta(root).get("cli")
+    if not isinstance(prev, list) or not prev:
+        return []
+    old = {str(c) for c in prev}
+    return sorted(c for c in current_cli if c not in old)
 
 
 # ---------------------------------------------------------------- API 契约
@@ -2104,6 +2304,30 @@ class IdleTracker:
         self.state[role] = rec
         self.flush()
         return now - int(rec["since"])
+
+    def nag_gate(self, key: str, ttl: int, stamp: int | None = None) -> bool:
+        """冷却门：距上次为 True 是否已过 ttl。过了就记下时刻并返回 True。
+
+        **为什么不用 observe() 凑。** observe 是给「角色」用的，靠 seq 变化判断
+        状态是否推进；拿它记提醒时刻就得伪造 seq。而它只在 seq 变化时重置
+        `since`，于是「先 clean 后 stale」这条路径上，第一次提醒会被压到
+        下一个 ttl 之后 —— 恰好是最该立刻提醒的那一次被吞掉。
+        这里显式记「上次提醒时刻」，语义只有它自己用。
+        """
+        now = int(stamp if stamp is not None else time.time())
+        rec = self.state.get(key)
+        last = int((rec or {}).get("nagged_at") or 0)
+        if last and (now - last) < ttl:
+            return False
+        self.state[key] = {"nagged_at": now, "ttl": ttl}
+        self.flush()
+        return True
+
+    def clear_nag(self, key: str) -> None:
+        """提醒条件消失时清掉冷却，让下次真的发生时立刻能喊。"""
+        if key in self.state:
+            del self.state[key]
+            self.flush()
 
     def is_fake_working(self, role: str) -> bool:
         """声称 working 但 seq 停滞够久 —— 判为假 working。

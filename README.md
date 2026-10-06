@@ -131,7 +131,24 @@ xteam swap tl devin --model swe-2-max   # 中途把 tl 换成 devin（见下）
 ```
 
 `sync` 存在的理由：角色章程是 `up` 时一次性投进 pane 的。你之后改了 xteam 的规则，
-正在跑的 pane 拿到的还是旧的——`sync` 重投章程并刷新 `.xteam/PROTOCOL.md`，不必重启整套。
+正在跑的 pane 拿到的还是旧的——`sync` 重投并刷新 `.xteam/PROTOCOL.md`，不必重启整套。
+
+## 升级 xteam 之后，正在跑的 agent 怎么跟上
+
+xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己变了。于是三件事分开做：
+
+| 谁变了 | 怎么让正在跑的 agent 知道 |
+|---|---|
+| 角色章程 | `sync` **重投全文** —— 规则要重新通读，摘一句摘要等于让它拿旧理解做事 |
+| 协议 / 输出规范（`skills/`） | `sync` **只给文件路径**，让它自己重读。全文很长，塞进来只会把真正的变更淹掉 |
+| 新增子命令（工具能力） | `sync` **只告知有哪几个新命令**，不重投章程 —— 它跑 `xteam <cmd> --help` 就拿得到 |
+
+`.xteam/rules.json` 记着投进去的是**哪一版**（指纹 + xteam 版本号 + 当时的命令面），
+`xteam status` 第一行就把「你跑的哪版 / pane 里投的是哪版」摆出来。门狗每 30 分钟
+在事件日志里提醒一次规则过期、每 24 小时查一次上游版本 —— **只记日志不打断 agent**。
+
+`xteam update` 只回答「有没有新的」，**不自动升级**：在你正跑着三个 pane 的时候换掉
+底下代码，而 pane 里那份上下文是按旧规则养成的。换成之后跑一次 `xteam sync` 即可。
 
 ## 默认跑在 omp 上，不是 opencode
 
@@ -219,7 +236,8 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam contracts list\|new\|check\|log` | 跨项目 API 契约 |
 | `xteam search` / `note` | 检索 / 沉淀 wiki 里的决策与教训 |
 | `xteam agents` / `models` / `doctor` | agent 能力、可用模型、环境体检（`--probe all` 批量实测） |
-| `xteam sync` | 把**改动过的**章程重投给正在跑的 pane（没变就不打扰） |
+| `xteam sync` | 把**改动过的**章程/协议/输出规范重投给正在跑的 pane（没变就不打扰） |
+| `xteam update` | 查上游有没有新版本（**不自动升级**） |
 | `xteam restore` | 关掉后从 `.xteam` 恢复现场（数据从不删除） |
 | `xteam down` | 收摊：**只关角色 pane，workspace 保留**（下次 up 直接复用） |
 
