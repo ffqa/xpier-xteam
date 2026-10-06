@@ -584,15 +584,17 @@ class Herdr:
         """给一个**工作中**的 agent 发消息（走 agent prompt）。
 
         对 blocked 的 agent 无效（会被拒）——那种情况用 send_choice。
+
+        **不补 send-keys enter。** `agent prompt` 按 pane 的 bracketed-paste
+        模式发送「文本 + 编码后的回车」，是一次有序提交，herdr 只在两者都
+        写完才报成功。之前这里多补了一个裸 enter，而终端输入缓冲区是共享的：
+        用户正在输入框里打了一半的字时，这个 enter 会把「用户半句话 + 门铃
+        文本」一起提交——等于别人在用户打字时替用户按了回车（2026-10-06 实测）。
         """
         proc = subprocess.run([self.bin, "agent", "prompt", target, message],
                               capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             return f"prompt-failed: {proc.stderr.strip()[:120]}"
-        send = subprocess.run([self.bin, "agent", "send-keys", target, "enter"],
-                              capture_output=True, text=True, timeout=30)
-        if send.returncode != 0:
-            return f"enter-failed: {send.stderr.strip()[:120]}"
         if wait_s > 0:
             time.sleep(wait_s)
         return f"status={self.agent_status(target)}"

@@ -1540,7 +1540,7 @@ def cmd_say(args: argparse.Namespace) -> int:
     # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
     # 「刚才那声门铃到底有没有把它叫醒、什么时候叫的」。
     print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
-    if status.startswith(("prompt-failed", "enter-failed")):
+    if status.startswith("prompt-failed"):
         print("  ⚠ 投递失败，角色可能不可达（pane 崩了 / 停在审批 UI）", file=sys.stderr)
         return 1
     return 0
