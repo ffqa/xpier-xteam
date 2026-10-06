@@ -6,6 +6,10 @@
 # 发布的提交」三者一致，这在 CI 里天然成立；留在本机就多一次「忘了重打包
 # 却发了 tag」的机会，而那种失败在用户机器上才暴露。
 #
+# **tag 由本目标用 `git tag -f` 强制对齐到 HEAD**，不依赖 pack.sh 顺手打的那个
+# —— pack.sh 在升版本时就打了 tag，而那之后还可能有提交（补剩余改动、
+# 改 CHANGELOG），那样 tag 指向的就不是最终代码，而 CI 会忠实地发布它。
+#
 # 用法：
 #   make release              # 升 patch、跑门禁、提交、打 tag、推 → CI 接走
 #   make release MINOR=1      # 升 minor
@@ -100,9 +104,13 @@ release: verify
 	  if ! grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$$" <<<"$$NEWV"; then \
 	    echo "VERSION 不是 X.Y.Z 形式：$$NEWV" >&2; exit 1; fi; \
 	  echo "▸ 打 tag 并推送"; \
-	  git tag -a "xteam-v$$NEWV" -m "release $$NEWV"; \
+	  if git rev-parse "xteam-v$$NEWV" >/dev/null 2>&1; then \
+	    echo "  pack.sh 已经打过 xteam-v$$NEWV；强制对齐到当前 HEAD"; \
+	  fi; \
+	  git tag -f -a "xteam-v$$NEWV" -m "release $$NEWV" >/dev/null; \
+	  echo "  tag 指向 $(git rev-parse --short xteam-v$$NEWV^{commit})"; \
 	  git push origin main; \
-	  git push origin "xteam-v$$NEWV"; \
+	  git push --force origin "xteam-v$$NEWV"; \
 	  echo; echo "✓ tag xteam-v$$NEWV 已推送"; \
 	  echo "  CI 会接着：核对 tag 与 VERSION → 打包 → 建 Release → 更新 $(TAP)"; \
 	  echo "  看进度：gh run watch  （或 gh run list）"; \
