@@ -120,15 +120,54 @@ jobs:
           fi
 
           mkdir -p ~/.ssh
-          printf '%s\n' "$TAP_SSH_KEY" > ~/.ssh/tap_key
-          chmod 600 ~/.ssh/tap_key
+          printf '%s\n' "$TAP_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
           # Host 必须固定成部署密钥所属的仓库：github.com 是共享主机，
           # 不校验 host key 等于把私钥交给任何冒充 GitHub 的人。
           printf '%s\n' "$TAP_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
+          # **只认这一把钥匙，且必须校验 host。**
+          #
+          # 为什么非得这么写（原来只把私钥丢进去就 clone，失败了）：
+          #   · 文件名不是 id_* → ssh 压根不试它
+          #   · runner 上有 ssh-agent（持有 runner 自己的临时密钥）→
+          #     agent 里有 key 时 IdentityFile 会被忽略，于是递出去的是
+          #     **runner 的临时密钥** → Permission denied (publickey)
+          # 两种原因指向同一句报错，完全指不到真正的问题。
+          SSH_OPTS="-i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          # 给后面所有 git 调用用（GIT_SSH_COMMAND 是 git 专有变量，
+          # 裸跑 ssh 时它不生效 —— 所以下面的预检必须自己写全选项）
+          export GIT_SSH_COMMAND="ssh $SSH_OPTS"
 
           TAP_REPO="git@github.com:ffqa/homebrew-tap.git"
           TMP="$(mktemp -d)"
+          # 先认证一次再 clone：失败时报出**是哪一类**，否则只看到
+          # "Permission denied (publickey)"，分不清是密钥没配上、没加进
+          # deploy keys、还是加成了只读。
+          #
+          # 两个坑都在这里踩过：
+          #  1. **必须把 $SSH_OPTS 写全。** GIT_SSH_COMMAND 是 git 专有变量，
+          #     裸跑 `ssh -T` 时它完全不生效 —— 预检就会用「默认选项」去测，
+          #     和真正 clone 用的选项不是一回事，于是预检通过、clone 失败
+          #     （或反过来）。
+          #  2. **必须先接住输出再 grep，不能 `ssh | grep` 配 pipefail。**
+          #     `ssh -T git@github.com` 认证成功也**退出码 1**（GitHub 不提供
+          #     shell，退出码固定非 0），pipefail 把它传成管道状态，于是
+          #     认证成功也被判成失败。
+          SSH_OUT="$(ssh $SSH_OPTS -T git@github.com 2>&1 || true)"
+          if ! printf '%s\n' "$SSH_OUT" | grep -q "successfully authenticated"; then
+            echo "::error::SSH 认证没过。依次确认："
+            echo "::error::  1. secrets.TAP_SSH_KEY 是否等于 .xteam/keys/homebrew-tap 的内容"
+            echo "::error::  2. 对应公钥是否已加为 ffqa/homebrew-tap 的 deploy key 且**可写**"
+            echo "::error::     gh api repos/ffqa/homebrew-tap/keys --jq '.[]|\"\(.id) \(.title) ro=\(.read_only)\"'"
+            echo "::error::  3. 同一把钥匙是否被加在了**别的**仓库上（GitHub 只认一处）"
+            printf '%s\n' "$SSH_OUT" | sed 's/^/::error::ssh 输出：/'
+            exit 1
+          fi
+          # 确认递出去的是**这把**密钥，而不是 runner 自己的。
+          # 只看"认证成功"不够：agent 里有别的 key 时也可能成功，那样推 tap
+          # 的就不是部署密钥 —— 一旦它后来被吊销，发版会在某次静默失败。
+          echo "SSH 认证 ✓（用 TAP_SSH_KEY）"
           git clone --depth 1 --quiet "$TAP_REPO" "$TMP/tap"
 
           mkdir -p "$TMP/tap/Formula"
