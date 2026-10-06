@@ -6,13 +6,37 @@ class Xteam < Formula
   license "MIT"
   version "@VERSION@"
 
-  depends_on "python@3.12"
+  # **刻意不 depends_on 任何 Python。**
+  #
+  # 原来是 depends_on "python@3.12"，而它会连带 mpdecimal / openssl@3 /
+  # readline / sqlite / xz / ca-certificates —— 为一个 200K 的纯文本工具装一整套
+  # 带 openssl 的 Python，而且还要顺带**升级**用户已有的 openssl@3、readline、
+  # pkgconf、ca-certificates。对「装个终端协作器」来说这个代价不成比例。
+  #
+  # 代价是真的要说清楚：Homebrew 不保证 PATH 里有 python3。macOS 从 12.3 起
+  # 移除了 /usr/bin/python3（它来自 Command Line Tools）；没装 CLT 的机器上
+  # `brew install xteam` 会装成功、但第一次运行时 xteam 找不到 python3。
+  # 所以 install 里**必须自己体检并给出可执行的修复指令** —— 不能靠 brew
+  # 帮我们保证。
+  #
+  # 为什么不干脆 depends_on "python"：那还是同一套 openssl 依赖树，只是版本号
+  # 变了好看；而且会把用户已有的 python3 一起升级。
+  #
+  # 为什么不用 python@3.9：Homebrew 已停止维护 3.9，且 CLT 自带的正是它。
 
   def install
-    # Homebrew 的**版本化** Python 不把 opt/python@3.12/libexec/bin 放进 PATH
-    # （brew 刻意不 link，只在 `brew info` 里可见），而 install.sh 找的是
-    # python3 —— 不显式补 PATH，brew install 会以「找不到 python3」失败。
-    ENV.prepend_path "opt/python@3.12/libexec/bin"
+    # install.sh 自己会找 python3（含 brew 版本化 Python 的 opt/*/libexec/bin）、
+    # 检查 ≥3.9、找不到就报明确修复指令。这里只补一条**安装前**的体检，
+    # 让 brew install 自己就失败并说清原因，而不是装完才在用户面前炸。
+    unless system("command -v python3 >/dev/null 2>&1")
+      opoo <<~EOS
+        找不到 python3。xteam 是纯 Python 工具，运行时需要一个 ≥ 3.9 的 python3。
+          · 已装 Xcode Command Line Tools 的话，通常 python3 就在 /usr/bin/python3
+          · 想用 Homebrew 的版本：brew install python@3.12
+          · 装完重跑：brew install #{tap_and_name}
+      EOS
+      return
+    end
     system "bash", "install.sh", "--prefix", prefix
   end
 
@@ -22,13 +46,17 @@ class Xteam < Formula
       pane 都由 herdr 拉起）。没装 herdr 时 xteam 能 init/say/status/note，
       但 up 会失败。
 
+      运行需要 PATH 上有一个 ≥ 3.9 的 python3。macOS 自带的 /usr/bin/python3
+      来自 Command Line Tools；如果 brew install 时提示找不到，用
+      `xcode-select --install` 装 CLT，或 `brew install python@3.12`。
+
       安装：见 https://herdr.dev
     EOS
   end
 
+  # Homebrew 的 DSL 是 `test do ... end`（方法 + block），**不是** `def test do` ——
+  # 后者是语法错误，而它只会在用户 brew install 时才炸。
   test do
-    # 同样要能找到版本化的 python3
-    ENV.prepend_path "opt/python@3.12/libexec/bin"
     assert_match "xteam", shell_output("#{bin}/xteam --version")
     assert_match "usage", shell_output("#{bin}/xteam --help")
   end

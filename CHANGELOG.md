@@ -1,5 +1,43 @@
 # 变更记录
 
+## 0.1.8
+
+### 发布
+
+- **Homebrew Formula 不再 `depends_on "python@3.12"`**。它会连带 mpdecimal /
+  openssl@3 / readline / sqlite / xz / ca-certificates，还会顺带**升级**用户已有的
+  openssl@3、readline、pkgconf、ca-certificates —— 为一个 200K 的纯文本工具装一整套
+  带 openssl 的 Python，代价不成比例。
+  改为不声明依赖，由 `install.sh` 自己体检 python3（≥3.9）；brew install 时若
+  PATH 上没有 python3，就地报出可执行的修复指令（`xcode-select --install`
+  或 `brew install python@3.12`），而不是装完才在用户面前炸。
+  已在「PATH 上只有系统 python3（3.9.6）、无任何 brew Python」的环境实测：
+  安装、`--version`、`--help`、skills 资源全部正常。
+
+## 0.1.7
+
+### 结项报告（PR #2）
+
+- PM 新增 `report` 义务：全部切片闭合但 `.xteam/REPORT.md` 缺失时，`status` 显示
+  PM 欠 `report`，巡检会催；写完义务消失。空项目不触发。
+- 新增 `templates/REPORT-TEMPLATE.md`：目标 / 进度与完成情况 / 部署启动测试 /
+  默认账号信息 / 边界与疑问点，五节，每节要有可验证内容。
+- 队列还有活时 PM 仍欠 `next-slice`（别停）；队列跑完后 `next-slice` 让位给
+  `report`，两条不并存。
+- **修：report 义务在真实项目里一次都不会触发。** 判据原为
+  `queue_counts() == (0, 0)`（队列里一行都没有），但 `Protocol.ensure()` 一上来
+  就建出 `QUEUE.md`、TL 追加切片后 total 永远 > 0 —— 只有「队列从没被用过」的
+  项目才会欠 report。改为按 `pending == 0` 判。
+  原测试用 `Bench`（不写 `QUEUE.md`，total 恰好为 0），正好落在唯一能过的分支上，
+  于是「测试全绿 + 功能是死的」同时成立。已补照真实布局写的断言。
+
+### 修
+
+- `PROTOCOL.md` 被误删一行，导致「解阻塞」流程图变成一个悬空的 `↓`（已恢复）。
+- `XTEAM_README.md` 被误删 `memory/<role>-recap.md` 那行表格（已恢复）。
+- `make release` 打出过空版本 tag：Makefile 每条配方行是**独立 shell**，
+  `NEWV` 传不下去。已合并成一段 `bash -c`，并加本地校验（VERSION 非空且是 X.Y.Z）。
+
 ## 0.1.6
 
 首个公开发布版（Homebrew：`brew tap ffqa/tap && brew install ffqa/tap/xteam`）。
@@ -90,6 +128,14 @@
 
 ### 发布
 
+- **Homebrew Formula 不再 `depends_on "python@3.12"`**。它会连带 mpdecimal /
+  openssl@3 / readline / sqlite / xz / ca-certificates，还会顺带**升级**用户已有的
+  openssl@3、readline、pkgconf、ca-certificates —— 为一个 200K 的纯文本工具装一整套
+  带 openssl 的 Python，代价不成比例。改为不声明依赖、由 `install.sh` 自己体检
+  python3（≥3.9），brew install 时若无 python3 就地报出可执行的修复指令
+  （`xcode-select --install` 或 `brew install python@3.12`）。
+  已在「PATH 上只有系统 python3（3.9.6）、无任何 brew Python」的环境实测：
+  安装、`--version`、`--help`、skills 资源全部正常。
 - 移交给 GitHub Actions：推 `xteam-v*` tag → 跑门禁 → 建 Release →
   自动更新 `ffqa/homebrew-tap` 的 Formula。本地不再需要发布脚本。
 - **`make release`**：一条命令完成升版本 → 门禁 → 提交 → 打 tag → 推，
