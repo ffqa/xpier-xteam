@@ -96,9 +96,9 @@ agent 的职责是**写工件**，而「谁欠什么」由 `debts()` 算出。ag
 | 三 pane 编排 + 文件协议状态机 | ✅ 端到端验证 |
 | 巡检（停滞判定 / 升级人类 / 代答选择题 / 权限放行） | ✅ |
 | 中断恢复（`restore`）、会话标记 | ✅ |
-| 多项目治理（项目注册表、共享契约层） | ⚠️ 已实现，**未在真实多项目跑过** |
-| 跨项目切片排序（`depends_on` + 拓扑序） | ⚠️ 同上 |
-| API 契约（`contracts new/list/check/log`） | ⚠️ 同上 |
+| 多项目治理（项目注册表、共享契约层） | ✅ `tests/e2e_multi.sh` 可重复验证 |
+| 跨项目切片排序（`depends_on` + 拓扑序） | ✅ 同上（e2e_multi） |
+| API 契约（`contracts new/list/check/log`） | ✅ 同上（e2e_multi） |
 | 第三方冷读评审（`xteam qa`） | ✅ 白名单放行 + 不可逆操作永不自动 |
 | 中途换 agent（`swap`，两阶段替换） | ✅ |
 | workspace 复用（`up` 复用 / `down` 只关 pane） | ✅ |

@@ -996,12 +996,29 @@ def cmd_restore(args: argparse.Namespace) -> int:
     print("    " + (", ".join(t.name for t in closed) or "（无）"))
     print("  未闭合（下次 up 会接着推）:")
     opens = proto.open_tasks()
+    cycles = proto.dep_cycles()
+    on_cycle = {n for c in cycles for n in c}
     for t in opens:
-        owes = {r: o for r, o in proto.debts(t).items()}
-        who = "、".join(f"{r}:{o}" for r, o in owes.items()) or "无（等新需求）"
+        # 成环/拼错不是「等前置」，debts() 的 wait-dep 在这两类上会撒谎——
+        # 行内如实标出，详情是下面与 status 逐字一致的 ⚠ 行。
+        miss = proto.missing_deps(t)
+        if t.name in on_cycle:
+            who = "⚠ 依赖成环"
+        elif miss:
+            who = f"⚠ depends_on 指向不存在的切片：{'、'.join(miss)}"
+        else:
+            owes = {r: o for r, o in proto.debts(t).items()}
+            who = "、".join(f"{r}:{o}" for r, o in owes.items()) or "无（等新需求）"
         print(f"    {t.name}  →  {who}")
     if not opens and not closed:
         print("    （无）")
+    for c in cycles:
+        print(f"  ⚠ 依赖成环：{' → '.join(c)}（这些切片永远排不上队）")
+    for t in opens:
+        miss = proto.missing_deps(t)
+        if miss:
+            print(f"  ⚠ {t.name} 的 depends_on 指向不存在的切片：{'、'.join(miss)}"
+                  f"（拼错了，不是排队）")
     print()
     tl = proto.dir / "watch" / "timeline.log"
     if tl.exists():
@@ -1699,6 +1716,15 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def _waiting_deps(proto: Protocol, tasks: list[Path]) -> dict[str, list[str]]:
+    """真在「等前置」的切片：成环与拼错不是等——那两类走各自的 ⚠ 行。"""
+    on_cycle = {n for c in proto.dep_cycles() for n in c}
+    return {t.name: proto.deps_blocking(t) for t in tasks
+            if proto.deps_blocking(t)
+            and t.name not in on_cycle
+            and not proto.missing_deps(t)}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     label, _ws_why = resolve_ws_label(root, args.workspace)
@@ -1810,8 +1836,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         cycles = proto.dep_cycles()
         for c in cycles:
             print(f"  ⚠ 依赖成环：{' → '.join(c)}（这些切片永远排不上队）")
-        waiting_deps = {t.name: proto.deps_blocking(t)
-                        for t in open_tasks if proto.deps_blocking(t)}
+        waiting_deps = _waiting_deps(proto, open_tasks)
         if waiting_deps:
             print("  等前置（不是卡住）："
                   + "  ".join(f"{k}←{'/'.join(v)}" for k, v in waiting_deps.items()))

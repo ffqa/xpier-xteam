@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -1933,6 +1935,52 @@ def test_slice_order_and_rules_staleness() -> None:
 
 
 
+def test_version_bump_carries_at_ten() -> None:
+    print("\n[新] 版本号满 10 进 1（十进制进位）")
+    # 直接从 pack.sh 里**抽出真的 bump_version** 来跑，而不是在这里重写一遍 ——
+    # 重写的话，测试就只验证了「我以为的规则」，pack.sh 改坏了也不会红。
+    pack = (Path(__file__).resolve().parent.parent / "pack.sh").read_text(
+        encoding="utf-8")
+    m = re.search(r"^bump_version\(\) \{.*?^\}", pack, re.S | re.M)
+    check("pack.sh 里找得到 bump_version", bool(m), True)
+    if not m:
+        return
+    body = m.group(0)
+    runner = ("die() { echo \"die: $1\" >&2; exit 1; }\n"
+              "say() { :; }\nBUMP=''\n" + body + "\n")
+    with tempfile.TemporaryDirectory() as td:
+        script = Path(td) / "b.sh"
+        script.write_text(runner, encoding="utf-8")
+        script.chmod(0o755)
+
+        def bump(ver: str, kind: str) -> str:
+            # 注意必须 **source** 抽出来的脚本 —— 直接 `bump_version` 等于在一个
+            # 没有该函数的 shell 里调用，会得到 "command not found"。
+            r = subprocess.run(
+                ["/bin/bash", "-c",
+                 f'. "{script}"; BUMP={kind}; bump_version {ver}'],
+                capture_output=True, text=True)
+            return r.stdout.strip() or f"<err:{r.stderr.strip()[:40]}>"
+
+        # 十进制进位：patch 到 9 再 +1 就进 minor，而不是走到 0.1.10
+        check("0.1.8 --patch→ 0.1.9", bump("0.1.8", "patch"), "0.1.9")
+        check("0.1.9 --patch→ 0.2.0（满 10 进 1，不产生 0.1.10）",
+              bump("0.1.9", "patch"), "0.2.0")
+        check("0.2.9 --patch→ 0.3.0", bump("0.2.9", "patch"), "0.3.0")
+        check("0.9.3 --minor→ 1.0.0（minor 满 10 也进位）",
+              bump("0.9.3", "minor"), "1.0.0")
+        check("0.1.9 --minor→ 0.2.0", bump("0.1.9", "minor"), "0.2.0")
+        check("0.1.9 --major→ 1.0.0", bump("0.1.9", "major"), "1.0.0")
+        # 越界的号也进位，不继续往上数
+        check("手改成 0.1.12 也能正确进位",
+              bump("0.1.12", "patch"), "0.2.0")
+        check("非 X.Y.Z 被拒", bump("0.1.x", "patch").startswith("<err:"), True)
+        check("未知档位被拒", bump("0.1.1", "huge").startswith("<err:"), True)
+        # **版本号绝不能出现 10**：这是本条规则存在的全部理由
+        check("结果里不会出现第 10 个 patch",
+              "0.1.10" in {bump(f"0.1.{i}", "patch") for i in range(20)}, False)
+
+
 def test_model_name_sanity_filter() -> None:
     print("\n[48] 模型名合理性过滤（防把欢迎语当模型名）")
     # 回归：实测 `claude models` 没有 models 子命令，会忽略参数直接进交互会话，
@@ -2533,11 +2581,42 @@ def test_permission_path_boundary() -> None:
     check("相对路径不自动放行", v("relative/path", project="/repo"), "unknown")
 
 
+def test_waiting_deps_excludes_cycles_and_typos() -> None:
+    print("\n[66] status 的「等前置」剔除成环与拼错（F-1 口径）")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root); proto.ensure()
+
+        def slice_(name: str, deps: list) -> None:
+            t = proto.tasks / name
+            t.mkdir(parents=True, exist_ok=True)
+            (t / "task.json").write_text(
+                json.dumps({"depends_on": deps}), encoding="utf-8")
+            (t / "spec.md").write_text("# s", encoding="utf-8")
+            (t / "spec.json").write_text('{"round": 1}', encoding="utf-8")
+
+        slice_("a", ["b"]); slice_("b", ["a"])
+        slice_("bad", ["ap-side"])
+        slice_("fe-side", ["api-side"])
+        slice_("api-side", [])
+        # deps_blocking 本身照旧三类全收——状态机地板不能动；
+        # 「等前置」过滤是渲染层的活：环上与拼错的切片被剔除，真在等的留下。
+        waiting = _cli._waiting_deps(proto, proto.open_tasks())
+        check("成环的 a 不算等前置", "a" not in waiting, True)
+        check("成环的 b 不算等前置", "b" not in waiting, True)
+        check("拼错的 bad 不算等前置", "bad" not in waiting, True)
+        check("合法等待 fe-side 留下", waiting.get("fe-side"), ["api-side"])
+        check("无依赖 api-side 不在等", "api-side" not in waiting, True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
         test_unconsumed_verdict_keeps_dev_busy,
         test_round_regression_is_conservative,
+        test_version_bump_carries_at_ten,
         test_legacy_consumed_key_is_readable,
         test_closed_frees_everyone_and_prompts_next_slice,
         test_all_closed_without_report_pm_owes_report,
@@ -2599,6 +2678,7 @@ def main() -> int:
         test_cli_search_entry_does_not_crash,
         test_status_queue_count_matches_queue_items,
         test_blocked_answer_failure_escalates_not_answered,
+        test_waiting_deps_excludes_cycles_and_typos,
     ):
         fn()
     print()

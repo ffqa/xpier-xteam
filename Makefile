@@ -10,6 +10,10 @@
 # —— pack.sh 在升版本时就打了 tag，而那之后还可能有提交（补剩余改动、
 # 改 CHANGELOG），那样 tag 指向的就不是最终代码，而 CI 会忠实地发布它。
 #
+# 版本号规则：**满 10 进 1**（十进制进位）。
+#   0.1.8 → 0.1.9 → 0.2.0 → 0.2.1 …    0.9.3 → 1.0.0
+# 这样版本号里永远不会出现「10」，避免把十进制版本号当十六进制读（10 < 9）。
+#
 # 用法：
 #   make release              # 升 patch、跑门禁、提交、打 tag、推 → CI 接走
 #   make release MINOR=1      # 升 minor
@@ -49,9 +53,11 @@ help:
 verify:
 	@echo '▸ 门禁前两层（静态 + 单测）'
 	@python3 tests/lint_names.py
-	@python3 tests/lint_shell.py install.sh tests/smoke.sh pack.sh brew-publish.sh
+	@python3 tests/lint_shell.py install.sh tests/smoke.sh pack.sh brew-publish.sh tests/e2e_multi.sh
 	@python3 -m py_compile bin/xteam bin/xteam_lib.py tests/test_protocol.py
 	@python3 tests/test_protocol.py | tail -2
+	@echo '▸ 多项目治理 e2e（tests/e2e_multi.sh，hermetic）'
+	@bash tests/e2e_multi.sh
 
 # ---------------------------------------------------------------- 打包
 # 不带 --no-verify：解包 → 装到临时前缀 → 跑门禁前两层，是发版前最便宜的一次
@@ -108,7 +114,7 @@ release: verify
 	    echo "  pack.sh 已经打过 xteam-v$$NEWV；强制对齐到当前 HEAD"; \
 	  fi; \
 	  git tag -f -a "xteam-v$$NEWV" -m "release $$NEWV" >/dev/null; \
-	  echo "  tag 指向 $(git rev-parse --short xteam-v$$NEWV^{commit})"; \
+	  echo "  tag 指向 $$(git rev-parse --short xteam-v$$NEWV^{commit})"; \
 	  git push origin main; \
 	  git push --force origin "xteam-v$$NEWV"; \
 	  echo; echo "✓ tag xteam-v$$NEWV 已推送"; \

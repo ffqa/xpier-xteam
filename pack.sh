@@ -66,9 +66,21 @@ EOF
   case "$1" in
     *[!0-9.]*|"") die "VERSION '$1' 不是 X.Y.Z 形式，没法自动升" ;;
   esac
+  # **满 10 进 1（十进制进位），不是十六进制也不是死写死。**
+  # 原来 patch 是 +1 无条件，于是版本会走到 0.1.10、0.1.11 —— 那是十六进制的
+  # 直觉，用在十进制版本号上，会让人下意识把 10 当成「比 9 小」，
+  # 排序、比较、grep 全都要额外解释一遍。
+  # 现在：patch 到 9 再 +1 就进位到 minor，minor 到 9 再进位到 major。
+  #   0.1.8  → 0.1.9 → 0.2.0 → 0.2.1 …
+  #   0.9.3  → 1.0.0
+  # 用 >= 9 而不是 == 9：万一有人手改成 0.1.12，仍然会正确进位，而不是继续往上数。
   case "$BUMP" in
-    patch) echo "$MAJ.$MIN.$((PAT + 1))" ;;
-    minor) echo "$MAJ.$((MIN + 1)).0" ;;
+    patch)
+      if [ "$PAT" -ge 9 ]; then echo "$MAJ.$((MIN + 1)).0"
+      else echo "$MAJ.$MIN.$((PAT + 1))"; fi ;;
+    minor)
+      if [ "$MIN" -ge 9 ]; then echo "$((MAJ + 1)).0.0"
+      else echo "$MAJ.$((MIN + 1)).0"; fi ;;
     major) echo "$((MAJ + 1)).0.0" ;;
     *)     die "--bump 只接受 patch / minor / major，收到 '$BUMP'" ;;
   esac
@@ -308,7 +320,8 @@ if [ "$VERIFY" = "1" ]; then
   python3 "$PREFIX/share/xteam/tests/lint_names.py" >/dev/null \
     || die "装出来的代码过不了 lint_names"
   python3 "$PREFIX/share/xteam/tests/lint_shell.py" \
-    "$PREFIX/share/xteam/install.sh" "$PREFIX/share/xteam/tests/smoke.sh" >/dev/null \
+    "$PREFIX/share/xteam/install.sh" "$PREFIX/share/xteam/tests/smoke.sh" \
+    "$PREFIX/share/xteam/tests/e2e_multi.sh" >/dev/null \
     || die "装出来的 shell 过不了 lint_shell"
   N=$(python3 "$PREFIX/share/xteam/tests/test_protocol.py" 2>&1 | grep -c '✓' || true)
   python3 "$PREFIX/share/xteam/tests/test_protocol.py" >/dev/null \

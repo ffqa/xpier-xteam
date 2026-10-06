@@ -60,9 +60,9 @@ finish() {
     # 摘要必须区分「三层全过」和「按要求只跑了两层」—— 否则 --no-e2e 的绿灯
     # 会被读成「端到端也验过了」，而它恰恰没验。
     if [ "${E2E:-1}" = "0" ]; then
-      printf '✓ 门前两层全过：静态 · 单测 %s 条断言（端到端按 --no-e2e 跳过）\n' "${N_ASSERT:-0}"
+      printf '✓ 门禁全过（端到端按 --no-e2e 跳过）：静态 · 单测 %s 条断言 · 多项目 e2e\n' "${N_ASSERT:-0}"
     else
-      printf '✓ 门禁三层全过：静态 · 单测 %s 条断言 · 端到端\n' "${N_ASSERT:-0}"
+      printf '✓ 门禁全过：静态 · 单测 %s 条断言 · 多项目 e2e · 端到端\n' "${N_ASSERT:-0}"
     fi
     printf '  工作目录 %s 即将删除\n' "$WORK"
   else
@@ -91,7 +91,7 @@ if out=$(python3 "$REPO/tests/lint_names.py" 2>&1); then
 else
   bad "未定义检查不通过" "$out"; layer_fail "静态"
 fi
-if out=$(python3 "$REPO/tests/lint_shell.py" "$REPO/install.sh" "$REPO/tests/smoke.sh" 2>&1); then
+if out=$(python3 "$REPO/tests/lint_shell.py" "$REPO/install.sh" "$REPO/tests/smoke.sh" "$REPO/tests/e2e_multi.sh" 2>&1); then
   ok "shell 没有会静默出错的写法"
 else
   bad "shell 检查不通过" "$out"; layer_fail "静态"
@@ -118,6 +118,20 @@ fi
 if [ -n "$LAYER" ]; then
   printf '\n✗ 门禁未过（%s层），不起 pane —— 省下两分钟，' "$LAYER"
   printf '也避免在坏代码上跑出误导结果\n'
+  exit 1
+fi
+
+# 多项目治理的端到端层：mktemp 里真 git 仓 + herdr 替身，不需要真 herdr，
+# 所以 --no-e2e 与完整路径都必须跑到（AC-7：只许跳过真要 herdr 的第 3 层）。
+step "门禁 2.5/3" "多项目治理 e2e：tests/e2e_multi.sh（hermetic）"
+if out=$(bash "$REPO/tests/e2e_multi.sh" 2>&1); then
+  ok "e2e_multi 全过（$(printf '%s\n' "$out" | tail -1)）"
+else
+  bad "e2e_multi 失败" "$(printf '%s\n' "$out" | tail -8)"
+  layer_fail "e2e_multi"
+fi
+if [ -n "$LAYER" ]; then
+  printf '\n✗ 门禁未过（%s层），不起 pane\n' "$LAYER"
   exit 1
 fi
 
