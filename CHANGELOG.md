@@ -1,6 +1,9 @@
 # 变更记录
 
-## 0.1.5
+## 0.1.6
+
+首个公开发布版（Homebrew：`brew tap ffqa/tap && brew install ffqa/tap/xteam`）。
+包含 0.1.5 全部内容，另加 PR #1 的一批改动。
 
 ### agent 与模型
 
@@ -20,7 +23,7 @@
 ### 输出契约与任务边界
 
 - 新增 `skills/ste/`（ASD-STE100 中文改写）：STE 只管「对人说的话」，
-  spec/request 等工件按各角色章程详写。
+  spec/request 等工件按各角色章程详写。`doctor` 会打印它的绝对路径。
 - **任务边界四环**：spec 范围节 → request 禁区节 → review 先核禁区 →
   dev「多一点都不写」。缺任何一环，超范围改动都只在事后被发现（甚至不被发现）。
 - recap 只写四节、**不得加节**；swap 交接同约束。
@@ -36,6 +39,8 @@
 - **协议里 `skills/ste/SKILL.md` 是死链**：`PROTOCOL.md` 会被拷进**用户项目的**
   `.xteam/`，而 `skills/` 留在 xteam 安装目录，两者不在一棵树上。改成「安装目录下
   （`doctor` 会打印绝对路径）」，并给 `doctor` 加了一行显示该目录。
+- **打包时校验文档相对链接**：抽出所有 `docs/`、`skills/` 链接逐个确认包里真有。
+  「文件在包里」和「有人指向它」是两件事，漏装只在用户点开时才发现。
 - **`lint_shell` 的 `set -u` 检测漏掉最常见写法**：用 `-u` 子串匹配，而
   `set -euo pipefail` 里 `-u` 不是子串，于是所有 set -u 检查在 `pack.sh` /
   `install.sh` 上静默失效。改成按短选项字母匹配。
@@ -46,9 +51,11 @@
 - **`lint_names` 对 `class Fake(_lib.Herdr)` 误报**：基类只认裸 `ast.Name`，
   写成属性访问就查不到继承方法 → 报「不存在的方法」。违反它自己
   「宁可漏报不要误报」的规矩。
-- **打包时校验文档相对链接**：docs/ 值得打包的唯一理由就是 README 里的链接能点开。
-  现在从 markdown 里抽出所有 `docs/`、`skills/` 链接逐个确认包里真有 ——
-  「文件在包里」和「有人指向它」是两件事，漏装只在用户点开时才发现。
+## 0.1.5
+
+首个公开提交（未发布，仅仓库内有记录）。
+
+### 修掉的真缺陷
 
 - **`swap` 曾非事务**：先关旧 tab 再起新 agent，新 agent 启动失败时旧 pane 和上下文
   已经没了。改为**两阶段替换** —— 新 agent 活了才关旧的，失败则原样回滚。
@@ -85,6 +92,11 @@
 
 - 移交给 GitHub Actions：推 `xteam-v*` tag → 跑门禁 → 建 Release →
   自动更新 `ffqa/homebrew-tap` 的 Formula。本地不再需要发布脚本。
+- **`make release`**：一条命令完成升版本 → 门禁 → 提交 → 打 tag → 推，
+  CI 接走打包与发布。发布逻辑留在本机就多一次「忘了重打包却发了 tag」的
+  机会，而那种失败只在用户机器上才暴露。
+- Homebrew tap 用 **SSH 部署密钥**而非 PAT：部署密钥只能写 `homebrew-tap`
+  一个仓库，泄露了也只影响 tap 且随时可吊销。
 - **`.gitignore` 补 `/Formula/`（锚定顶层）**：原来写 `Formula/`，而 macOS 的
   `core.ignorecase` 默认为 true，于是它把发布模板所在的 `.github/formula/`
   一起吃掉 —— 模板从没进过仓库，CI 从一个不存在的路径读它，发版必炸，而本地

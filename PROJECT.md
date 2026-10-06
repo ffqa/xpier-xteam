@@ -195,25 +195,26 @@ bash pack.sh --worktree          # 发布包（不含 .git，自证可用）
 
 ## 6.1 发版
 
-发版已交给 GitHub Actions，本机不跑发布脚本：
+发版已交给 GitHub Actions，本机只做前置（升版本、门禁、打 tag、推）：
 
 ```bash
-bash pack.sh --bump=patch     # 升版本 + 自动提交 + 打 tag xteam-v0.1.6
-git push && git push --tags   # tag 一到，CI 接走剩下全部
+make release              # 升 patch + 门禁 + 提交 + 打 tag + 推
+make release MINOR=1      # 升 minor
+make check                # 只跑门禁前两层 + 打包自证（不想发版时用）
 ```
 
 CI（`.github/workflows/release.yml`）会：核对 tag 与 `VERSION` 一致 → 打包并自证可用
 → 建 Release（正文只取 CHANGELOG 当前版本那一段）→ 更新 `ffqa/homebrew-tap` 的 Formula。
 
+**发版前建议手动跑一次端到端**：`make verify` 不含第 3 层（要 herdr + 真 agent，
+约 110s），而它恰好是唯一能验「门铃真的送达 / swap 真的能换」的一层。
+本机跑：`bash tests/smoke.sh`。
+
 Formula 模板在 `.github/formula/xteam.rb.template`。**要改安装逻辑就改那里**，
 不要改本地 `brew-publish.sh` —— 它已 gitignore，发版不再经过它。
 
-首次配置需要给仓库加两个 secret（发 Tap 用，否则 Release 仍会建、只是不更新 tap）：
-
-| secret | 内容 |
-|---|---|
-| `TAP_SSH_KEY` | `ffqa/homebrew-tap` 的部署私钥（只对这个库有写权限） |
-| `TAP_KNOWN_HOSTS` | `ssh-keyscan github.com` 的输出 |
+发布凭据（SSH 部署密钥）备份在 `.xteam/keys/`，说明见该目录的 `README.md`。
+对应两个 secret：`TAP_SSH_KEY`、`TAP_KNOWN_HOSTS`。
 
 ## 7. 回复风格
 
