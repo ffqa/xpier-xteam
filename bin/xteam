@@ -1246,8 +1246,10 @@ def cmd_swap(args: argparse.Namespace) -> int:
         if old_pane:
             print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
             herdr.doorbell(old_pane,
-                           f"你要被换掉了。请立刻把当前进展、已确认的结论、"
-                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md，"
+                           f"你要被换掉了。请把当前进展、已确认的结论、"
+                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md "
+                           f"（15 行以内，只写这四节：做完什么 / 验证结果 / 关键决定与理由 / "
+                           f"下一步遗留，不得加节），"
                            f"然后停下。",
                            wait_s=args.recap_wait)
         print(f"[{now()}] recap："
@@ -1905,9 +1907,11 @@ def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path)
         msg = (
             f"【收尾】请写一份 recap 到 {target}（**覆盖写，不要追加**）。\n"
             f"原因：{why}。这份文件跨会话保留，之后给你派活或换人时会带上它。\n"
-            f"只要 15 行以内，四行小标题即可：\n"
+            f"只要 15 行以内，**只写这四节，不得加节**：\n"
             f"  ## 做完什么\n  ## 验证结果（实测命令 + 数字）\n"
             f"  ## 关键决定与理由\n  ## 下一步 / 遗留\n"
+            f"不要写「这份 recap 存在的原因」、不要写工具观察笔记、不要复述队列——"
+            f"那些在 .xteam/ 里本来就有，重写一遍只是烧 token。\n"
             f"写完就停下，别展开叙述 —— 它是给下一个接手的人扫一眼用的，不是作文。"
         )
         if pct:
