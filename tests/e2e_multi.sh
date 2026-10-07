@@ -1731,6 +1731,75 @@ run grep -c "只有你自己写" "$REPO/roles/tl.md" "$REPO/roles/dev.md"
 assert_has "MP-32.4 tl 的产物仍是单一作者" "roles/tl.md:1"
 assert_has "MP-32.4 dev 的产物仍是单一作者" "roles/dev.md:1"
 
+# MP-33：门铃投递的两条实测判据（omp 形状）—— 假 herdr，不需要真 agent。
+xin33() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin33:$PATH" LABEL=mp33 ROOT="$t" \
+    TAIL="$BASE/mp33.tail" CHIP="$BASE/mp33.chip" EMPTY="$BASE/mp33.empty" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp33 "$@" </dev/null)
+}
+mkdir -p "$BASE/bin33"
+cat > "$BASE/bin33/herdr" <<'EOF'
+#!/bin/sh
+# 输入行放 $TAIL 里；prompt 之后（模拟 omp）翻成粘贴块，send-keys enter 之后翻回空框。
+LOG="${TAIL}.log"
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w33","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"w33:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result":{"agents":[{"pane_id":"w33:p1","name":"pm-'"$LABEL"'","agent":"omp","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w33","tab_id":"w33:t1"},{"pane_id":"w33:p2","name":"tl-'"$LABEL"'","agent":"omp","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w33","tab_id":"w33:t1"},{"pane_id":"w33:p3","name":"dev-'"$LABEL"'","agent":"omp","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w33","tab_id":"w33:t1"}]}}' ;;
+  "pane read")      cat "$TAIL" ;;
+  "pane list")      printf '%s\n' '{"result":{"panes":[{"pane_id":"w33:p1","cwd":"'"$ROOT"'"},{"pane_id":"w33:p2","cwd":"'"$ROOT"'"},{"pane_id":"w33:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  "agent prompt")   printf 'prompt\n' >> "$LOG"; cp "$CHIP" "$TAIL"; printf '%s\n' '{"result":{}}' ;;
+  "pane send-keys") printf 'send-keys %s\n' "$4" >> "$LOG"; cp "$EMPTY" "$TAIL"; printf '%s\n' '{"result":{}}' ;;
+  *) printf '%s\n' '{"result":{}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin33/herdr"
+printf '╰─\n'         > "$BASE/mp33.empty"
+printf '╰─ txt #2\n'  > "$BASE/mp33.chip"
+
+step "MP-33" "门铃投递：框里有草稿不投；长消息成粘贴块才自动补回车（omp 实测形状）"
+
+T="$BASE/mp33"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-33.0 init 布景 rc=0" 0
+
+# 判据表只认实测过的 kind —— 布景必须真的是 omp，否则退回旧行为（那才是对的）。
+printf '{"roles":{"pm":{"kind":"omp"},"tl":{"kind":"omp"},"dev":{"kind":"omp"}}}\n' \
+  > "$T/.xteam/team.json"
+
+# 态 1：输入框里有草稿 → 不投、不补键，且如实报「没投」。
+printf '╰─ HALF-TYPED 我在打这句话\n' > "$BASE/mp33.tail"
+: > "$BASE/mp33.tail.log"
+run xin33 "$T" say dev "ZZSAY 不该发出去" --wait-empty 0
+assert_rc  "MP-33.1 草稿在 → 非 0（没投）" nz
+assert_has "MP-33.1 明说没投" "没投"
+n="$(grep -c prompt "$BASE/mp33.tail.log")"
+[ "$n" = "0" ] && ok "MP-33.1 一次都没投（prompt 调用 0 次）" \
+  || bad "MP-33.1 草稿在还投了" "$(cat "$BASE/mp33.tail.log")"
+
+# 态 2：短消息（行内提交）→ 投一次，不补键。
+printf '╰─\n' > "$BASE/mp33.tail"
+: > "$BASE/mp33.tail.log"
+run xin33 "$T" say dev "ZZSHORT 一句话门铃"
+assert_rc "MP-33.2 短消息 rc=0" 0
+[ "$(grep -c prompt "$BASE/mp33.tail.log")" = "1" ] \
+  && ok "MP-33.2 投了一次" || bad "MP-33.2 没投或投多次" "$(cat "$BASE/mp33.tail.log")"
+[ "$(grep -c send-keys "$BASE/mp33.tail.log")" = "0" ] \
+  && ok "MP-33.2 短消息不补回车（0 次）" || bad "MP-33.2 短消息补了回车" "$(cat "$BASE/mp33.tail.log")"
+
+# 态 3：长消息（≥90 行 → omp 收成粘贴块）→ 补一次回车，提交后输入框回空框。
+printf '╰─\n' > "$BASE/mp33.tail"
+: > "$BASE/mp33.tail.log"
+LONG="$(python3 -c 'print("\n".join(f"章程行 {i}" for i in range(120)))')"
+run xin33 "$T" say dev "$LONG"
+assert_rc "MP-33.3 长消息 rc=0" 0
+assert_has "MP-33.3 报的是已投递" "已投递"
+[ "$(grep -c 'send-keys enter' "$BASE/mp33.tail.log")" = "1" ] \
+  && ok "MP-33.3 补了一次 send-keys enter" || bad "MP-33.3 补键次数不对" "$(cat "$BASE/mp33.tail.log")"
+[ "$(grep -c '^╰─$' "$BASE/mp33.tail")" = "1" ] \
+  && ok "MP-33.3 提交后输入框回到空框" || bad "MP-33.3 输入框还残留" "$(cat "$BASE/mp33.tail")"
+
 # ---------------------------------------------------------------- 收尾
 printf '\n'
 printf '%s/%s 通过\n' "$PASS" "$TOTAL"

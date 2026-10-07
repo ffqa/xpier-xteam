@@ -104,6 +104,7 @@ from xteam_lib import (  # noqa: E402
     search_models,
     suggest_kinds,
     subagent_capability,
+    PASTE_CHIP_LINES,
 )
 
 FAILURES: list[str] = []
@@ -1846,7 +1847,7 @@ def test_slice_order_and_rules_staleness() -> None:
             def role_map(self, ws_id: str):
                 return {r: {"pane_id": f"p-{r}"} for r in ("pm", "tl", "dev")}
 
-            def doorbell(self, pane, msg, wait_s=0):
+            def doorbell(self, pane, msg, wait_s=0, kind="", wait_empty_s=15.0):
                 sent_log.append((str(pane), str(msg)))
                 return "ok"
 
@@ -3086,7 +3087,7 @@ def test_say_recheck_window() -> None:
             return {"workspace_id": "wQ"}
         def role_map(self, workspace_id):
             return {"dev": {"pane_id": "wQ:p3"}}
-        def doorbell(self, pane, message, wait_s=0.0):
+        def doorbell(self, pane, message, wait_s=0.0, kind="", wait_empty_s=15.0):
             return "prompt-failed: boom"
 
     real_herdr = _cli.Herdr
@@ -3095,7 +3096,8 @@ def test_say_recheck_window() -> None:
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / ".xteam").mkdir()
             args = argparse.Namespace(project=td, workspace="w1",
-                                      role="dev", message="x", settle=0)
+                                      role="dev", message="x", settle=0,
+                                      wait_empty=0.0)
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), \
                  contextlib.redirect_stderr(err):
@@ -3316,7 +3318,7 @@ def test_say_three_state_render() -> None:
             return {"workspace_id": "wV"}
         def role_map(self, workspace_id):
             return {"dev": {"pane_id": "wV:p3"}}
-        def doorbell(self, pane, message, wait_s=0.0):
+        def doorbell(self, pane, message, wait_s=0.0, kind="", wait_empty_s=15.0):
             return "status=idle"
         def agent_status(self, pane_id: str) -> str:
             self.calls.append("agent_status")
@@ -3335,7 +3337,8 @@ def test_say_three_state_render() -> None:
             with tempfile.TemporaryDirectory() as td:
                 (Path(td) / ".xteam").mkdir()
                 args = argparse.Namespace(project=td, workspace="w1",
-                                          role="dev", message="x", settle=0)
+                                          role="dev", message="x", settle=0,
+                                          wait_empty=0.0)
                 out, err = io.StringIO(), io.StringIO()
                 with contextlib.redirect_stdout(out), \
                      contextlib.redirect_stderr(err):
@@ -3909,6 +3912,96 @@ def test_subagent_capability_table_is_verified_only() -> None:
     check("空列表 → 空串（怎么显示由调用方定）", subagent_capability([]), "")
 
 
+class _FakeHerdr(Herdr):
+    """门铃判据的替身：只覆盖外部边界（pane 读 / prompt / send-keys / agent 表）。
+
+    形状全部照 2026-10-07 实测的 omp 18.x：空框 `╰─`、草稿 `╰─ <字>`、
+    长消息被收成粘贴块 `╰─ txt #2`。
+    """
+
+    def __init__(self, tails: list[str], kind: str = "omp") -> None:
+        self.tails = list(tails)
+        self.kind = kind
+        self.calls: list[tuple] = []
+
+    def agents(self) -> list[dict]:
+        return [{"pane_id": "wX:p1", "agent": self.kind}]
+
+    def read_pane(self, pane_id: str, lines: int = 60, source: str = "recent") -> str:
+        self.calls.append(("read", source))
+        return self.tails.pop(0) if len(self.tails) > 1 else self.tails[0]
+
+    def _prompt(self, target: str, message: str) -> tuple[int, str]:
+        self.calls.append(("prompt", message))
+        return 0, ""
+
+    def _run(self, *args: str, timeout: int = 30) -> dict:
+        self.calls.append(("run",) + args)
+        return {}
+
+    def agent_status(self, pane_id: str) -> str:
+        return "working"
+
+
+def test_box_state_reads_omp_input_line() -> None:
+    print("\n[93] 输入框判据：omp 的 `╰─` 空框 / 草稿 / 粘贴块（实测形状）")
+    empty = ("   Esc Working…\n"
+             " >---6%-------------------------------------------------|--------------1M-\n"
+             "╰─\n")
+    draft = empty.replace("╰─\n", "╰─ HALF-TYPED 我在打这句话\n")
+    chip = empty.replace("╰─\n", "╰─ txt #2\n")
+    check("空框 → empty", _FakeHerdr([empty]).box_state("wX:p1"), "empty")
+    check("草稿 → draft", _FakeHerdr([draft]).box_state("wX:p1"), "draft")
+    check("粘贴块（长消息被收成 chip）→ draft",
+          _FakeHerdr([chip]).box_state("wX:p1"), "draft")
+    check("认不出的 kind → unknown（不预检也不补键）",
+          _FakeHerdr([draft], kind="devin").box_state("wX:p1"), "unknown")
+    check("找不到提示符 → unknown",
+          _FakeHerdr(["没有任何提示符\n"]).box_state("wX:p1"), "unknown")
+
+
+def test_doorbell_guards_human_draft_and_retries_enter() -> None:
+    print("\n[94] 门铃：框里有草稿不投；长消息成粘贴块才补一次回车")
+    empty = "╰─\n"
+    draft = "╰─ HALF-TYPED 我在打这句话\n"
+    chip = "╰─ txt #2\n"
+    long_msg = "行\n" * PASTE_CHIP_LINES        # ≥ 阈值：走「投完复核」路径
+    short_msg = "一句话门铃"
+
+    h = _FakeHerdr([draft])
+    res = h.doorbell("wX:p1", short_msg, wait_empty_s=0.0)
+    check("框里有草稿 → 返回 skipped-draft", res.startswith("skipped-draft"), True)
+    check("草稿在时不投（没调 prompt）",
+          [c for c in h.calls if c[0] == "prompt"], [])
+    check("草稿在时也不补回车（绝不替人按）",
+          [c for c in h.calls if c[0] == "run"], [])
+
+    h = _FakeHerdr([empty, chip, empty])       # 投前空 → 投完是粘贴块 → 补键后提交
+    res = h.doorbell("wX:p1", long_msg, wait_empty_s=0.0)
+    check("长消息成粘贴块 → 补一次 send-keys enter",
+          [c for c in h.calls if c[0] == "run"],
+          [("run", "pane", "send-keys", "wX:p1", "enter")])
+    check("提交成功 → 状态里没有 submit=stuck", "submit=stuck" in res, False)
+
+    h = _FakeHerdr([empty, empty])             # 短消息：行内提交，框一直是空的
+    h.doorbell("wX:p1", short_msg, wait_empty_s=0.0)
+    check("短消息不复核（一次回车都不补）",
+          [c for c in h.calls if c[0] == "run"], [])
+
+    h = _FakeHerdr([empty, chip])              # 补了也不提交 → 如实报出，不装成功
+    res = h.doorbell("wX:p1", long_msg, wait_empty_s=0.0)
+    check("补回车也没提交 → submit=stuck", "submit=stuck" in res, True)
+    check("最多补两次（不无限按）",
+          len([c for c in h.calls if c[0] == "run"]), 2)
+
+    h = _FakeHerdr([draft], kind="devin")      # 认不出的 kind：退回旧行为
+    res = h.doorbell("wX:p1", short_msg, wait_empty_s=0.0)
+    check("认不出的 kind 照投（不预检）",
+          [c[0] for c in h.calls if c[0] == "prompt"], ["prompt"])
+    check("认不出的 kind 不补键", [c for c in h.calls if c[0] == "run"], [])
+    check("认不出的 kind 返回 status", res.startswith("status="), True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4005,6 +4098,8 @@ def main() -> int:
         test_start_next_still_gated_by_pending_window,
         test_consume_preempts_implement,
         test_subagent_capability_table_is_verified_only,
+        test_box_state_reads_omp_input_line,
+        test_doorbell_guards_human_draft_and_retries_enter,
     ):
         fn()
     print()

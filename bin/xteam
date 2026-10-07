@@ -1888,10 +1888,21 @@ def cmd_say(args: argparse.Namespace) -> int:
         head = "（你上次的 recap 摘要）\n" + "\n".join(tail) + "\n\n"
     else:
         head = ""
-    status = herdr.doorbell(pane, hint + head + args.message, wait_s=args.settle)
+    status = herdr.doorbell(pane, hint + head + args.message, wait_s=args.settle,
+                            kind=kind, wait_empty_s=args.wait_empty)
     log_event(proto.dir / "watch" / "doorbell.log", f"-> {args.role}: {args.message[:80]}")
     # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
     # 「刚才那声门铃到底有没有把它叫醒、什么时候叫的」。
+    if status.startswith("skipped-draft"):
+        print(f"[{now()}] 门铃 → {args.role} ({pane})  没投")
+        print(f"  ⚠ {status.split(': ', 1)[-1]}", file=sys.stderr)
+        return 1
+    if "submit=stuck" in status:
+        # 长消息被 TUI 收成粘贴块挂在输入框，补回车也没提交 —— 说清楚，别装成功。
+        print(f"[{now()}] 门铃 → {args.role} ({pane})  已投但**没提交**")
+        print("  ⚠ 长消息卡在输入框（TUI 的粘贴块），补回车也没发出去 —— "
+              "去那个 pane 按一次回车", file=sys.stderr)
+        return 1
     if status.startswith("prompt-failed"):
         print(f"[{now()}] 门铃 → {args.role} ({pane})  {status}")
         print("  ⚠ 投递失败，角色可能不可达（pane 崩了 / 停在审批 UI）", file=sys.stderr)
@@ -3989,6 +4000,8 @@ def main() -> int:
     p.add_argument("role")
     p.add_argument("message")
     p.add_argument("--settle", type=int, default=0, help="投递后等几秒再读状态")
+    p.add_argument("--wait-empty", type=float, default=15.0, metavar="SECS",
+                   help="输入框里有草稿时，等它变空几秒（默认 15；0 = 不等，直接不投）")
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("snap", help="按 delivered.json.changed[] 钉交付快照（提交）")

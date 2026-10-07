@@ -336,6 +336,20 @@ SYSTEM_PROMPT_ARG: dict[str, str] = {
 # 能扇出、结果没有，比明说「未实测」更糟：它会编出一份没有证据的结论。
 SUBAGENT_CAPABLE: set[str] = {"omp"}
 
+# kind → 输入框提示符。`xteam say` 靠它判断「框里有没有东西」：
+# 框里有草稿时投递 = herdr 的编码回车把「人打的一半 + 门铃文本」一起提交。
+# **只在实测过的 kind 上写**（口径同 SYSTEM_PROMPT_ARG）：认不出来就退回旧行为
+# （不预检、不补键）——绝不对着不认识的面板瞎按回车。
+INPUT_BOX_MARK: dict[str, str] = {
+    "omp": "╰─",     # 实测 omp 18.x：空框是 `╰─`，草稿/粘贴块是 `╰─ <内容>`
+}
+
+# omp 会把「大块粘贴」收成挂在输入框里的**粘贴块**（`╰─ txt #N`）而不是行内文本，
+# 而 herdr 那次编码回车不提交它 —— 要再补一次 enter 才发得出去。实测边界
+# （2026-10-07）：90 行还是行内提交，100 行变成粘贴块。留余量：**≥90 行就复核**。
+# 短消息不复核（复核要轮询 3 秒），所以门铃的常规路径一点没变慢。
+PASTE_CHIP_LINES = 90
+
 
 def subagent_capability(kinds) -> str:
     """把 kind 列表渲染成一行「谁有只读子代理」：`omp ✓ / agy ?（未实测）`。"""
@@ -622,8 +636,11 @@ class Herdr:
                 return str((agent.get("agent_session") or {}).get("value") or "")
         return ""
 
-    def read_pane(self, pane_id: str, lines: int = 60) -> str:
-        proc = subprocess.run([self.bin, "pane", "read", pane_id, "--lines", str(lines)],
+    def read_pane(self, pane_id: str, lines: int = 60,
+                  source: str = "recent") -> str:
+        """读 pane 输出。`source="visible"` 读当前屏（输入框在最底下那几行）。"""
+        proc = subprocess.run([self.bin, "pane", "read", pane_id,
+                               "--lines", str(lines), "--source", source],
                               capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             raise RuntimeError(f"herdr pane read {pane_id} rc={proc.returncode}")
@@ -745,24 +762,114 @@ class Herdr:
 
     # -- 门铃 / 投递 --
 
-    def doorbell(self, target: str, message: str, wait_s: float = 0.0) -> str:
-        """给一个**工作中**的 agent 发消息（走 agent prompt）。
+    def agent_kind(self, pane_id: str) -> str:
+        """这个 pane 跑的是哪个 kind（`agent list` 的 `agent` 字段）。查不到返回空串。"""
+        for agent in self.agents():
+            if agent.get("pane_id") == pane_id:
+                return str(agent.get("agent") or "")
+        return ""
+
+    def box_state(self, pane_id: str, kind: str = "") -> str:
+        """输入框里有没有东西：`empty` / `draft` / `unknown`。
+
+        实测（omp 18.x，2026-10-07）：输入行是**最后一条以 `╰─` 开头的行** ——
+        空框就是 `╰─`；有人打了字、或挂了一个粘贴块（`╰─ txt #2`）就带内容。
+        认不出的 kind / 读不到 / 找不到提示符 → `unknown`：调用方一律退回旧行为，
+        **不预检也不补键**。
+        """
+        mark = INPUT_BOX_MARK.get(kind or self.agent_kind(pane_id))
+        if not mark:
+            return "unknown"
+        try:
+            tail = self.read_pane(pane_id, lines=40, source="visible")
+        except Exception:                        # noqa: BLE001
+            return "unknown"
+        for line in reversed(tail.splitlines()):
+            if line.startswith(mark):
+                return "draft" if line[len(mark):].strip() else "empty"
+        return "unknown"
+
+    def _poll_box(self, pane_id: str, kind: str, want: str,
+                  timeout_s: float) -> str:
+        """轮询输入框直到变成 `want`（或超时），返回最后一次读到的状态。
+
+        **必须轮询**：omp 渲染粘贴块比 `agent prompt` 返回晚 —— 实测返回只要
+        0.31s，粘贴块 t+0.5s 才出现在输入行上，单次读会读到「还没渲染」的旧屏。
+        """
+        deadline = time.time() + timeout_s
+        state = self.box_state(pane_id, kind)
+        while state != want and time.time() < deadline:
+            time.sleep(0.25)
+            state = self.box_state(pane_id, kind)
+        return state
+
+    def _ensure_submitted(self, target: str, kind: str) -> bool:
+        """长消息投完的复核：被收成粘贴块就补回车，直到输入框空。返回是否已提交。
+
+        **只该在「投之前框是空的」之后调用** —— 那时框里的东西必然是刚投进去的，
+        补回车不会连坐别人的字。最多补两次：第一次提交，第二次给渲染慢的余地。
+        """
+        for _ in range(2):
+            if self._poll_box(target, kind, "draft", 3.0) != "draft":
+                return True                      # 一直是空框 = 行内提交成功
+            try:
+                self._run("pane", "send-keys", target, "enter")
+            except RuntimeError:
+                return False
+            if self._poll_box(target, kind, "empty", 2.0) == "empty":
+                return True
+        return False
+
+    def _prompt(self, target: str, message: str) -> tuple[int, str]:
+        """`agent prompt` 投一次。返回 (rc, stderr)。**测试用替身覆盖这一层。**"""
+        proc = subprocess.run([self.bin, "agent", "prompt", target, message],
+                              capture_output=True, text=True, timeout=30)
+        return proc.returncode, proc.stderr.strip()
+
+    def doorbell(self, target: str, message: str, wait_s: float = 0.0,
+                 kind: str = "", wait_empty_s: float = 15.0) -> str:
+        """给一个 agent 发消息（走 `agent prompt`）。
 
         对 blocked 的 agent 无效（会被拒）——那种情况用 send_choice。
 
-        **不补 send-keys enter。** `agent prompt` 按 pane 的 bracketed-paste
-        模式发送「文本 + 编码后的回车」，是一次有序提交，herdr 只在两者都
-        写完才报成功。之前这里多补了一个裸 enter，而终端输入缓冲区是共享的：
-        用户正在输入框里打了一半的字时，这个 enter 会把「用户半句话 + 门铃
-        文本」一起提交——等于别人在用户打字时替用户按了回车（2026-10-06 实测）。
+        **两条实测判据（2026-10-07，omp 18.x）：**
+
+        1. **框里有草稿就不投。** 人可能正在这个 pane 里打字；直接投，herdr 那次
+           编码回车会把「人打的一半 + 门铃文本」一起提交（实测：草稿被连坐发出，
+           agent 收到一句人还没写完的话）。所以先看框，非空就等它空；等不到就
+           返回 `skipped-draft` **什么都不投**（宁可不叫醒，也不替人按回车）。
+        2. **投完复核框里还留着没有。** omp 把长多行消息（`sync` 投的就是章程全文）
+           收成粘贴块挂在输入框（`╰─ txt #N`），herdr 那次回车不提交它 —— 实测
+           需要再补一次 enter。补键**只在「投之前框是空的」前提下**做：那时框里的
+           东西必然是刚投进去的，不会连坐别人的字。
         """
-        proc = subprocess.run([self.bin, "agent", "prompt", target, message],
-                              capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            return f"prompt-failed: {proc.stderr.strip()[:120]}"
+        kind = kind or self.agent_kind(target)
+        known = kind in INPUT_BOX_MARK
+        box = self.box_state(target, kind)
+        if known:
+            # 可见屏偶尔读不到输入行（渲染竞态）：重试几次，别把「读不到」当「空框」。
+            for _ in range(3):
+                if box != "unknown":
+                    break
+                time.sleep(0.25)
+                box = self.box_state(target, kind)
+        if box == "draft":
+            deadline = time.time() + wait_empty_s
+            while time.time() < deadline and self.box_state(target, kind) == "draft":
+                time.sleep(0.5)
+            if self.box_state(target, kind) == "draft":
+                return (f"skipped-draft: 输入框里有草稿，等了 {wait_empty_s:.0f}s "
+                        f"没等到空 —— 没投（投了会把你打的一半一起发出去）")
+        rc, err = self._prompt(target, message)
+        if rc != 0:
+            return f"prompt-failed: {err[:120]}"
+        submitted = True
+        if known and box == "empty" and message.count("\n") + 1 >= PASTE_CHIP_LINES:
+            submitted = self._ensure_submitted(target, kind)
         if wait_s > 0:
             time.sleep(wait_s)
-        return f"status={self.agent_status(target)}"
+        tail = "" if submitted else ";submit=stuck"
+        return f"status={self.agent_status(target)}{tail}"
 
     def send_choice(self, pane_id: str, text: str, settle_s: int = 5) -> tuple[bool, str]:
         """给**停在选项 UI 上**的 agent 提交一个选择。
@@ -784,8 +891,9 @@ class Herdr:
             return False, f"提交后仍停在 blocked（{before} → {after}）"
         return True, f"{before} → {after}"
 
-    def send_initial_prompt(self, target: str, text: str, wait_s: int = 20) -> str:
-        return self.doorbell(target, text, wait_s=wait_s)
+    def send_initial_prompt(self, target: str, text: str, wait_s: int = 20,
+                            kind: str = "") -> str:
+        return self.doorbell(target, text, wait_s=wait_s, kind=kind)
 
     def wait_state(self, target: str, states: tuple[str, ...], timeout_ms: int) -> str:
         args = [self.bin, "agent", "wait", target, "--timeout", str(timeout_ms)]
