@@ -1778,6 +1778,12 @@ n="$(grep -c prompt "$BASE/mp33.tail.log")"
 [ "$n" = "0" ] && ok "MP-33.1 一次都没投（prompt 调用 0 次）" \
   || bad "MP-33.1 草稿在还投了" "$(cat "$BASE/mp33.tail.log")"
 
+# 态 1b：面板上要能**看见**这件事 —— 否则人只会以为「agent 不干活」。
+run xin33 "$T" status
+assert_rc  "MP-33.1b status rc=0" 0
+assert_has "MP-33.1b 面板报出「门铃投不进去」" "门铃投不进去"
+assert_has "MP-33.1b 指明是草稿挡住" "输入框里有草稿"
+
 # 态 2：短消息（行内提交）→ 投一次，不补键。
 printf '╰─\n' > "$BASE/mp33.tail"
 : > "$BASE/mp33.tail.log"

@@ -3954,6 +3954,15 @@ def test_box_state_reads_omp_input_line() -> None:
     check("草稿 → draft", _FakeHerdr([draft]).box_state("wX:p1"), "draft")
     check("粘贴块（长消息被收成 chip）→ draft",
           _FakeHerdr([chip]).box_state("wX:p1"), "draft")
+    # 聚焦的 pane 会在输入行右侧挂提示（android_dev 实测形状）：那是提示不是草稿。
+    # 0.2.6 把空框判成草稿 → 所有门铃被静默跳过，巡检还倒过来说「无响应」。
+    focused = "╰─" + " " * 120 + "Shift+Tab to change thinking effort\n"
+    check("聚焦时的右侧提示不算草稿（0.2.6 的假阳性）",
+          _FakeHerdr([focused]).box_state("wX:p1"), "empty")
+    focused_draft = ("╰─ 我在打这句话" + " " * 100
+                     + "Shift+Tab to change thinking effort\n")
+    check("有草稿 + 右侧提示 → draft",
+          _FakeHerdr([focused_draft]).box_state("wX:p1"), "draft")
     check("认不出的 kind → unknown（不预检也不补键）",
           _FakeHerdr([draft], kind="devin").box_state("wX:p1"), "unknown")
     check("找不到提示符 → unknown",

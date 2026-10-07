@@ -2619,6 +2619,24 @@ def cmd_status(args: argparse.Namespace) -> int:
         if overlaps:
             print(f"⇄ 重叠中：{'、'.join(overlaps)}")
 
+    # **门铃投不进去**：目标输入框里有草稿（有人正在那个 pane 里打字）。这是最容易
+    # 被误读成「agent 不干活」的状态 —— 催办/派发全被跳过，而角色表上一点异常都
+    # 看不出来（android_dev 实测：tl 被冤枉两小时，真因是人自己停着的半句话）。
+    drafts = []
+    for role in sorted(role_map):
+        info = role_map[role]
+        pane = str(info.get("pane_id") or "")
+        if not pane:
+            continue
+        try:
+            if herdr.box_state(pane, str(info.get("agent") or "")) == "draft":
+                drafts.append(role)
+        except Exception:                        # noqa: BLE001
+            continue
+    if drafts:
+        print(f"\n⚠ 门铃投不进去：{'、'.join(drafts)} —— 输入框里有草稿"
+              f"（有人正在那个 pane 里打字）。清空输入框，它们才能收到派发与催办。")
+
     # request.md 落地超阈值还无人领 → 点名 TL 去派发（门铃 dev），不只催 dev。
     undispatched = proto.undispatched_tasks()
     if undispatched:
@@ -2742,6 +2760,40 @@ def _nag_self_stale(root: Path, logf: Path, tracker: IdleTracker) -> None:
         log_event(logf,
                   "SELF-STALE 巡检在跑旧代码（与磁盘上的 bin/xteam 指纹不一致）"
                   " —— xteam watch stop && xteam watch start 重启巡检")
+
+
+def _nudge(herdr: Herdr, tracker: IdleTracker, logf: Path, role: str,
+           task: str, owes: str, pane: str, msg: str, label: str,
+           level: int) -> bool:
+    """发一次催办/升级，按结果记账。**投不进去不算催过** —— 返回是否真投出去。
+
+    目标输入框里有草稿（有人正在那个 pane 里打字）时门铃会被跳过。以前这种
+    「没投」也照样记成 `ALERT` 并把告警阶梯推上一级，于是两轮之后升级成
+    「催了两轮无响应」—— 把「投不进去」说成「它不理人」。android_dev 实测：
+    tl 就这么被冤枉了两小时，真因是人类自己停在输入框里的半句话。
+    """
+    kind = ""
+    try:
+        kind = str(herdr.agent_kind(pane) or "")
+    except Exception:                            # noqa: BLE001
+        pass
+    result = herdr.doorbell(pane, msg, wait_s=5, kind=kind)
+    if result.startswith("skipped-draft"):
+        n = int(tracker.state.get(role, {}).get("skipped", 0)) + 1
+        tracker.state.setdefault(role, {})["skipped"] = n
+        tracker.flush()
+        log_event(logf, f"NUDGE-SKIPPED {role} owes={owes} task={task} → {result}")
+        # 连续投不进去 = 卡点在人这边（清一下输入框就好），说清楚是谁的问题。
+        if n == 3 or n % 10 == 0:
+            log_event(logf, f"NEEDS-HUMAN {role} owes={owes} task={task} "
+                            f"门铃投不进去：输入框里有草稿（有人正在那个 pane 里打字）"
+                            f"，已连续 {n} 轮 —— 清空输入框它就能收到")
+        return False
+    tracker.state.setdefault(role, {})["skipped"] = 0
+    tracker.flush()
+    log_event(logf, f"{label} {role} owes={owes} task={task} → {result}")
+    tracker.set_alerted(role, level)
+    return True
 
 
 def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> None:
@@ -2921,17 +2973,15 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
                     else:
                         # 外部工具挂了不该让门禁停摆，只提示 PM 这视角没有
                         msg += f"\n\n（第三方评审没跑成：{note[:120]}——照常判）"
-            result = herdr.doorbell(pane, msg, wait_s=5)
-            log_event(logf, f"ALERT {role} idle={idle}s owes={owes} task={task} → {result}")
-            tracker.set_alerted(role, 1)
+            _nudge(herdr, tracker, logf, role, task, owes, pane, msg,
+                   f"ALERT {role} idle={idle}s", 1)
         elif idle >= IDLE_ESCALATE_SECS:
             msg = (
                 f"【巡检升级】idle {idle}s 且仍欠 {owes}（{task}）——可能卡死。"
                 f"回一句状态，或报告你卡在哪一步。"
             )
-            result = herdr.doorbell(pane, msg, wait_s=5)
-            log_event(logf, f"ESCALATE {role} idle={idle}s owes={owes} → {result}")
-            tracker.set_alerted(role, 2)
+            _nudge(herdr, tracker, logf, role, task, owes, pane, msg,
+                   f"ESCALATE {role} idle={idle}s", 2)
 
     try:
         proto.write_index()          # 单文件快照，别让人挨个翻 task 目录

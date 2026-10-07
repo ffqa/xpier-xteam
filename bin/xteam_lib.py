@@ -773,7 +773,14 @@ class Herdr:
         """输入框里有没有东西：`empty` / `draft` / `unknown`。
 
         实测（omp 18.x，2026-10-07）：输入行是**最后一条以 `╰─` 开头的行** ——
-        空框就是 `╰─`；有人打了字、或挂了一个粘贴块（`╰─ txt #2`）就带内容。
+        空框是 `╰─`；有人打了字、或挂了一个粘贴块（`╰─ txt #2`）就带内容。
+
+        **聚焦的 pane 会在输入行右侧挂一句提示**（`Shift+Tab to change thinking
+        effort`），用一大段空白和正文隔开。只看「第一个大空隙之前」的内容 ——
+        否则空框会被判成草稿：0.2.6 就栽在这，装上去之后所有门铃都被静默跳过
+        （watch 日志：`ALERT tl … → skipped-draft`），而巡检还倒过来说「催了两轮
+        无响应」。判据错的方向比漏判更贵：它让整条链看起来是 agent 不干活。
+
         认不出的 kind / 读不到 / 找不到提示符 → `unknown`：调用方一律退回旧行为，
         **不预检也不补键**。
         """
@@ -786,7 +793,9 @@ class Herdr:
             return "unknown"
         for line in reversed(tail.splitlines()):
             if line.startswith(mark):
-                return "draft" if line[len(mark):].strip() else "empty"
+                # 大空隙（≥3 空格）之后是右侧提示，不是人打的字。
+                head = re.split(r"\s{3,}", line[len(mark):], maxsplit=1)[0]
+                return "draft" if head.strip() else "empty"
         return "unknown"
 
     def _poll_box(self, pane_id: str, kind: str, want: str,
