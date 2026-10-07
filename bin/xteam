@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -36,6 +37,7 @@ from xteam_lib import (  # noqa: E402
     Herdr,
     IdleTracker,
     OBLIGATIONS,
+    PHASES,
     Protocol,
     ROLES,
     RoleSpec,
@@ -2284,6 +2286,66 @@ def _merge_overall_pending(pending: list, overall: list) -> list:
     return [tuple(x.split(":", 1)) for x in overall]
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    """每片的分段耗时与全局吞吐：瓶颈用数说话，不靠感觉。
+
+    读的全是文件 mtime —— 协议里没有时间戳字段，所以是近似：同一次写入的两个
+    边界会记成同一时刻。「重叠命中」是**「解锁重叠有没有真的发生」的唯一证据**
+    （F-16 全局冻结下它恒为 0）。**不需要 herdr** —— pane 全关着也能看。
+    """
+    root = _find_team_root(args.project)
+    proto = Protocol(root)
+    if not proto.dir.is_dir():
+        die(f"{proto.dir} 不存在 —— 这个项目没用 xteam 起过"
+            f"（先 xteam init && xteam up .）")
+    rows = proto.phase_times()
+    if args.since:
+        try:
+            cut = time.mktime(time.strptime(args.since, "%Y-%m-%d"))
+        except ValueError:
+            die(f"--since 要写成 YYYY-MM-DD，收到 {args.since!r}")
+        rows = [r for r in rows if (r["stamps"]["spec.md"] or 0) >= cut]
+    rows.sort(key=lambda r: r["stamps"]["spec.md"] or 0)
+    if args.limit > 0:
+        rows = rows[-args.limit:]
+    tp = proto.throughput(rows)
+    if args.json:
+        print(json.dumps({
+            "rows": [{k: v for k, v in r.items() if k != "stamps"} for r in rows],
+            "summary": tp}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print(f"[{now()}] 没有可统计的切片（{proto.tasks}）")
+        return 0
+    heads = ("TL拆解", "dev实现", "TL复审", "PM门禁", "收尾", "合计")
+
+    def cell(value: float | None) -> str:
+        return f"{'-':>9}" if value is None else f"{value:9.1f}"
+
+    print(f"{'切片':32}" + "".join(f"{h:>9}" for h in heads) + "  判定")
+    for r in rows:
+        print(f"{r['slice']:32}"
+              + "".join(cell(r["minutes"][p]) for p, _, _ in PHASES)
+              + cell(r["total"]) + f"  {r['verdict'] or '-'}")
+    md = tp["median"]
+    print("\n中位  n={}  {}".format(tp["slices"], "  ".join(
+        (f"{h} {md[p]:.1f}m" if md[p] is not None else f"{h} -")
+        for p, h in zip([p for p, _, _ in PHASES], heads[:-1])))
+        + (f"  合计 {md['total']:.1f}m" if md["total"] is not None else "  合计 -"))
+    hours = tp["wall_minutes"] / 60.0
+    print(f"吞吐  {tp['closed']} 片 / {hours:.1f}h = "
+          f"{(tp['closed'] / hours if hours > 0 else 0.0):.2f} 片/小时；"
+          f"并行度 {tp['parallelism'] if tp['parallelism'] is not None else '-'}"
+          f"（sum {tp['sum_minutes']:.0f}m / 墙 {tp['wall_minutes']:.0f}m）")
+    windows = [r["minutes"]["tl_review"] + r["minutes"]["pm_gate"] for r in rows
+               if r["minutes"]["tl_review"] is not None
+               and r["minutes"]["pm_gate"] is not None]
+    print(f"冻结  Σ{tp['freeze_minutes']:.0f}m"
+          f"（中位 {statistics.median(windows) if windows else 0.0:.1f}m/片）；"
+          f"重叠命中 {tp['freeze_with_other_writer']}/{tp['slices']}")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     _require_herdr()
@@ -3774,6 +3836,13 @@ def main() -> int:
     p.add_argument("message")
     p.add_argument("--settle", type=int, default=0, help="投递后等几秒再读状态")
     p.set_defaults(func=cmd_say)
+
+    p = sub.add_parser("stats", help="每片分段耗时与吞吐（瓶颈用数说话）")
+    p.add_argument("--since", help="只统计这个日期（YYYY-MM-DD）之后开工的切片")
+    p.add_argument("--limit", type=int, default=0,
+                   help="只看最近 N 片（0=全部，默认全部）")
+    p.add_argument("--json", action="store_true", help="机器可读输出")
+    p.set_defaults(func=cmd_stats)
 
     p = sub.add_parser("status", help="状态表（带时间戳）")
     p.set_defaults(func=cmd_status)

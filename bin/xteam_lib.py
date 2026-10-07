@@ -22,11 +22,13 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -56,6 +58,17 @@ WAITING_GRACE_SECS = 1800    # 角色声明「在等人类」后多久内免打�
 STUCK_WORKING_SECS = 900      # 声称 working 但 seq 停滞多久算假 working
 HUMAN_ESCALATE_REPEAT_SECS = 900  # 升级给人类后，多久再重提醒一次
 SAMPLE_PERIOD = 60           # 巡检采样间隔（秒）
+
+# 阶段 → (起点文件, 终点文件)。`xteam stats` 用文件 mtime 还原每片的分段耗时。
+# **只有 mtime 可用** —— 协议里没有写时间戳的字段，所以这是粗粒度近似：
+# 同一次写入的两个边界会被记成同一时刻（时长为 0），不是精确的相位测量。
+PHASES: tuple[tuple[str, str, str], ...] = (
+    ("tl_decomp", "spec.md", "request.md"),
+    ("dev_impl", "request.md", "delivered.json"),
+    ("tl_review", "delivered.json", "ready.json"),
+    ("pm_gate", "ready.json", "verdict.json"),
+    ("close", "verdict.json", "closed.md"),
+)
 
 
 # ---------------------------------------------------------------- agent 能力表
@@ -932,6 +945,17 @@ def _is_closed(task: Path) -> bool:
     return (task / "closed.md").exists()
 
 
+def _mtime(path: Path) -> float | None:
+    """文件 mtime（秒）；不存在/不可读 → None。
+
+    **None ≠ 0**：0 会被读成「那一刻发生了两件事」，None 才是「没有这一刻」。
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 class Protocol:
     """`.xteam/` 目录即状态机。**文件存在性 + round 计数**就是状态，无 status 字段。
 
@@ -1026,6 +1050,77 @@ class Protocol:
             "owes": self.overall_debts(),
             "queue": self.queue_items(),
             "tasks": tasks,
+        }
+
+    def phase_times(self) -> list[dict]:
+        """每片的分段耗时（分钟）。纯派生，不新增事实。
+
+        用文件 mtime 当时刻 —— 协议里没有写时间戳的字段，所以这是近似：
+        - 某一端的文件不存在 → 那一段是 **None，不是 0**（0 会被读成「没花时间」）
+        - mtime 回退（负时长）**原样保留** —— 夹成 0 会让并行度骗人
+        """
+        files = ("spec.md", "request.md", "delivered.json",
+                 "ready.json", "verdict.json", "closed.md")
+        rows = []
+        for t in self.all_tasks():
+            stamps = {name: _mtime(t / name) for name in files}
+            minutes: dict[str, float | None] = {}
+            for phase, start, end in PHASES:
+                a, b = stamps[start], stamps[end]
+                minutes[phase] = (round((b - a) / 60.0, 1)
+                                  if a is not None and b is not None else None)
+            spec, closed = stamps["spec.md"], stamps["closed.md"]
+            rows.append({
+                "slice": t.name,
+                "closed": _is_closed(t),
+                "verdict": (str(_read_json(t / "verdict.json").get("verdict", ""))
+                            .upper() or None),
+                "stamps": stamps,
+                "minutes": minutes,
+                "total": (round((closed - spec) / 60.0, 1)
+                          if spec is not None and closed is not None else None),
+            })
+        return rows
+
+    def throughput(self, rows: list[dict] | None = None) -> dict:
+        """把 `phase_times()` 汇成「一行话」：中位 / 吞吐 / 并行度 / 冻结 / 重叠命中。
+
+        `freeze_with_other_writer` 是**「重叠真的发生了」的唯一证据**：冻结窗口
+        （delivered → verdict）里，另一片的 request 已落、delivered 还没落 —— 也就是
+        有人在这段时间里正在写。F-16 全局冻结下它恒为 0。
+        """
+        rows = self.phase_times() if rows is None else rows
+
+        def med(values: list) -> float | None:
+            vals = [v for v in values if v is not None]
+            return round(statistics.median(vals), 1) if vals else None
+
+        sum_minutes = sum(r["total"] for r in rows if r["total"] is not None)
+        specs = [r["stamps"]["spec.md"] for r in rows if r["stamps"]["spec.md"] is not None]
+        wall = (max(specs) - min(specs)) / 60.0 if len(specs) > 1 else 0.0
+        freeze, hits = 0.0, 0
+        for r in rows:
+            start, end = r["stamps"]["delivered.json"], r["stamps"]["verdict.json"]
+            if start is None or end is None:
+                continue
+            freeze += (end - start) / 60.0
+            for other in rows:
+                if other is r:
+                    continue
+                req, dl = other["stamps"]["request.md"], other["stamps"]["delivered.json"]
+                if req is not None and dl is not None and req < start < dl < end:
+                    hits += 1
+                    break
+        return {
+            "slices": len(rows),
+            "closed": sum(1 for r in rows if r["closed"]),
+            "sum_minutes": round(sum_minutes, 1),
+            "wall_minutes": round(wall, 1),
+            "parallelism": (round(sum_minutes / wall, 2) if wall > 0 else None),
+            "median": {**{p: med([r["minutes"][p] for r in rows]) for p, _, _ in PHASES},
+                       "total": med([r["total"] for r in rows])},
+            "freeze_minutes": round(freeze, 1),
+            "freeze_with_other_writer": hits,
         }
 
     def overall_debts(self) -> dict[str, list[str]]:

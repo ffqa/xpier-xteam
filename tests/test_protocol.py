@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import shutil
@@ -3107,6 +3108,75 @@ def test_say_recheck_window() -> None:
         _cli.Herdr = real_herdr
 
 
+def _mk_stamps(root: Path, slug: str, stamps: dict[str, float],
+               contents: dict[str, str] | None = None) -> None:
+    """造一个切片目录，文件时间戳写死 —— stats/throughput 的测试布景。"""
+    task = root / ".xteam" / "tasks" / slug
+    task.mkdir(parents=True, exist_ok=True)
+    for name, ts in stamps.items():
+        path = task / name
+        body = (contents or {}).get(name) or ("{}" if name.endswith(".json") else "# x")
+        path.write_text(body, encoding="utf-8")
+        os.utime(path, (ts, ts))
+
+
+def test_phase_times_and_throughput_from_mtimes() -> None:
+    print("\n[85] stats：分段耗时/中位/并行度/重叠命中都从 mtime 算")
+    t0 = 1_700_000_000.0
+    b = Bench()
+    try:
+        # a、b 走完全程；c 只到 request；d 是「a 的冻结窗口里正在写」的那一片。
+        _mk_stamps(b.tmp, "a", {"spec.md": t0, "request.md": t0 + 600,
+                                "delivered.json": t0 + 1800, "ready.json": t0 + 2100,
+                                "verdict.json": t0 + 2400, "closed.md": t0 + 2460})
+        _mk_stamps(b.tmp, "b", {"spec.md": t0 + 3000, "request.md": t0 + 3300,
+                                "delivered.json": t0 + 4500, "ready.json": t0 + 4800,
+                                "verdict.json": t0 + 5100, "closed.md": t0 + 5160},
+                   contents={"verdict.json": json.dumps(
+                       {"round": 1, "delivery": 1, "verdict": "PASS"})})
+        _mk_stamps(b.tmp, "c", {"spec.md": t0 + 6000, "request.md": t0 + 6600})
+        _mk_stamps(b.tmp, "d", {"request.md": t0 + 1700, "delivered.json": t0 + 2000})
+        rows = {r["slice"]: r for r in b.proto.phase_times()}
+        check("a 的分段耗时（分钟）", rows["a"]["minutes"],
+              {"tl_decomp": 10.0, "dev_impl": 20.0, "tl_review": 5.0,
+               "pm_gate": 5.0, "close": 1.0})
+        check("a 的合计 41m", rows["a"]["total"], 41.0)
+        check("c 只到 request：后面几段是 None 不是 0",
+              [rows["c"]["minutes"][p] for p in ("tl_review", "pm_gate", "close")],
+              [None, None, None])
+        check("c 未闭合 → 没有合计", rows["c"]["total"], None)
+        check("b 的判定读自 verdict.json", rows["b"]["verdict"], "PASS")
+        check("a 没有 verdict.json → 判定 None", rows["a"]["verdict"], None)
+        tp = b.proto.throughput(list(rows.values()))
+        check("片数/闭合数", (tp["slices"], tp["closed"]), (4, 2))
+        check("sum 只累有合计的片（41 + 36）", tp["sum_minutes"], 77.0)
+        check("墙 = 最晚 spec - 最早 spec", tp["wall_minutes"], 100.0)
+        check("并行度 = sum/墙", tp["parallelism"], 0.77)
+        check("中位 dev 实现", tp["median"]["dev_impl"], 20.0)
+        check("中位合计（41/36 → 38.5）", tp["median"]["total"], 38.5)
+        check("冻结合计（a 10m + b 10m）", tp["freeze_minutes"], 20.0)
+        check("重叠命中：a 的冻结窗口里 d 正在写", tp["freeze_with_other_writer"], 1)
+    finally:
+        b.cleanup()
+
+
+def test_phase_times_missing_file_and_backwards_mtime() -> None:
+    print("\n[86] stats：缺文件 → None；mtime 回退 → 负值原样（不夹成 0）")
+    t0 = 1_700_000_000.0
+    b = Bench()
+    try:
+        _mk_stamps(b.tmp, "half", {"spec.md": t0})
+        _mk_stamps(b.tmp, "back", {"spec.md": t0, "request.md": t0 - 600})
+        rows = {r["slice"]: r for r in b.proto.phase_times()}
+        check("只写了 spec：tl_decomp 是 None", rows["half"]["minutes"]["tl_decomp"], None)
+        check("request 早于 spec：负时长原样",
+              rows["back"]["minutes"]["tl_decomp"], -10.0)
+        tp = b.proto.throughput(list(rows.values()))
+        check("中位只吃有值的那一片（负值也算数）", tp["median"]["tl_decomp"], -10.0)
+    finally:
+        b.cleanup()
+
+
 def test_gate_window_freezes_other_implement() -> None:
     print("\n[77] 已交付未判窗口冻结其它 implement；verdict 对准恢复（F-16）")
     b = Bench("a")
@@ -3799,6 +3869,8 @@ def main() -> int:
         test_context_pct_all_three_kinds,
         test_whoami_and_reopen_intro,
         test_charter_reply_timestamp_rule,
+        test_phase_times_and_throughput_from_mtimes,
+        test_phase_times_missing_file_and_backwards_mtime,
     ):
         fn()
     print()

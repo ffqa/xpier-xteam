@@ -1541,6 +1541,54 @@ printf '%s' "$LAST_OUT" | grep -qF 'request 派发超时' \
 
 # MP-29.4 回归：MP-12~MP-28 断言继续全过即自动满足（末行 N/N）。
 
+step "MP-30" "stats：分段耗时 / 中位 / 并行度 / 重叠命中都从 mtime 算（F-24）"
+
+T="$BASE/mp30"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-30.0 init 布景 rc=0" 0
+
+# 布景：两片走完全程，时刻写死（os.utime）——不真实睡眠，整个场景毫秒级。
+python3 - "$T/.xteam/tasks" <<'PY'
+import json, os, sys
+from pathlib import Path
+t0 = 1_700_000_000.0
+names = ("spec.md", "request.md", "delivered.json",
+         "ready.json", "verdict.json", "closed.md")
+stages = {"alpha": (0, 600, 1800, 2100, 2400, 2460),
+          "beta": (3000, 3300, 4500, 4800, 5100, 5160)}
+for slug, offs in stages.items():
+    d = Path(sys.argv[1]) / slug
+    d.mkdir(parents=True, exist_ok=True)
+    for name, off in zip(names, offs):
+        p = d / name
+        p.write_text(json.dumps({"round": 1, "delivery": 1, "verdict": "PASS"})
+                     if name == "verdict.json"
+                     else ("{}" if name.endswith(".json") else "# x\n"),
+                     encoding="utf-8")
+        os.utime(p, (t0 + off, t0 + off))
+PY
+
+# stats 是纯文件派生：pane 一个没起、herdr 也没有真身，照样出数。
+run xin "$T" stats
+assert_rc  "MP-30.1 stats rc=0（不需要 herdr / workspace）" 0
+assert_has "MP-30.1 中位行按片数汇总" "中位  n=2"
+assert_has "MP-30.1 没有并行写者 → 重叠命中 0/2" "重叠命中 0/2"
+
+xin "$T" stats --json > "$BASE/mp30.json" 2>&1
+run python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))["summary"]
+assert s["slices"] == 2, s
+assert s["closed"] == 2, s
+assert s["median"]["dev_impl"] == 20.0, s
+assert s["median"]["tl_decomp"] == 7.5, s
+assert s["freeze_minutes"] == 20.0, s
+assert s["freeze_with_other_writer"] == 0, s
+sys.exit(0)
+' "$BASE/mp30.json"
+assert_rc "MP-30.2 --json 的片数/中位/冻结/重叠命中逐字段对" 0
+
 # ---------------------------------------------------------------- 收尾
 printf '\n'
 printf '%s/%s 通过\n' "$PASS" "$TOTAL"
