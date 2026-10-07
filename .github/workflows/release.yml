@@ -199,6 +199,17 @@ jobs:
             echo "Formula 语法 ✓（ruby -c）"
           fi
 
+          # 运行时守卫：ruby -c 抓不到 NameError（那是运行期错误）—— 出现过
+          # 「CI 全绿、用户 brew install 拿到 Ruby 异常」。替身 Formula 真跑一遍
+          # install 的「无 python3」分支，不抛异常且文案对才算过。
+          # ruby 不在不能静默跳过：缺运行时工具 = 守卫没跑，跟「全绿但用户装不上」
+          # 是同一种假绿灯。
+          command -v ruby >/dev/null 2>&1 \
+            || { echo "::error::ruby 不在 PATH，Formula 运行时守卫跑不了"; exit 1; }
+          ruby tests/test_formula.rb "$TMP/tap/Formula/xteam.rb" \
+            || { echo "::error::Formula 运行时守卫不过（install 抛异常或文案不对）"; exit 1; }
+          echo "Formula 运行时守卫 ✓（install 无 python3 分支不抛异常、文案对）"
+
           cd "$TMP/tap"
           git add Formula/xteam.rb
           if git diff --cached --quiet; then
