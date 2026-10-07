@@ -70,6 +70,11 @@ PHASES: tuple[tuple[str, str, str], ...] = (
     ("close", "verdict.json", "closed.md"),
 )
 
+# FAIL 修复优先于开新片：手里有没消费的 verdict（别的片）时，dev 不许开新活
+# ——否则「边修上一片、边写下一片」会把两处推理搅在一起，还不容易看出来。
+# 实测 FAIL 率 0/24（本仓），这个开关基本不触发；抖动大了就把它关掉（改 False）。
+PREEMPT_ON_FAIL: bool = True
+
 
 # ---------------------------------------------------------------- agent 能力表
 
@@ -325,6 +330,17 @@ SYSTEM_PROMPT_ARG: dict[str, str] = {
     "omp": "--append-system-prompt",
     "pi": "--append-system-prompt",
 }
+
+# 哪些 kind 有「只读子代理」可用（`task`/subagent 一类）。口径同
+# SYSTEM_PROMPT_ARG：**只在表里才承认**。没实测过的不写 ✓ —— 让 agent 以为自己
+# 能扇出、结果没有，比明说「未实测」更糟：它会编出一份没有证据的结论。
+SUBAGENT_CAPABLE: set[str] = {"omp"}
+
+
+def subagent_capability(kinds) -> str:
+    """把 kind 列表渲染成一行「谁有只读子代理」：`omp ✓ / agy ?（未实测）`。"""
+    return " / ".join(f"{k} ✓" if k in SUBAGENT_CAPABLE else f"{k} ?（未实测）"
+                      for k in sorted(kinds))
 
 # 原地开新会话的斜杠命令：kind → 命令。
 # 实测 omp / pi：`/new` 开新会话（omp 的 herdr `agent_session` 路径随之变化），
@@ -1141,8 +1157,10 @@ class Protocol:
                 name = ns_label if ob == "next-slice" and ns_label else t.name
                 out.setdefault(role, []).append(f"{name}:{ob}")
         if (not out.get("pm") and self._unstarted_items()
-                and not self.pending_gate_tasks()):
-            # 待判窗口内同样不催 PM 开新片——新片开工就是往判中的树上写东西。
+                and not self._unstarted_gate_conflict()):
+            # 待判窗口里，只有「下一片与待判片触碰同一批文件」才不催 —— 那才是
+            # 「开新片 = 往判中的树上写东西」（F-16）。触碰不相交时照催：队列
+            # 先铺好下一片，dev 交付完就能接上，不用等 PM 现写 spec。
             out["pm"] = ["(队列):start-next"]
         # **队列全闭合但 REPORT.md 缺失 → PM 欠 report。** 切片 closed 只意味
         # 「这片做完了」，而人类要的是「整个项目做完后能部署、能测试、有人接」。
@@ -1292,11 +1310,14 @@ class Protocol:
                 and not _verdict_passed(task)
                 and _verdict_delivery(task) >= _delivery_round(task)
             )
-            # 「已交付未判」窗口开着时，其它切片不许开工：gate 必须判在一棵
-            # 可归因的树上，树里混进下一片的半成品 FAIL 就没法归因（F-16）。
+            # **写树闸门：只拦「跟已经在飞的片触碰同一批文件」。**
+            # F-16 的原判据是「树必须可归因」，所以冻住整棵树；钉了交付快照
+            # （`xteam snap` → base/head）之后，「可归因」由提交承担，树可以继续
+            # 往前跑。没写 touches.json = 未知 = 冲突（保守方向，退回原来的串行）。
             # 待判片自己到不了这——delivered 且无对准它的 FAIL 才算 pending。
             if (not delivered or fail_pending) \
-                    and not self.pending_gate_tasks():
+                    and not self.implement_blockers(task) \
+                    and not (PREEMPT_ON_FAIL and self._rework_slices(exclude=task)):
                 out["dev"] = "implement"
             elif ((task / "verdict.json").exists()
                     and _verdict_round(task) != _consumed_round(task)):
@@ -1536,14 +1557,130 @@ class Protocol:
                 if i["state"] not in ("done", "已闭合")
                 and not (self.tasks / i["slice"] / "spec.md").exists()]
 
+    def touches(self, task: Path) -> list[str] | None:
+        """TL 写的 `touches.json`：这一片会碰哪些路径（glob，相对项目根）。
+
+        缺失 / 坏 JSON / 不是字符串列表 / 空 → **None = 未知**。
+        「没声明」和「不碰任何文件」是两回事：未知一律按「跟谁都冲突」处理
+        （保守方向是退回串行，漏判的代价是把两片写进同一份文件）。
+        """
+        data = _read_json(task / "touches.json")
+        paths = data.get("paths")
+        if not isinstance(paths, list):
+            return None
+        out = [str(p).strip().lstrip("./")
+               for p in paths if isinstance(p, str) and p.strip()]
+        return out or None
+
+    def conflict_with(self, task: Path, others: list[str],
+                      unknown_conflicts: bool = True) -> list[str]:
+        """`task` 和其它切片是否触碰同一批文件。返回冲突的片名（空 = 可并行）。
+
+        判据（双向，任一条命中即冲突）：
+        - glob 双向匹配：`bin/*.py` 与 `bin/xteam_lib.py` 算相交（任一侧当模式）
+        - **目录前缀**：`bin` 与 `bin/xteam` 算相交（声明一个目录 = 碰它下面所有文件）
+        - 任一侧未知（没写 touches.json）→ `unknown_conflicts` 决定算不算冲突
+
+        默认（True）把未知当冲突：多判一个只是退回串行，漏判一个就是把两片写进
+        同一份文件。`unknown_conflicts=False` 只在「双方都明确声明过」时才算冲突
+        —— 给旧片留一条不互相冻死的路（见 `implement_blockers`）。
+        """
+        mine = self.touches(task)
+        if not mine:
+            if not unknown_conflicts:
+                return []
+            return [n for n in others if n != task.name]
+
+        def hit(a: str, b: str) -> bool:
+            return (fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a)
+                    or a.startswith(b + "/") or b.startswith(a + "/"))
+
+        clash: list[str] = []
+        for name in others:
+            if name == task.name:
+                continue
+            theirs = self.touches(self.tasks / name)
+            if not theirs:
+                if unknown_conflicts:
+                    clash.append(name)
+                continue
+            if any(hit(a, b) for a in mine for b in theirs):
+                clash.append(name)
+        return clash
+
+    def implement_blockers(self, task: Path) -> list[str]:
+        """拦着 `task` 开工（写产品文件）的片名。空 = 可以开工。
+
+        两条规则，都往保守偏，但**保证总有人能动**（互相冻死比串行糟得多）：
+
+        1. 与**待判片**触碰冲突 → 拦（F-16：gate 要判在一棵可归因的树上；判完就放）。
+           未知一律算冲突 —— 旧片没有 `touches.json`，行为退回「交付即冻结」。
+        2. 与**明确声明了同一批文件**的在飞片 → 只放队列序最前的那一片，其余等它
+           （一次一个写者）。两边有一边没声明时不算冲突：那是升级前的常态，
+           而且归因已经由交付快照（`head`）承担，不会再变成「分不清哪片是哪片」。
+        """
+        blocked = self.conflict_with(task, self.pending_gate_tasks())
+        order = {t.name: i for i, t in enumerate(self._tasks_by_queue_order())}
+        mine = order.get(task.name, -1)
+        for name in self.conflict_with(task, self.inflight_slices(exclude=task),
+                                       unknown_conflicts=False):
+            if name not in blocked and order.get(name, -1) < mine:
+                blocked.append(name)
+        return blocked
+
+    def inflight_slices(self, exclude: Path | None = None) -> list[str]:
+        """「已经开工、还没闭合」的切片名，按队列序。
+
+        开工判据 = `request.md` 在：TL 拆完才算真占了地方（只写了 spec 的还在
+        PM 手上转，没人往产品文件里写东西）。
+        """
+        out: list[str] = []
+        for t in self._tasks_by_queue_order():
+            if _is_closed(t) or (exclude is not None and t.name == exclude.name):
+                continue
+            if (t / "request.md").exists():
+                out.append(t.name)
+        return out
+
+    def _rework_slices(self, exclude: Path | None = None) -> list[str]:
+        """别的片给你记着「要返工」的判定（FAIL、还没消费）—— 先修它，再开新片。
+
+        **只拦 FAIL**：PASS 的 `consume` 只是「读一眼、记一笔」，拿它挡新活就把
+        解锁重叠全挡没了。自己那片不算（是不是自己欠 `implement` 由 fail_pending 判）。
+        """
+        out: list[str] = []
+        for t in self.all_tasks():
+            if _is_closed(t) or (exclude is not None and t.name == exclude.name):
+                continue
+            if not (t / "verdict.json").exists() or _verdict_passed(t):
+                continue
+            if _verdict_round(t) != _consumed_round(t):
+                out.append(t.name)
+        return out
+
+    def _unstarted_gate_conflict(self) -> list[str]:
+        """队列里第一个未开工项 与「待判片」的冲突（空 = 不拦 start-next）。
+
+        只在**待判窗口**上判：新片开工（写 spec）本身不写产品文件，真正的写树
+        闸门在 `implement`（那里对所有在飞片判冲突）。这里保守一点，只是为了不
+        让 dev 在待判窗口里拿到同一批文件的活。
+        """
+        items = sorted(self._unstarted_items(), key=lambda i: i["order"])
+        gate = self.pending_gate_tasks()
+        if not items or not gate:
+            return []
+        return self.conflict_with(self.tasks / items[0]["slice"], gate)
+
     def pending_gate_tasks(self) -> list[str]:
         """「已交付未判」的切片名 —— delivered.json 在、这次交付还没被 verdict 覆盖。
 
         窗口从 delivered.json 落盘开到 verdict.delivery 对准这次交付
         （ready.json 有无不算数——交付即冻结，TL review 期间同样在窗口内）。
-        窗口存在时其它切片的 dev implement 义务不成立、overall 的 start-next
-        也不补：gate 必须判在一棵可归因的树上（F-16）。FAIL 已对准当前交付的
-        不算 pending——verdict 落地窗口就关了，fail_pending 照常走。
+        **它不再是全局闸门**：写树闸门是 `conflict_with()`（只拦触碰冲突），
+        归因交给交付快照（`xteam snap` 钉的 base/head）。这里剩两个用途：
+        status 显示「谁在待判」、`_unstarted_gate_conflict()` 的保守判据。
+        FAIL 已对准当前交付的不算 pending——verdict 落地窗口就关了，fail_pending
+        照常走。
         """
         pending = []
         for t in self.all_tasks():

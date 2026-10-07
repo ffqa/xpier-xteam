@@ -26,10 +26,17 @@ request.md「禁区」节是硬线：**多一点都不写**。禁区点名的文
 
 跑 request.md 里指定的命令。**记录实际输出**。
 
+**只跑 request.md 里声明的命令。** 全量测试属于 gate（PM 在快照树里跑）——
+主树里可能同时有别人在写，跑全量会看到不属于你的失败，那是噪声不是证据。
+
+**子代理**：你 CLI 里如果有**只读子代理**，可以拿它并行查证、跑测试矩阵。但
+**代码只能你自己写**（子代理写的东西你不知道来路，`changed[]` 就废了），
+`delivered.json` 也只有你自己写。
+
 ```json
 {
-  "base": "<你开始时的 commit>",
-  "head": "<你做完时的 commit>",
+  "base": "<xteam snap 写回：你开始时的 commit>",
+  "head": "<xteam snap 写回：这次交付的 commit>",
   "changed": ["path/a.go", "path/b.go"],
   "verification": [
     {"cmd": "go build ./...", "expected": "干净", "actual": "无输出", "pass": true},
@@ -38,7 +45,11 @@ request.md「禁区」节是硬线：**多一点都不写**。禁区点名的文
 }
 ```
 
-写进 `.xteam/tasks/<slug>/delivered.json`。
+写进 `.xteam/tasks/<slug>/delivered.json`（`changed` 写全：这一片改了哪些路径）。
+
+**然后钉快照**：`xteam snap <slug> --summary "一句话"` —— 它按 `changed[]` 只提交你
+这一片的路径，并把 `base`/`head` 写回 delivered.json。交付必须**不可变**：TL/PM 要在
+它上面判，而主树这时已经在跑下一片了。别人的、人类未提交的改动不许卷进来。
 
 **验证失败就写 `pass: false`。** 把失败写成通过，比不做验证更糟——PM 会基于你的假数据判 PASS。
 ```json
@@ -63,10 +74,15 @@ request.md「禁区」节是硬线：**多一点都不写**。禁区点名的文
 xteam say tl "<slug> 已交付（delivery n）：.xteam/tasks/<slug>/delivered.json，请 review"
 ```
 
-**然后停在这里等审核结果。不要接着做下一件事。**
+**然后看 `xteam whoami`，别空等。** 两种合法状态：
 
-「不要急着往前开发」是硬规则。理由：你往前做的任何东西，在 review 出问题时会全部变成
-要回滚的返工。多个 agent 协作失败几乎都是因为执行方在等审核时自己往前走了。
+- 有别的片给你 `implement`（它的 `touches.json` 跟待判片不相交）→ **接着做那一
+  片**。交付快照已经把这一片钉死了，判它的人不需要你停手；
+- 没有 → 停在这里等审核结果。
+
+**不要做没人派给你的活。** 「不急着往前开发」仍然是硬规则：你往前做的任何东西，
+在 review 出问题时会全部变成要回滚的返工。能开工的只有**队列里已经拆解好、
+义务明确落在你头上**的那一片。
 
 ### 5. 取 verdict
 
@@ -76,10 +92,12 @@ PM 出 `verdict.json` 后门铃你。读它，然后写 `consumed.json`：
 {"round": 1, "note": "已取 r1"}
 ```
 
-- **PASS** → 问 TL 要下一件：`xteam say tl "<slug> PASS 了，下一件是什么？"`
+- **PASS** → 先看 `xteam whoami`：已经派给你的下一片就直接做；没有就问 TL 要：
+  `xteam say tl "<slug> PASS 了，下一件是什么？"`
   **主动要。不要等 TL 想起来。**
 - **FAIL** → 按 `findings` 逐条修，**每条都要自己复现一遍**。review 的 finding 可能有误
   （PM 和 TL 也会判断错）。修完把 `delivered.json` 的 `round` **+1** 重新上报。
+  **手里有没消费的 verdict 时不许开新片** —— 先把这一片修完、重新交付，再回去做别的。
 
 修完 review 提出的问题后，同样是**停下来等下一轮审核**。
 

@@ -1589,6 +1589,148 @@ sys.exit(0)
 ' "$BASE/mp30.json"
 assert_rc "MP-30.2 --json 的片数/中位/冻结/重叠命中逐字段对" 0
 
+step "MP-31" "交付快照：snap 只提交 changed[]；review-tree 钉出只读快照树"
+
+T="$BASE/mp31"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-31.0 init 布景 rc=0" 0
+
+# 布景：切片自己的改动在 bin/tool；同时工作树里有一处「别人的」未提交改动
+# （foo.txt）—— 快照只许带走前者，后者必须留在工作树里脏着。
+mkdir -p "$T/bin" "$T/.xteam/tasks/snap1"
+printf 'v1\n' > "$T/bin/tool"
+printf 'base\n' > "$T/foo.txt"
+(cd "$T" && git add -A && git -c user.email=t@t -c user.name=t commit -qm base >/dev/null)
+printf 'v2\n' >> "$T/bin/tool"
+printf 'wip\n' >> "$T/foo.txt"
+printf '{"round":1,"changed":["bin/tool"],"verification":[]}\n' \
+  > "$T/.xteam/tasks/snap1/delivered.json"
+
+run xin "$T" snap snap1 --summary "MP-31 布景"
+assert_rc  "MP-31.1 snap rc=0" 0
+assert_has "MP-31.1 打印提交区间" "快照 "
+
+run git -C "$T" show --name-only --format= HEAD
+assert_line "MP-31.1 提交里有切片自己的路径" "bin/tool" "bin/tool"
+printf '%s' "$LAST_OUT" | grep -qF 'foo.txt' \
+  && bad "MP-31.1 别人的脏改动被卷进提交" "$LAST_OUT" \
+  || ok  "MP-31.1 别人的脏改动没被卷进提交"
+
+run git -C "$T" status --short
+assert_line "MP-31.1 别人的脏改动仍留在工作树里" "foo.txt" " M foo.txt"
+
+run python3 -c '
+import json, subprocess, sys
+d = json.load(open(sys.argv[1] + "/.xteam/tasks/snap1/delivered.json"))
+head = subprocess.run(["git", "-C", sys.argv[1], "rev-parse", "--short", "HEAD"],
+                      capture_output=True, text=True).stdout.strip()
+base = subprocess.run(["git", "-C", sys.argv[1], "rev-parse", "--short", "HEAD~1"],
+                      capture_output=True, text=True).stdout.strip()
+assert d["head"] == head, d
+assert d["base"] == base, d
+sys.exit(0)
+' "$T"
+assert_rc "MP-31.1 base/head 写回 delivered.json，且对得上仓库" 0
+
+run xin "$T" review-tree snap1
+assert_rc  "MP-31.2 review-tree rc=0" 0
+assert_has "MP-31.2 打印快照树路径" "快照树："
+run git -C "$T/.xteam/rt/snap1" rev-parse --short HEAD
+assert_has "MP-31.2 快照树的 HEAD 就是交付提交" "$(cd "$T" && git rev-parse --short HEAD)"
+
+run git -C "$T" status --short
+printf '%s' "$LAST_OUT" | grep -qF 'foo.txt' \
+  && ok "MP-31.2 主工作树不受快照树影响（仍脏着）" \
+  || bad "MP-31.2 主工作树被搅动了" "$LAST_OUT"
+
+run xin "$T" review-tree snap1 --rm
+assert_rc     "MP-31.3 --rm rc=0" 0
+assert_absent "MP-31.3 快照树目录已消失" "$T/.xteam/rt/snap1"
+
+# 没有新差异 → 不制造空提交（rc=3），且不改 delivered.json。
+run xin "$T" snap snap1
+assert_rc  "MP-31.4 无差异 → 非 0（不制造空提交）" nz
+assert_has "MP-31.4 明说没有可提交的改动" "没有可提交的改动"
+
+# 旧格式交付（没有 head）：快照钉不出来 → 明说，不当成功。
+printf '{"round":1,"changed":["bin/tool"]}\n' \
+  > "$T/.xteam/tasks/snap1/delivered.json"
+run xin "$T" review-tree snap1
+assert_rc  "MP-31.5 旧格式 → 非 0" nz
+assert_has "MP-31.5 明说钉不出来（不假装成功）" "快照钉不出来"
+
+# changed[] 空 → 拒绝提交（不能归因的东西不许进历史）。
+printf '{"round":1,"changed":[]}\n' > "$T/.xteam/tasks/snap1/delivered.json"
+run xin "$T" snap snap1
+assert_rc  "MP-31.6 changed[] 空 → 非 0" nz
+assert_has "MP-31.6 明说拒绝提交" "拒绝提交"
+
+# MP-32：解锁重叠的状态面（未知/相交/不相交三态）—— 不需要真 agent。
+xin32() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin32:$PATH" LABEL=mp32 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp32 "$@" </dev/null)
+}
+mkdir -p "$BASE/bin32"
+cat > "$BASE/bin32/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"w32","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"w32:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"w32:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w32","tab_id":"w32:t1"},{"pane_id":"w32:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w32","tab_id":"w32:t1"},{"pane_id":"w32:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"w32","tab_id":"w32:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"w32:p1","cwd":"'"$ROOT"'"},{"pane_id":"w32:p2","cwd":"'"$ROOT"'"},{"pane_id":"w32:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin32/herdr"
+
+step "MP-32" "解锁重叠：触碰不相交才放行；未知/相交退回冻结（状态面文案）"
+
+T="$BASE/mp32"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-32.0 init 布景 rc=0" 0
+
+# 布景：a 已交付未判（待判窗口开着）；b 已拆解（request.md 在），等 dev 开工。
+mkdir -p "$T/.xteam/tasks/a" "$T/.xteam/tasks/b"
+printf '# spec\n' > "$T/.xteam/tasks/a/spec.md"
+printf '{"round":1}\n' > "$T/.xteam/tasks/a/spec.json"
+printf '# request\n' > "$T/.xteam/tasks/a/request.md"
+printf '{"round":1,"changed":["bin/xteam"]}\n' > "$T/.xteam/tasks/a/delivered.json"
+printf '{"paths":["bin/xteam"]}\n' > "$T/.xteam/tasks/a/touches.json"
+printf '# request\n' > "$T/.xteam/tasks/b/request.md"
+printf '| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | a | doing | |\n| 2 | b | doing | |\n' \
+  > "$T/.xteam/QUEUE.md"
+
+# 态 1：两边都没声明触碰（旧片）→ 未知一律算冲突 → 冻结。
+run xin32 "$T" status
+assert_rc  "MP-32.1 status rc=0" 0
+assert_has "MP-32.1 冻结行点名冲突片" "⏳ 待 gate：a（冻结：b 与它触碰同一批文件）"
+assert_line "MP-32.1 未知触碰 → dev 无 implement" "dev " "none"
+
+# 态 2：b 声明了与 a 不相交的路径 → 放行，并如实报出重叠。
+printf '{"paths":["docs/*.md"]}\n' > "$T/.xteam/tasks/b/touches.json"
+run xin32 "$T" status
+assert_rc  "MP-32.2 status rc=0" 0
+assert_has "MP-32.2 无冲突时不再说冻结" "⏳ 待 gate：a（其它片可并行——触碰不冲突）"
+assert_has "MP-32.2 报出重叠对" "⇄ 重叠中：a（待 gate）+ b（开工）"
+assert_line "MP-32.2 dev 拿到 implement" "dev " "implement"
+
+# 态 3：b 改成跟 a 撞同一批文件 → 退回冻结。
+printf '{"paths":["bin/xteam"]}\n' > "$T/.xteam/tasks/b/touches.json"
+run xin32 "$T" status
+assert_rc  "MP-32.3 status rc=0" 0
+assert_has "MP-32.3 又点名冲突片" "⏳ 待 gate：a（冻结：b 与它触碰同一批文件）"
+assert_line "MP-32.3 dev 又无 implement" "dev " "none"
+
+# 子代理边界：章程里必须写明（只读、单一作者），否则 agent 会自己发明用法。
+run grep -c "只读子代理" "$REPO/roles/tl.md" "$REPO/roles/dev.md"
+assert_has "MP-32.4 tl 章程写了子代理边界" "roles/tl.md:1"
+assert_has "MP-32.4 dev 章程写了子代理边界" "roles/dev.md:1"
+run grep -c "只有你自己写" "$REPO/roles/tl.md" "$REPO/roles/dev.md"
+assert_has "MP-32.4 tl 的产物仍是单一作者" "roles/tl.md:1"
+assert_has "MP-32.4 dev 的产物仍是单一作者" "roles/dev.md:1"
+
 # ---------------------------------------------------------------- 收尾
 printf '\n'
 printf '%s/%s 通过\n' "$PASS" "$TOTAL"

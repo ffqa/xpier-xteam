@@ -103,6 +103,7 @@ from xteam_lib import (  # noqa: E402
     wiki_search,
     search_models,
     suggest_kinds,
+    subagent_capability,
 )
 
 FAILURES: list[str] = []
@@ -3781,6 +3782,133 @@ def test_charter_reply_timestamp_rule() -> None:
         check(f"三字样缺「{t}」不算数", has_rule(compliant.replace(t, "")), False)
 
 
+def test_touches_absent_means_conflict() -> None:
+    print("\n[87] touches 缺失/坏 JSON/空 → 未知 = 跟谁都冲突（保守方向）")
+    b = Bench()
+    try:
+        ta, tb = b.proto.tasks / "a", b.proto.tasks / "b"
+        tb.mkdir(exist_ok=True)
+        check("缺 touches.json → None（未知）", b.proto.touches(ta), None)
+        check("未知 vs 任意 → 算冲突", b.proto.conflict_with(ta, ["b"]), ["b"])
+        (tb / "touches.json").write_text('{"paths": ["docs/*.md"]}', encoding="utf-8")
+        check("对面也未知 → 仍算冲突", b.proto.conflict_with(ta, ["b"]), ["b"])
+        (ta / "touches.json").write_text('{"paths": []}', encoding="utf-8")
+        check("空列表 = 未知，不是「不碰任何文件」", b.proto.touches(ta), None)
+        (ta / "touches.json").write_text("{ 坏 json", encoding="utf-8")
+        check("坏 JSON → None（不许抛）", b.proto.touches(ta), None)
+        (ta / "touches.json").write_text('{"paths": "bin/x"}', encoding="utf-8")
+        check("paths 不是列表 → None", b.proto.touches(ta), None)
+    finally:
+        b.cleanup()
+
+
+def test_conflict_glob_both_directions() -> None:
+    print("\n[88] 触碰冲突：双向 glob；不相交才放行")
+    b = Bench()
+    try:
+        ta, tb = b.proto.tasks / "a", b.proto.tasks / "b"
+        tb.mkdir(exist_ok=True)
+        (ta / "touches.json").write_text('{"paths": ["bin/*.py"]}', encoding="utf-8")
+        (tb / "touches.json").write_text('{"paths": ["bin/xteam_lib.py"]}',
+                                         encoding="utf-8")
+        check("glob vs 命中的文件 → 相交", b.proto.conflict_with(ta, ["b"]), ["b"])
+        (tb / "touches.json").write_text('{"paths": ["bin/xteam"]}', encoding="utf-8")
+        check("glob 没命中它（它是无扩展名的二进制）→ 不相交",
+              b.proto.conflict_with(ta, ["b"]), [])
+        (tb / "touches.json").write_text('{"paths": ["bin"]}', encoding="utf-8")
+        check("声明目录 = 碰它下面所有文件 → 相交",
+              b.proto.conflict_with(ta, ["b"]), ["b"])
+        (tb / "touches.json").write_text('{"paths": ["docs/*.md"]}', encoding="utf-8")
+        check("不相交 → 空（可以并行）", b.proto.conflict_with(ta, ["b"]), [])
+        check("自己不算自己的冲突", b.proto.conflict_with(ta, ["a"]), [])
+        (tb / "touches.json").write_text('{"paths": ["./bin/xteam_lib.py"]}',
+                                         encoding="utf-8")
+        check("前导 ./ 归一化后仍相交", b.proto.conflict_with(ta, ["b"]), ["b"])
+    finally:
+        b.cleanup()
+
+
+def test_overlap_allows_disjoint_implement() -> None:
+    print("\n[89] 解锁重叠：触碰不相交时，待判窗口里别的片也能开工")
+    b = Bench("a")
+    try:
+        b.advance_to("delivered")                  # a：已交付未判，窗口开着
+        (b.task / "touches.json").write_text('{"paths": ["bin/xteam"]}',
+                                             encoding="utf-8")
+        tb = b.proto.tasks / "b"
+        tb.mkdir()
+        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        check("b 没声明触碰 = 未知 → 仍冻结（向后兼容）",
+              b.proto.debts(tb).get("dev"), None)
+        (tb / "touches.json").write_text('{"paths": ["bin/xteam"]}', encoding="utf-8")
+        check("b 跟 a 碰同一批文件 → 冻结", b.proto.debts(tb).get("dev"), None)
+        (tb / "touches.json").write_text('{"paths": ["docs/*.md"]}', encoding="utf-8")
+        check("b 触碰不相交 → dev 可以开工 b", b.proto.debts(tb).get("dev"), "implement")
+        check("a 自己是待判片 → 不催它 implement", b.proto.debts(b.task).get("dev"), None)
+        check("待判窗口照旧可查（状态面/兜底还用它）",
+              b.proto.pending_gate_tasks(), ["a"])
+    finally:
+        b.cleanup()
+
+
+def test_start_next_still_gated_by_pending_window() -> None:
+    print("\n[90] start-next：待判窗口 + 下一片未声明触碰 → 不催（第 74 组口径不变）")
+    b = Bench("probe")
+    try:
+        b.task.rmdir()                             # 先造「只有队列」的真空态
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | q9 | todo | |\n", encoding="utf-8")
+        check("队列有未开工项、无人欠账 → PM 欠 start-next",
+              b.proto.overall_debts().get("pm"), ["(队列):start-next"])
+        a = b.proto.tasks / "a"
+        a.mkdir()
+        (a / "spec.md").write_text("# spec\n", encoding="utf-8")
+        (a / "spec.json").write_text('{"round": 1}', encoding="utf-8")
+        (a / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (a / "delivered.json").write_text('{"round": 1}', encoding="utf-8")
+        check("出现待判窗口 + 下一片没声明触碰 → 不再催（保守）",
+              b.proto.overall_debts().get("pm"), None)
+    finally:
+        b.cleanup()
+
+
+def test_consume_preempts_implement() -> None:
+    print("\n[91] 别的片有没消费的 FAIL → 不开新片（返工优先）")
+    b = Bench("a")
+    try:
+        b.advance_to("delivered")
+        b.write("verdict.json", {"round": 1, "delivery": 1, "verdict": "FAIL"})
+        (b.task / "touches.json").write_text('{"paths": ["bin/xteam"]}',
+                                             encoding="utf-8")
+        tb = b.proto.tasks / "b"
+        tb.mkdir()
+        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (tb / "touches.json").write_text('{"paths": ["docs/*.md"]}', encoding="utf-8")
+        check("FAIL 对准本次交付 → dev 欠 a 重做（不是 consume）",
+              b.proto.debts(b.task).get("dev"), "implement")
+        check("b 触碰不相交，但有没消费的 FAIL 压着 → 不给 implement",
+              b.proto.debts(tb).get("dev"), None)
+        b.write("consumed.json", {"round": 1})
+        b.write("delivered.json", {"round": 2, "changed": ["bin/xteam"]})
+        check("消费 + 重交 → a 转 TL chase（a 这轮不再是重做义务）",
+              b.proto.debts(b.task).get("dev"), None)
+        check("FAIL 已消费 → b 的 implement 放开",
+              b.proto.debts(tb).get("dev"), "implement")
+    finally:
+        b.cleanup()
+
+
+def test_subagent_capability_table_is_verified_only() -> None:
+    print("\n[92] 只读子代理：只在实测表里的才给 ✓（不假装有能力）")
+    check("omp 在表里 → ✓", subagent_capability(["omp"]), "omp ✓")
+    check("没实测的 kind → ?（未实测）", subagent_capability(["agy"]),
+          "agy ?（未实测）")
+    check("多个 kind 按名字排序渲染",
+          subagent_capability(["omp", "devin"]), "devin ?（未实测） / omp ✓")
+    check("空列表 → 空串（怎么显示由调用方定）", subagent_capability([]), "")
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -3871,6 +3999,12 @@ def main() -> int:
         test_charter_reply_timestamp_rule,
         test_phase_times_and_throughput_from_mtimes,
         test_phase_times_missing_file_and_backwards_mtime,
+        test_touches_absent_means_conflict,
+        test_conflict_glob_both_directions,
+        test_overlap_allows_disjoint_implement,
+        test_start_next_still_gated_by_pending_window,
+        test_consume_preempts_implement,
+        test_subagent_capability_table_is_verified_only,
     ):
         fn()
     print()

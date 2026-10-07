@@ -161,6 +161,10 @@ xteam stamp pm "等你拍板结算口径" --waiting --wait-for "结算单含未�
 
 TL 完成工作 review 并写下 `ready.json` 后，门禁判据归你：
 
+**先钉快照再判**：`xteam review-tree <slug>` 会打印这一片快照树的目录 —— 门禁在
+里面跑。主树这时可能已经在跑下一片，**只有快照树里的结果算数**（判完
+`xteam review-tree <slug> --rm` 清掉，片闭合时巡检也会自动清）。
+
 判定写成 `.xteam/tasks/<slug>/verdict.json`：
 
 ```json

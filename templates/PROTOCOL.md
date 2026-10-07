@@ -1,7 +1,8 @@
 # xteam 协作协议
 
-三个 pane（pm / tl / dev）之间的全部协作协议。**没有看板，没有卡，没有分支/worktree。**
-状态就是文件的存在性。
+三个 pane（pm / tl / dev）之间的全部协作协议。**没有看板，没有卡，没有分支。**
+状态就是文件的存在性。唯一的 worktree 是 `xteam review-tree` 临时钉出的交付快照
+（`--detach`，片闭合即清）：它钉的是「第几次交付」，不是开发分支。
 
 ## 目录
 
@@ -20,11 +21,17 @@
                                     —— 卡住了，需要 PM 定
       pm-response.json PM 写 {"round": N, "decision": "…"}  对 blocked 的回应
       request.md     TL 写   拆解 + 细化到 dev 可执行（达成一致后才写）
+      touches.json   TL 写   {"paths": ["bin/x", "tests/*.py"]} —— 这一片会碰哪些路径
+                                    （glob，相对项目根）。**写 request.md 时一起写**：
+                                    它是「两片能不能同时开工」的唯一判据
       delivered.json DEV 写  实现完成 + 自测结果（round = 本次交付序号）
+                                    —— `base`/`head`/`changed[]` 是**机器读的键**（别改名）：
+                                    `xteam snap` 按它们钉交付快照、写回 base/head
       ready.json     TL 写  工作 review 通过（delivery = 已通过的交付序号）
       verdict.json   PM 写  门禁 PASS/FAIL（round = 判次，delivery = 判的是哪次交付）
       consumed.json  DEV 写 已取 verdict（round 对齐）
       closed.md      PM 写  本切片闭合
+  rt/                   review-tree 钉出来的快照树（交付提交的只读副本，片闭合自动清）
   session.json         xteam up 写的会话记录（workspace / pane 映射）
   team.json            角色用的 agent / model（可选，up 自动落盘）
   identity/            <角色>.md：身份文件（挂进系统提示词，重置清不掉）

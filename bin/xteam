@@ -75,6 +75,7 @@ from xteam_lib import (  # noqa: E402
     now,
     now_utc,
     _read_json,
+    _delivery_round,
     write_json,
     ONESHOT_VERIFIED,
     QaAgentRejected,
@@ -108,6 +109,7 @@ from xteam_lib import (  # noqa: E402
     display_version,
     UPSTREAM_REPO,
     SYSTEM_PROMPT_ARG,
+    subagent_capability,
     REOPEN_ADVISE_PCT,
     REOPEN_ADVISE_COOLDOWN,
     RESET_EVIDENCE,
@@ -515,6 +517,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
           + (f"  ⚠ 缺：{'、'.join(missing_used)}" if missing_used else ""))
     print(f"  实测 --model  {', '.join(sorted(VERIFIED_TUI_MODEL))}")
     print(f"  推断 --model  {len(ASSUMED_TUI_MODEL)} 个（用 --probe 转成实测）")
+    print(f"  只读子代理    {subagent_capability(used) if used else '（未声明）'}"
+          + "   —— 章程允许它们做侦察/测试矩阵，产物仍只有角色自己写")
     # 协议正文里让人「照着去 skills/ste/SKILL.md 看完整输出规范」，那处不给
     # 绝对路径 —— 因为 PROTOCOL.md 会被拷进**用户项目的** .xteam/，写相对路径
     # 必然解析不到。doctor 是 agent 唯一会主动跑的命令，所以绝对路径打在这里。
@@ -2286,6 +2290,130 @@ def _merge_overall_pending(pending: list, overall: list) -> list:
     return [tuple(x.split(":", 1)) for x in overall]
 
 
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    """在项目根跑一条 git。**不抛异常**：错误交给调用方读 stderr 决定怎么报。"""
+    return subprocess.run(["git", "-C", str(root), *args],
+                          capture_output=True, text=True)
+
+
+def _review_tree_path(proto: Protocol, slug: str) -> Path:
+    return proto.dir / "rt" / slug
+
+
+def _prune_review_tree(proto: Protocol, slug: str) -> bool:
+    """移除某片的快照树。不存在 = 已经干净 → True（幂等，巡检每轮都敢调）。"""
+    path = _review_tree_path(proto, slug)
+    if not path.exists():
+        return True
+    return _git(proto.root, "worktree", "remove", "--force", str(path)).returncode == 0
+
+
+def cmd_snap(args: argparse.Namespace) -> int:
+    """按 `delivered.json.changed[]` 给这一片钉一个提交 —— 交付快照。
+
+    **为什么必须钉**：TL/PM 要在「不会再动的树」上 review/gate（F-16）。原来靠
+    冻结整棵工作树换可归因，代价是 dev 交付后必须干等（本仓实测每片 3–12m）。
+    钉快照把可归因从「树不许动」降级成「这一段提交不许动」——树就能继续往前跑。
+
+    **只提交 changed[] 里的路径**：别人的、人类未提交的改动不许卷进来。这是
+    「一个人分支」的替代品，不是 git 工作流。
+    """
+    root = _find_team_root(args.project)
+    proto = Protocol(root)
+    task = proto.tasks / args.slug
+    if not (task / "delivered.json").exists():
+        die(f"{task} 里没有 delivered.json —— 先交付，再钉快照")
+    data = _read_json(task / "delivered.json")
+    changed = data.get("changed")
+    paths = [p.strip().lstrip("./") for p in changed
+             if isinstance(p, str) and p.strip()] if isinstance(changed, list) else []
+    if not paths:
+        print("changed[] 空：不能归因，拒绝提交（先写清这一片改了哪些路径）")
+        return 2
+    for p in paths:
+        if (root / p).exists():
+            continue
+        # 删掉的文件不在工作树里但在索引里，同样合法。
+        if _git(root, "ls-files", "--error-unmatch", "--", p).returncode != 0:
+            print(f"changed[] 里的路径既不在工作树、也不在 git 索引里：{p}")
+            return 2
+    base = _git(root, "rev-parse", "--short", "HEAD")
+    if base.returncode != 0:
+        die("拿不到 HEAD：" + (base.stderr.strip() or "这个项目是 git 仓吗？"))
+    added = _git(root, "add", "--", *paths)
+    if added.returncode != 0:
+        print(added.stderr.strip() or "git add 失败")
+        return 1
+    round_no = _delivery_round(task)
+    summary = args.summary or "交付快照"
+    msg = f"slice {args.slug} r{round_no}: {summary}"
+    commit = _git(root, "commit", "-m", msg, "--", *paths)
+    if commit.returncode != 0:
+        blob = (commit.stdout + commit.stderr)
+        if "nothing to commit" in blob or "no changes added" in blob:
+            print(f"没有可提交的改动：changed[] 里的 {len(paths)} 条路径相对 HEAD "
+                  f"没有差异（{args.slug}）")
+            return 3
+        print(commit.stderr.strip() or blob.strip() or "git commit 失败")
+        return 1
+    head = _git(root, "rev-parse", "--short", "HEAD")
+    data["base"] = base.stdout.strip()
+    data["head"] = head.stdout.strip()
+    if not write_json(task / "delivered.json", data):
+        print("快照已提交，但回写 delivered.json 失败 —— 下次得手写 base/head")
+        return 1
+    print(f"快照 {data['base']}..{data['head']}（只含 changed[] 里的 "
+          f"{len(paths)} 条路径）")
+    stat = _git(root, "diff", "--stat", f"{data['base']}..{data['head']}")
+    if stat.stdout.strip():
+        print(stat.stdout.rstrip())
+    return 0
+
+
+def cmd_review_tree(args: argparse.Namespace) -> int:
+    """把某片的交付提交钉成一棵只读快照树，给 TL/PM 判。
+
+    **worktree 不是用来「防冲突」的** —— 冲突靠 `touches.json` 声明不相交 +
+    只提交 `changed[]` 路径来躲开。它在这里只有一个作用：让 review/gate 面对
+    一棵**不会再动的树**，而主工作树继续往前跑。
+    """
+    root = _find_team_root(args.project)
+    proto = Protocol(root)
+    path = _review_tree_path(proto, args.slug)
+    if args.rm:
+        if not path.exists():
+            return 0
+        res = _git(root, "worktree", "remove", "--force", str(path))
+        if res.returncode != 0:
+            print(res.stderr.strip() or "移除快照树失败")
+            return 1
+        print(f"已移除快照树：{path}")
+        return 0
+    task = proto.tasks / args.slug
+    head = str(_read_json(task / "delivered.json").get("head") or "").strip()
+    if not head:
+        print("该片没有交付 commit（旧格式 delivered.json 没有 head）：快照钉不出来 "
+              "—— 这一片继续按「树冻结」处理。")
+        return 2
+    if _git(root, "cat-file", "-e", f"{head}^{{commit}}").returncode != 0:
+        print(f"交付提交 {head} 不在本仓（被 rebase/gc 过？）—— 快照钉不出来。")
+        return 2
+    if path.exists() and not _prune_review_tree(proto, args.slug):
+        print(f"旧快照树清不掉：{path}（先看 git worktree list）")
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    added = _git(root, "worktree", "add", "--detach", str(path), head)
+    if added.returncode != 0:
+        print(added.stderr.strip() or "git worktree add 失败")
+        return 1
+    base = str(_read_json(task / "delivered.json").get("base") or "")
+    print(f"快照树：{path}（HEAD={head}）")
+    if base:
+        print(f"  在里面判：cd {path} && git diff {base}..{head}")
+    print(f"  判完清掉：xteam --project {root} review-tree {args.slug} --rm")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     """每片的分段耗时与全局吞吐：瓶颈用数说话，不靠感觉。
 
@@ -2461,7 +2589,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     # 就会把半成品混进正在判的那棵树）。这行就是「dev 显示 none」的解释。
     pending_gate = proto.pending_gate_tasks()
     if pending_gate:
-        print(f"\n⏳ 待 gate：{'、'.join(pending_gate)}（产品树冻结，判完再开新活）")
+        in_flight = proto.inflight_slices()
+        conflicts: dict[str, list[str]] = {}
+        overlaps: list[str] = []
+        for name in pending_gate:
+            clash = proto.conflict_with(proto.tasks / name, in_flight)
+            conflicts[name] = clash
+            overlaps += [f"{name}（待 gate）+ {other}（开工）"
+                         for other in in_flight
+                         if other not in clash and other not in pending_gate]
+        clash_flat = sorted({n for names in conflicts.values() for n in names})
+        if clash_flat:
+            print(f"\n⏳ 待 gate：{'、'.join(pending_gate)}"
+                  f"（冻结：{'、'.join(clash_flat)} 与它触碰同一批文件）")
+        else:
+            print(f"\n⏳ 待 gate：{'、'.join(pending_gate)}"
+                  f"（其它片可并行——触碰不冲突）")
+        if overlaps:
+            print(f"⇄ 重叠中：{'、'.join(overlaps)}")
 
     # request.md 落地超阈值还无人领 → 点名 TL 去派发（门铃 dev），不只催 dev。
     undispatched = proto.undispatched_tasks()
@@ -2598,6 +2743,15 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
         return
     role_map = herdr.role_map(ws["workspace_id"])
     debts = proto.obligations()
+
+    # 快照树（review-tree）是判据的载体，不是长期资产：片一闭合就清掉。
+    # 留着会被读成「还在判」，也白占盘；每轮都清，幂等。
+    try:
+        for t in proto.all_tasks():
+            if (t / "closed.md").exists():
+                _prune_review_tree(proto, t.name)
+    except Exception as exc:                     # 清理失败绝不能带倒巡检
+        log_event(logf, f"RT-PRUNE-FAILED {type(exc).__name__}")
 
     # 规则/上游变更的低频提醒。xteam 不是常驻进程，用户没有任何时刻会收到
     # 「它变了」—— 门狗是唯一一直在跑的东西，所以提醒放这里，而不是指望人
@@ -3836,6 +3990,16 @@ def main() -> int:
     p.add_argument("message")
     p.add_argument("--settle", type=int, default=0, help="投递后等几秒再读状态")
     p.set_defaults(func=cmd_say)
+
+    p = sub.add_parser("snap", help="按 delivered.json.changed[] 钉交付快照（提交）")
+    p.add_argument("slug", help="切片名（.xteam/tasks/<slug>）")
+    p.add_argument("--summary", default="", help="提交信息里的那句话")
+    p.set_defaults(func=cmd_snap)
+
+    p = sub.add_parser("review-tree", help="把交付提交钉成一棵只读快照树（git worktree）")
+    p.add_argument("slug", help="切片名（.xteam/tasks/<slug>）")
+    p.add_argument("--rm", action="store_true", help="移除快照树")
+    p.set_defaults(func=cmd_review_tree)
 
     p = sub.add_parser("stats", help="每片分段耗时与吞吐（瓶颈用数说话）")
     p.add_argument("--since", help="只统计这个日期（YYYY-MM-DD）之后开工的切片")
