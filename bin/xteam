@@ -39,6 +39,8 @@ from xteam_lib import (  # noqa: E402
     OBLIGATIONS,
     PHASES,
     Protocol,
+    render_board,
+    detect_choice_prompt,
     ROLES,
     RoleSpec,
     WAITING_GRACE_SECS,
@@ -2425,6 +2427,115 @@ def cmd_review_tree(args: argparse.Namespace) -> int:
     return 0
 
 
+def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
+                 role_map: dict, tracker: IdleTracker) -> dict:
+    """采集一屏看板要的事实。**只读**：不改状态、不投递、不新增事实来源。"""
+    debts = proto.obligations()
+    overall = proto.overall_debts()
+    rows = []
+    for role in BOOT_ORDER:
+        agent = role_map.get(role)
+        if not agent:
+            continue
+        status = str(agent.get("agent_status", "unknown"))
+        pending = _merge_overall_pending(debts.get(role, []), overall.get(role, []))
+        owes, where = "none", ""
+        if pending:
+            owes = pending[0][1]
+            where = (f"{pending[0][0]}"
+                     + (f" +{len(pending)-1}" if len(pending) > 1 else ""))
+        pane = str(agent.get("pane_id") or "")
+        try:
+            box = herdr.box_state(pane, str(agent.get("agent") or "")) if pane else "unknown"
+        except Exception:                        # noqa: BLE001
+            box = "unknown"
+        since = tracker.state_since(role)
+        rows.append({"role": role, "status": status, "owes": owes, "where": where,
+                     "box": box, "pane": pane,
+                     "held": fmt_duration(int(time.time()) - int(since)) if since else "-"})
+
+    blocked_on_prompt = []
+    try:
+        blocked_on_prompt = _prompt_blocked_roles(
+            herdr, [(r["role"], "", r["status"], r["owes"], r["where"], r["pane"])
+                    for r in rows])
+    except Exception:                            # noqa: BLE001
+        blocked_on_prompt = []
+    alerts = _chain_alerts(proto, herdr, role_map,
+                           [(r["role"], "", r["status"], r["owes"], r["where"], r["pane"])
+                            for r in rows],
+                           tracker, blocked_on_prompt)
+
+    in_flight = set(proto.inflight_slices())
+    gate = set(proto.pending_gate_tasks())
+    slices = []
+    for t in proto.slice_order(proto.open_tasks()):
+        owes = "、".join(f"{role}:{ob}" for role, ob in sorted(proto.debts(t).items()))
+        note = "在飞" if t.name in in_flight else "未开工"
+        if t.name in gate:
+            note = "**待 gate**"
+        slices.append({"name": t.name, "stage": proto._stage(t),
+                       "note": f"{note}  {owes or '（没人欠活）'}"})
+
+    events = []
+    ev = proto.dir / "watch" / "events.log"
+    if ev.exists():
+        keys = ("ALERT", "NUDGE-SKIPPED", "ESCALATE", "NEEDS-HUMAN", "STUCK",
+                "BLOCKED-ANSWER", "QA ", "RECAP-ASK")
+        try:
+            lines = ev.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for ln in [x for x in lines if any(k in x for k in keys)][-8:]:
+            events.append(re.sub(r"^(\d{4})-(\d\d-\d\d)T(\d\d:\d\d:\d\d)Z ",
+                                 r"\2 \3 ", ln)[:110])
+
+    return {
+        "title": (f"xteam board  {now()}  {label!r}  {root}  "
+                  f"（xteam {_installed_version() or '?'}）"),
+        "roles": rows, "alerts": alerts, "slices": slices, "events": events,
+    }
+
+
+def cmd_board(args: argparse.Namespace) -> int:
+    """一屏看板：谁在干什么、**链路为什么不动**、最近发生了什么。默认自动刷新。
+
+    和 `status` 的关系：同一份事实（`.xteam/` + pane 现状），`status` 是一次快照，
+    这个是一直挂着的视图。起因是实测撞到「链路卡了近两小时，而面板上什么都看不
+    出来」—— 门铃投不进去、agent 停在选择框上，这两件都不在角色表里。
+    **它只读**：不投递、不改状态、不新增事实来源。
+    """
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    _require_herdr()
+    label, _ws_why = resolve_ws_label(root, args.workspace)
+    herdr = Herdr(scope=label)
+    ws = herdr.find_workspace(label)
+    if not ws:
+        die(f"找不到 workspace {label!r}（先跑 xteam up）")
+    role_map = herdr.role_map(ws["workspace_id"])
+    if not role_map:
+        die(f"workspace {label!r} 在，但没有 agent 在跑（pane 已关）"
+            f" —— 重新开跑：xteam --project {root} up . --watch")
+    tracker = IdleTracker(proto.dir / "watch" / "idle.state")
+    color = sys.stdout.isatty() and not args.plain
+    try:
+        while True:
+            frame = render_board(
+                _board_state(root, proto, herdr, label, role_map, tracker),
+                color=color)
+            if args.once:
+                print(frame)
+                return 0
+            sys.stdout.write("\033[H\033[J" + frame
+                             + f"\n\n  {args.interval:g}s 刷新 · Ctrl-C 退出\n")
+            sys.stdout.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     """每片的分段耗时与全局吞吐：瓶颈用数说话，不靠感觉。
 
@@ -2483,6 +2594,105 @@ def cmd_stats(args: argparse.Namespace) -> int:
           f"（中位 {statistics.median(windows) if windows else 0.0:.1f}m/片）；"
           f"重叠命中 {tp['freeze_with_other_writer']}/{tp['slices']}")
     return 0
+
+
+def _chain_alerts(proto: Protocol, herdr: Herdr, role_map: dict, rows: list,
+                  tracker: IdleTracker, blocked_on_prompt: list[str]) -> list[str]:
+    """链路层的告警块：**为什么不动**。`status` 与 `board` 共用同一份文案。
+
+    这一层是这套东西最容易被误读的部分 —— 面板上「agent 没在干活」有五种完全
+    不同的原因（待判冻结 / 投不进去 / 派发超时 / 停在选项框 / 真欠活没动），
+    每种该做的事都不一样。所以文案必须由协议算出来，不能让人自己猜。
+    """
+    blocks: list[str] = []
+
+    # 「已交付未判」的窗口里产品树冻结：dev 不欠下一片的 implement（欠了开工
+    # 就会把半成品混进正在判的那棵树）。这行就是「dev 显示 none」的解释。
+    pending_gate = proto.pending_gate_tasks()
+    if pending_gate:
+        in_flight = proto.inflight_slices()
+        conflicts: dict[str, list[str]] = {}
+        overlaps: list[str] = []
+        for name in pending_gate:
+            clash = proto.conflict_with(proto.tasks / name, in_flight)
+            conflicts[name] = clash
+            overlaps += [f"{name}（待 gate）+ {other}（开工）"
+                         for other in in_flight
+                         if other not in clash and other not in pending_gate]
+        clash_flat = sorted({n for names in conflicts.values() for n in names})
+        if clash_flat:
+            line = (f"⏳ 待 gate：{'、'.join(pending_gate)}"
+                    f"（冻结：{'、'.join(clash_flat)} 与它触碰同一批文件）")
+        else:
+            line = (f"⏳ 待 gate：{'、'.join(pending_gate)}"
+                    f"（其它片可并行——触碰不冲突）")
+        if overlaps:
+            line += f"\n⇄ 重叠中：{'、'.join(overlaps)}"
+        blocks.append(line)
+
+    # **门铃投不进去**：目标输入框里有草稿（有人正在那个 pane 里打字）。这是最容易
+    # 被误读成「agent 不干活」的状态 —— 催办/派发全被跳过，而角色表上一点异常都
+    # 看不出来（android_dev 实测：tl 被冤枉两小时，真因是人自己停着的半句话）。
+    drafts = []
+    for role in sorted(role_map):
+        info = role_map[role]
+        pane = str(info.get("pane_id") or "")
+        if not pane:
+            continue
+        try:
+            if herdr.box_state(pane, str(info.get("agent") or "")) == "draft":
+                drafts.append(role)
+        except Exception:                        # noqa: BLE001
+            continue
+    if drafts:
+        blocks.append(f"⚠ 门铃投不进去：{'、'.join(drafts)} —— 输入框里有草稿"
+                      f"（有人正在那个 pane 里打字）。清空输入框，它们才能收到派发与催办。")
+
+    # **停在选择题上**：agent 在等一个答案（不是权限框 —— 那个另有判据）。
+    # 这一条以前完全不可见：角色表只显示 `blocked`，而「它在等你选」才是可行动的
+    # 信息（android_dev 实测：tl 停在 omp 的多选框上，整条链卡住，面板上只看到
+    # 一个 blocked 字样，人根本不知道该干什么）。
+    choices = []
+    for role in sorted(role_map):
+        pane = str((role_map.get(role) or {}).get("pane_id") or "")
+        if not pane:
+            continue
+        try:
+            if detect_choice_prompt(herdr.read_pane(pane)):
+                choices.append(role)
+        except Exception:                        # noqa: BLE001
+            continue
+    if choices:
+        blocks.append(f"⚠ {'、'.join(choices)} 停在选择框上（等你答，不是做完）"
+                      " —— 去它的 pane 里选（Space 切换 / Enter 确认），"
+                      "或 `xteam say <角色> \"选哪个\"` 告诉它")
+
+    # request.md 落地超阈值还无人领 → 点名 TL 去派发（门铃 dev），不只催 dev。
+    undispatched = proto.undispatched_tasks()
+    if undispatched:
+        blocks.append(f"⏳ request 派发超时：{'、'.join(undispatched)}"
+                      f"（request.md 已下超 {IDLE_ALERT_SECS}s 未交付"
+                      f" —— TL 该门铃 dev 派发了）")
+
+    idle_hits = []
+    for role, cn, status, owes, where, pane in rows:
+        if status in ("working", "blocked"):
+            continue
+        if owes != "none":
+            idle_hits.append((role, status, owes, where,
+                              fmt_epoch(tracker.state_since(role))))
+    if blocked_on_prompt:
+        blocks.append(f"⚠ {'、'.join(blocked_on_prompt)} 停在权限/选项框上（不是做完）"
+                      " —— 去它的 pane 里作答，或 `xteam watch once` 让巡检处理")
+    if idle_hits:
+        lines = ["⚠ 该动没动："]
+        for role, status, owes, where, since_at in idle_hits:
+            lines.append(f"   {role} ({status} 自 {since_at}) 欠 {owes} @ {where}")
+            lines.append(f"      → xteam say {role} \"{OBLIGATIONS.get(owes, '')}\"")
+        blocks.append("\n".join(lines))
+    elif not blocked_on_prompt:
+        blocks.append("✓ 无欠账角色。真 idle 且 owes:none 是合法终态（做完了在等下一项）。")
+    return blocks
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -2596,71 +2806,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         tail = f"{owes} {where}".rstrip()
         print(f"{role.ljust(width)}  {status:<8}  {held:<8}  {since_at:<14}  {active_at:<14}  {tail}")
 
-    # 「已交付未判」的窗口里产品树冻结：dev 不欠下一片的 implement（欠了开工
-    # 就会把半成品混进正在判的那棵树）。这行就是「dev 显示 none」的解释。
-    pending_gate = proto.pending_gate_tasks()
-    if pending_gate:
-        in_flight = proto.inflight_slices()
-        conflicts: dict[str, list[str]] = {}
-        overlaps: list[str] = []
-        for name in pending_gate:
-            clash = proto.conflict_with(proto.tasks / name, in_flight)
-            conflicts[name] = clash
-            overlaps += [f"{name}（待 gate）+ {other}（开工）"
-                         for other in in_flight
-                         if other not in clash and other not in pending_gate]
-        clash_flat = sorted({n for names in conflicts.values() for n in names})
-        if clash_flat:
-            print(f"\n⏳ 待 gate：{'、'.join(pending_gate)}"
-                  f"（冻结：{'、'.join(clash_flat)} 与它触碰同一批文件）")
-        else:
-            print(f"\n⏳ 待 gate：{'、'.join(pending_gate)}"
-                  f"（其它片可并行——触碰不冲突）")
-        if overlaps:
-            print(f"⇄ 重叠中：{'、'.join(overlaps)}")
-
-    # **门铃投不进去**：目标输入框里有草稿（有人正在那个 pane 里打字）。这是最容易
-    # 被误读成「agent 不干活」的状态 —— 催办/派发全被跳过，而角色表上一点异常都
-    # 看不出来（android_dev 实测：tl 被冤枉两小时，真因是人自己停着的半句话）。
-    drafts = []
-    for role in sorted(role_map):
-        info = role_map[role]
-        pane = str(info.get("pane_id") or "")
-        if not pane:
-            continue
-        try:
-            if herdr.box_state(pane, str(info.get("agent") or "")) == "draft":
-                drafts.append(role)
-        except Exception:                        # noqa: BLE001
-            continue
-    if drafts:
-        print(f"\n⚠ 门铃投不进去：{'、'.join(drafts)} —— 输入框里有草稿"
-              f"（有人正在那个 pane 里打字）。清空输入框，它们才能收到派发与催办。")
-
-    # request.md 落地超阈值还无人领 → 点名 TL 去派发（门铃 dev），不只催 dev。
-    undispatched = proto.undispatched_tasks()
-    if undispatched:
-        print(f"\n⏳ request 派发超时：{'、'.join(undispatched)}"
-              f"（request.md 已下超 {IDLE_ALERT_SECS}s 未交付"
-              f" —— TL 该门铃 dev 派发了）")
-
-    idle_hits = []
-    for role, cn, status, owes, where, pane in rows:
-        if status in ("working", "blocked"):
-            continue
-        if owes != "none":
-            idle_hits.append((role, status, owes, where,
-                              fmt_epoch(tracker.state_since(role))))
-    if blocked_on_prompt:
-        print(f"\n⚠ {'、'.join(blocked_on_prompt)} 停在权限/选项框上（不是做完）"
-              " —— 去它的 pane 里作答，或 `xteam watch once` 让巡检处理")
-    if idle_hits:
-        print("\n⚠ 该动没动：")
-        for role, status, owes, where, since_at in idle_hits:
-            print(f"   {role} ({status} 自 {since_at}) 欠 {owes} @ {where}")
-            print(f"      → xteam say {role} \"{OBLIGATIONS.get(owes, '')}\"")
-    elif not blocked_on_prompt:
-        print("\n✓ 无欠账角色。真 idle 且 owes:none 是合法终态（做完了在等下一项）。")
+    # **链路为什么不动**：status 与 board 共用同一份文案（`_chain_alerts`）。
+    for block in _chain_alerts(proto, herdr, role_map, rows, tracker,
+                               blocked_on_prompt):
+        print("\n" + block)
 
     queue = proto.dir / "QUEUE.md"
     if queue.exists():
@@ -2890,7 +3039,8 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
                     if int(time.time()) - int(
                             tracker.state.get(role, {}).get("escalated_at", 0)
                     ) >= HUMAN_ESCALATE_REPEAT_SECS:
-                        escalate_to_human(root, herdr, role, task, owes, idle, logf)
+                        escalate_to_human(root, herdr, role, task, owes, idle, logf,
+                                  _blocked_reason(herdr, pane))
                         tracker.state.setdefault(role, {})["escalated_at"] = int(time.time())
             continue
         if status == "working":
@@ -2919,7 +3069,8 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
             # 现在升级到人类：记 NEEDS-HUMAN 事件 + 周期重提醒，直到有人接手。
             if int(time.time()) - int(tracker.state.get(role, {}).get("escalated_at", 0)) \
                     >= HUMAN_ESCALATE_REPEAT_SECS:
-                escalate_to_human(root, herdr, role, task, owes, idle, logf)
+                escalate_to_human(root, herdr, role, task, owes, idle, logf,
+                                  _blocked_reason(herdr, pane))
                 tracker.state.setdefault(role, {})["escalated_at"] = int(time.time())
                 tracker.flush()
             continue
@@ -3320,6 +3471,9 @@ def _answer_choice(root: Path, role: str, proto: Protocol) -> str:
 
     options = _parse_options(tail)
     if not options:
+        if detect_choice_prompt(tail):
+            return ("停在选择框上（不是权限框，也不是能自动选的那种）"
+                    " —— 需要人来答：去那个 pane 里选（Space 切换 / Enter 确认）")
         return "未识别出选项（可能不是选择题），保留现场等 PM 处理"
 
     chosen = next((o for o in options if o["recommended"]), options[0])
@@ -3331,22 +3485,45 @@ def _answer_choice(root: Path, role: str, proto: Protocol) -> str:
     return f"选了「{chosen['text'][:40]}」→ 已提交，agent 恢复 working"
 
 
+def _blocked_reason(herdr, pane: str) -> str:
+    """这个 pane 是不是停在「等人答」的框上？返回人话原因（空 = 不是）。
+
+    只读，不替它答 —— 判据与 `status`/看板的链路提示同一份。
+    """
+    if not pane:
+        return ""
+    try:
+        tail = herdr.read_pane(pane)
+    except Exception:                            # noqa: BLE001
+        return ""
+    if detect_choice_prompt(tail):
+        return "停在选择框上等你答（去那个 pane 里选）"
+    if detect_permission_prompt(tail)["is_permission"]:
+        return "停在权限框上等你放行"
+    return ""
+
+
 def escalate_to_human(root: Path, herdr, role: str, task: str, owes: str,
-                      idle: int, logf: Path) -> None:
+                      idle: int, logf: Path, reason: str = "") -> None:
     """角色催不动了 —— 升级到人类，绝不静默放弃。
 
     三件事，缺一不可：
       1. 大声记事件（人不主动翻日志，就会重演 apartment 那个「卡几小时」）
       2. 写进时间线并打 WAITING 标记，让它下次上线第一眼看到「这里等你」
       3. 响 macOS 通知 —— 唯一能真正打断人的通道；失败也不放弃，终端已有输出
+
+    `reason` 是人话原因（如「停在选择框上等你答」）。**不能一律写「无响应」**：
+    停在交互框上的 agent 不是不理人，它在等一个只有人能给的答案 —— 说错原因，
+    人会去催一个根本没法自己动的东西（android_dev 实测）。
     """
+    why = reason or "催了两轮无响应"
     log_event(logf, f"NEEDS-HUMAN {role} owes={owes} task={task} "
-                    f"idle={fmt_duration(idle)} 催了两轮无响应")
+                    f"idle={fmt_duration(idle)} {why}")
     log_timeline(root, role,
-                 f"催了两轮仍不响应，已升级给人类：欠 {owes}（{task}）",
+                 f"催了两轮仍不响应，已升级给人类：{why}；欠 {owes}（{task}）",
                  waiting=True, wait_for=f"人类处理 {role} 的 {owes}")
     title = f"xteam: {role} 卡住了"
-    body = f"{role} 欠 {owes}（{task}），已 idle {fmt_duration(idle)}，催两轮无响应"
+    body = f"{role} 欠 {owes}（{task}），已 idle {fmt_duration(idle)}，{why}"
     notify(title, body)
     print(f"[{now()}] ⚠ NEEDS-HUMAN: {body}", file=sys.stderr)
 
@@ -4063,6 +4240,13 @@ def main() -> int:
     p.add_argument("slug", help="切片名（.xteam/tasks/<slug>）")
     p.add_argument("--rm", action="store_true", help="移除快照树")
     p.set_defaults(func=cmd_review_tree)
+
+    p = sub.add_parser("board", help="一屏看板：谁在干什么、链路为什么不动（自动刷新）")
+    p.add_argument("--once", action="store_true", help="只打一屏就退出（脚本/测试用）")
+    p.add_argument("--interval", type=float, default=2.0, metavar="SECS",
+                   help="刷新间隔（默认 2 秒）")
+    p.add_argument("--plain", action="store_true", help="不上色（管道里默认就不上色）")
+    p.set_defaults(func=cmd_board)
 
     p = sub.add_parser("stats", help="每片分段耗时与吞吐（瓶颈用数说话）")
     p.add_argument("--since", help="只统计这个日期（YYYY-MM-DD）之后开工的切片")

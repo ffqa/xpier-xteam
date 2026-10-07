@@ -356,6 +356,74 @@ def subagent_capability(kinds) -> str:
     return " / ".join(f"{k} ✓" if k in SUBAGENT_CAPABLE else f"{k} ?（未实测）"
                       for k in sorted(kinds))
 
+
+# 「停在选择题上」的识别标记。实测（omp 18.x）：底部提示行是
+# `Space toggle · Enter next · Up/Down move · Tab/Left/Right · Esc cancel`，
+# 选项行是 `| [ ] 应用管理 |`。**只用来报告，不用来自动作答** —— 替 agent
+# 选是另一条路（send_choice，带白名单与不可逆拦截）。
+CHOICE_MARKERS: tuple[str, ...] = (
+    "space toggle", "enter next", "esc cancel", "other (type your own)",
+)
+
+
+def detect_choice_prompt(tail: str) -> bool:
+    """pane 尾部是不是停在「选择题/多选框」上（等一个答案）。"""
+    low = tail.lower()
+    return any(m in low for m in CHOICE_MARKERS)
+
+
+def _ansi(text: str, code: str, on: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if on else text
+
+
+def render_board(state: dict, color: bool = False) -> str:
+    """把看板状态渲染成一屏文本。**纯函数**：采集在 bin/xteam（要 herdr）。
+
+    看板只回答三件事：谁在干什么、**链路为什么不动**、最近发生了什么。
+    它**不新增任何状态** —— 事实仍然只在 `.xteam/` 与 pane 现状里，看板只是
+    把同一份事实渲染成一眼能看完的一屏（`status` 是快照，这个是常驻视图）。
+    """
+    out = [_ansi(str(state.get("title") or "xteam board"), "1", color), ""]
+    roles = state.get("roles") or []
+    out.append(_ansi("── 角色 ─────────────────────────────────────────────", "36", color))
+    if roles:
+        for r in roles:
+            owes = r.get("owes") or "none"
+            where = f" @ {r['where']}" if r.get("where") else ""
+            box = {"draft": "   ✍ 输入框有草稿（投不进去）",
+                   "unknown": ""}.get(str(r.get("box") or ""), "")
+            held = str(r.get("held") or "").ljust(8)
+            out.append(f"  {str(r.get('role','')):<4} {str(r.get('status','')):<8} "
+                       f"{held} {owes}{where}{box}")
+    else:
+        out.append("  （没有在跑的角色）")
+
+    alerts = state.get("alerts") or []
+    if alerts:
+        out.append("")
+        out.append(_ansi("── 链路（为什么不动）──────────────────────────────", "36", color))
+        for a in alerts:
+            for line in str(a).splitlines():
+                out.append("  " + _ansi(line, "33", color))
+
+    slices = state.get("slices") or []
+    out.append("")
+    out.append(_ansi("── 切片 ─────────────────────────────────────────────", "36", color))
+    if slices:
+        for s in slices:
+            out.append(f"  {str(s.get('name','')):<28} [{s.get('stage','')}]"
+                       f"  {s.get('note','')}")
+    else:
+        out.append("  （没有未闭合切片）")
+
+    events = state.get("events") or []
+    if events:
+        out.append("")
+        out.append(_ansi("── 最近事件 ─────────────────────────────────────────", "36", color))
+        for e in events:
+            out.append("  " + str(e))
+    return "\n".join(out)
+
 # 原地开新会话的斜杠命令：kind → 命令。
 # 实测 omp / pi：`/new` 开新会话（omp 的 herdr `agent_session` 路径随之变化），
 # 而 `/clear` 只是「丢消息、会话继续」—— 重开要的是前者的效果。

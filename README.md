@@ -128,6 +128,7 @@ xteam sync                # 改了 xteam 的规则后，把新章程重投给正
 xteam projects            # 治理了哪些项目、依赖关系、各自未闭合的活
 xteam restore             # 关掉后从这里恢复现场
 xteam swap tl devin --model swe-2-max   # 中途把 tl 换成 devin（见下）
+xteam board               # 一屏看板：谁在干什么、链路为什么不动（默认 2 秒刷新）
 xteam stats               # 每片分段耗时 / 吞吐 / 并行度（瓶颈用数说话，不用感觉）
 xteam snap <slug>         # dev 交付时钉交付快照：只提交 changed[] 里的路径
 xteam review-tree <slug>  # TL/PM 在交付提交的只读快照树里 review/gate
@@ -154,6 +155,31 @@ dev 交付完只能干等（本仓 24 片实测：这段每片 3–12m、中位 
 
 `xteam stats` 里的**重叠命中**（冻结窗口内另有片在写）是「解锁有没有真的生效」的唯一
 证据 —— 全局冻结下它恒为 0。
+
+## 看板：链路为什么不动
+
+`xteam status` 是一次快照；`xteam board` 是常驻视图（默认 2 秒刷新，`--once` 只打一屏，
+管道里自动不上色）。它渲染的是**同一份事实**（`.xteam/` + pane 现状），重点不是
+「谁在忙」，而是**「为什么不动」**：
+
+```
+xteam board  2026-10-07 23:07:30  'android_dev'  /Users/…/android_dev  （xteam 0.2.8）
+
+── 角色 ─────────────────────────────────────────────
+  pm   working  5m10s    next-slice @ console-into-main +14
+  tl   blocked  3m10s    none
+── 链路（为什么不动）──────────────────────────────
+  ⚠ tl 停在选择框上（等你答，不是做完） —— 去它的 pane 里选（Space 切换 / Enter 确认）
+  ⚠ 门铃投不进去：tl —— 输入框里有草稿（有人正在那个 pane 里打字）
+── 切片 ─────────────────────────────────────────────
+  console-ui-commit            [settling]  未开工  pm:settle
+── 最近事件 ─────────────────────────────────────────
+  10-07 23:07:26 BLOCKED-ANSWER tl idle=3m06s → 停在选择框上…
+```
+
+起因是一次实测：链路卡了近两小时，而 `status` 上只有一行 `tl blocked` ——
+**门铃投不进去**和**agent 停在选择框上**这两件在角色表里都看不见。
+**看板只读**：不投递、不改状态、不新增事实来源（「状态是文件，不是看板」这条不变）。
 
 ## 升级 xteam 之后，正在跑的 agent 怎么跟上
 

@@ -105,6 +105,8 @@ from xteam_lib import (  # noqa: E402
     suggest_kinds,
     subagent_capability,
     PASTE_CHIP_LINES,
+    render_board,
+    detect_choice_prompt,
 )
 
 FAILURES: list[str] = []
@@ -4011,6 +4013,43 @@ def test_doorbell_guards_human_draft_and_retries_enter() -> None:
     check("认不出的 kind 返回 status", res.startswith("status="), True)
 
 
+def test_render_board_and_choice_detector() -> None:
+    print("\n[95] 看板渲染 + 选择题识别（纯函数，不碰 herdr）")
+    state = {
+        "title": "xteam board  T  'demo'  /tmp/demo  （xteam 0.2.8）",
+        "roles": [
+            {"role": "pm", "status": "working", "held": "5m10s",
+             "owes": "next-slice", "where": "console +14", "box": "empty"},
+            {"role": "tl", "status": "blocked", "held": "3m10s",
+             "owes": "none", "where": "", "box": "draft"},
+        ],
+        "alerts": ["⚠ tl 停在选择框上（等你答，不是做完）"],
+        "slices": [{"name": "console-ui-commit", "stage": "settling",
+                    "note": "未开工  pm:settle"}],
+        "events": ["10-07 23:07:26 BLOCKED-ANSWER tl …"],
+    }
+    frame = render_board(state)
+    check("标题在", "xteam board" in frame, True)
+    check("角色行带义务与在哪", "next-slice @ console +14" in frame, True)
+    check("输入框有草稿会标出来", "✍ 输入框有草稿" in frame, True)
+    check("链路块在", "链路（为什么不动）" in frame, True)
+    check("链路块带原因", "停在选择框上" in frame, True)
+    check("切片块带阶段", "[settling]" in frame, True)
+    check("事件块在", "BLOCKED-ANSWER" in frame, True)
+    check("不上色时没有 ANSI", "\033[" in frame, False)
+    check("上色时有 ANSI", "\033[" in render_board(state, color=True), True)
+    check("空状态不炸", render_board({}).splitlines()[0], "xteam board")
+    check("没有角色时说清是空的",
+          "（没有在跑的角色）" in render_board({"roles": []}), True)
+
+    # 实测形状：omp 的多选框（android_dev 里 tl 停的那个）。
+    choice_tail = ("|   [ ] 应用管理                        |\n"
+                   "|   [ ] Other (type your own)           |\n"
+                   "| Space toggle · Enter next · Up/Down move · Esc cancel |\n")
+    check("omp 的选择框 → 认出来", detect_choice_prompt(choice_tail), True)
+    check("普通输出 → 不误判", detect_choice_prompt("正在跑测试…\n"), False)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4109,6 +4148,7 @@ def main() -> int:
         test_subagent_capability_table_is_verified_only,
         test_box_state_reads_omp_input_line,
         test_doorbell_guards_human_draft_and_retries_enter,
+        test_render_board_and_choice_detector,
     ):
         fn()
     print()

@@ -1806,6 +1806,21 @@ assert_has "MP-33.3 报的是已投递" "已投递"
 [ "$(grep -c '^╰─$' "$BASE/mp33.tail")" = "1" ] \
   && ok "MP-33.3 提交后输入框回到空框" || bad "MP-33.3 输入框还残留" "$(cat "$BASE/mp33.tail")"
 
+# 态 4：一屏看板 —— 必须把「为什么不动」摆出来（这里是草稿挡住门铃）。
+printf '╰─ txt #2\n' > "$BASE/mp33.tail"
+run xin33 "$T" board --once
+assert_rc  "MP-33.4 board --once rc=0" 0
+assert_has "MP-33.4 有角色表" "── 角色"
+assert_has "MP-33.4 报出草稿挡住门铃" "门铃投不进去"
+assert_has "MP-33.4 有切片块" "── 切片"
+
+# 态 5：agent 停在选择框上 → 面板必须说清是「等你答」，不是「无响应」。
+printf '|   [ ] 应用管理   |\n| Space toggle · Enter next · Esc cancel |\n' \
+  > "$BASE/mp33.tail"
+run xin33 "$T" status
+assert_rc  "MP-33.5 status rc=0" 0
+assert_has "MP-33.5 报出停在选择框上" "停在选择框上"
+
 # ---------------------------------------------------------------- 收尾
 printf '\n'
 printf '%s/%s 通过\n' "$PASS" "$TOTAL"
