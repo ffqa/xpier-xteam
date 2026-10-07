@@ -957,6 +957,96 @@ assert_line "MP-21.3 pm 行不含 report（不挤掉）" "pm " "" "report"
 
 # MP-21.4 回归：MP-12~MP-20 断言继续全过即自动满足（末行 N/N）。
 
+# ---------------------------------------------------------------- MP-22
+step "MP-22" "say 复核窗口：无占位符两轮复核，mid-turn 排队不误报未送达"
+
+T="$BASE/mp22"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-22.0 init 布景 rc=0" 0
+
+# 有状态替身（spec §2.1 钉的形状）：dev 的 agent_status 由 agent list 调用
+# 次数翻转——CNT>=FLIP_AT 才 working（第 2 轮复核才转 = mid-turn 排队提交）；
+# pane send-keys 落 MARK 也让 dev 转 working（补 enter 后真提交）；
+# PROMPT_FAIL=1 时 agent prompt 退出码非 0。
+mkdir -p "$BASE/bin22"
+cat > "$BASE/bin22/herdr" <<'EOF'
+#!/bin/sh
+{ printf '%s %s %s\n' "$1" "$2" "$3"; } >> "$LOGF"
+N=$(cat "$CNT" 2>/dev/null || echo 0)
+if [ "$1 $2" = "agent list" ]; then N=$((N+1)); echo "$N" > "$CNT"; fi
+if [ -f "$MARK" ] || [ "$N" -ge "${FLIP_AT:-999}" ]; then ST=working; else ST=done; fi
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wQ","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wQ:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wQ:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"},{"pane_id":"wQ:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"},{"pane_id":"wQ:p3","name":"dev-'"$LABEL"'","agent_status":"'"$ST"'","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wQ:p1","cwd":"'"$ROOT"'"},{"pane_id":"wQ:p2","cwd":"'"$ROOT"'"},{"pane_id":"wQ:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  "agent prompt")   if [ -n "$PROMPT_FAIL" ]; then printf 'boom\n' >&2; exit 1; fi; : ;;
+  "pane read")      cat "$TAIL" ;;
+  "pane send-keys") touch "$MARK"; printf '%s\n' '{"result": {}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin22/herdr"
+xin22() {
+  local t="$1" tail="$2"; shift 2
+  (cd "$t" && PATH="$BASE/bin22:$PATH" LABEL=mp22 ROOT="$t" \
+    CNT="$BASE/mp22.cnt" MARK="$BASE/mp22.mark" LOGF="$BASE/mp22.log" \
+    TAIL="$tail" FLIP_AT="${FLIP_AT:-999}" PROMPT_FAIL="${PROMPT_FAIL:-}" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp22 "$@" </dev/null)
+}
+reset22() { rm -f "$BASE/mp22.cnt" "$BASE/mp22.mark" "$BASE/mp22.log"; }
+
+# MP-22.1：mid-turn——prompt 成功、尾巴无占位符、第 2 轮复核才转 working。
+# 调用序列钉死：role_map(#1)/doorbell prev(#2)/复核轮1(#3) 都 done，
+# 轮2(#4) 才 working → 不得报未送达。
+reset22
+FLIP_AT=4 run xin22 "$T" "$BASE/tailB.txt" say dev "x"
+assert_rc "MP-22.1 mid-turn say rc=0（不报假失败）" 0
+printf '%s' "$LAST_OUT" | grep -qF '未送达' \
+  && bad "MP-22.1 第2轮转working仍报未送达" "$LAST_OUT" \
+  || ok  "MP-22.1 输出不含未送达"
+assert_has "MP-22.1 主行含 已送达（" "已送达（"
+[ "$(grep -c 'agent list' "$BASE/mp22.log")" -ge 4 ] \
+  && ok  "MP-22.1 第 2 轮复核真的查了 agent list" \
+  || bad "MP-22.1 缺第 2 轮复核" "$(cat "$BASE/mp22.log")"
+
+# MP-22.2：真失败——agent prompt 直接失败。
+# 注：spec 表写「含 未送达」，但 prompt-failed 是 F-5 §2.2 冻结的第三种渲染
+# （主行 prompt-failed:… + stderr 投递失败），禁区不许改其逐字格式——
+# 按冻结格式断言，实质（真失败必须报 + rc≠0）保留。
+reset22
+LAST_OUT="$(PROMPT_FAIL=1 xin22 "$T" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp22.err")"; LAST_RC=$?
+assert_rc "MP-22.2 prompt 失败 rc≠0" nz
+printf '%s' "$LAST_OUT" | grep -qF 'prompt-failed' \
+  && ok  "MP-22.2 主行含 prompt-failed（冻结格式）" \
+  || bad "MP-22.2 主行缺 prompt-failed" "$LAST_OUT"
+grep -qF '投递失败' "$BASE/mp22.err" \
+  && ok  "MP-22.2 stderr 含投递失败" \
+  || bad "MP-22.2 stderr 缺投递失败" "$(cat "$BASE/mp22.err")"
+
+# MP-22.3：真失败——prompt 成功但两轮都不动（恒 done）、无占位符。
+reset22
+LAST_OUT="$(FLIP_AT=999 xin22 "$T" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp22.err")"; LAST_RC=$?
+assert_rc "MP-22.3 两轮不动 rc≠0" nz
+assert_has "MP-22.3 主行含 未送达（" "未送达（"
+grep -qF '未送达' "$BASE/mp22.err" \
+  && ok  "MP-22.3 stderr 含未送达" \
+  || bad "MP-22.3 stderr 缺未送达" "$(cat "$BASE/mp22.err")"
+printf '%s' "$(cat "$BASE/mp22.log")" | grep -qF 'pane send-keys' \
+  && bad "MP-22.3 无占位符还抢了回车" "$(cat "$BASE/mp22.log")" \
+  || ok  "MP-22.3 无 send-keys（不抢按回车）"
+
+# MP-22.4：F-5 不回退——有占位符仍恰补一次 enter 并报已送达。
+reset22
+FLIP_AT=999 run xin22 "$T" "$BASE/tailC.txt" say dev "x"
+assert_rc "MP-22.4 占位符 say rc=0" 0
+assert_has "MP-22.4 主行含 已送达（" "已送达（"
+[ "$(grep -c 'pane send-keys' "$BASE/mp22.log")" -eq 1 ] \
+  && ok  "MP-22.4 恰补一次 enter" \
+  || bad "MP-22.4 send-keys 次数异常" "$(cat "$BASE/mp22.log")"
+
+# MP-22.5 回归：MP-12~MP-21 断言继续全过即自动满足（末行 N/N）。
+
 # ---------------------------------------------------------------- 收尾
 printf '\n'
 printf '%s/%s 通过\n' "$PASS" "$TOTAL"

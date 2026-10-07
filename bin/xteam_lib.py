@@ -45,6 +45,11 @@ XTEAM_DIRNAME = ".xteam"
 # context 偏高触发的 recap 冷却（秒）—— 没有它，巡检每 60 秒问一遍。
 RECAP_CONTEXT_COOLDOWN = 1800
 
+# say 送达复核窗口（秒）：第 1 轮非 working 且尾巴无排队占位符时，隔这么久
+# 再查第 2 轮。mid-turn 的目标把门铃文本排进 TUI 队列、回合结束才提交，
+# 只查一轮必然把「已排队待提交」误报成未送达。不许为 0——为 0 等于没给第二次机会。
+SAY_RECHECK_S = 1
+
 IDLE_ALERT_SECS = 600        # 非活动满多久开始门铃
 IDLE_ESCALATE_SECS = 1800    # 门铃后仍无反应，再升级一次
 WAITING_GRACE_SECS = 1800    # 角色声明「在等人类」后多久内免打扰

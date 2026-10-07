@@ -3012,6 +3012,86 @@ def test_status_merges_overall_synthetic_debts() -> None:
     check("合并前取了 overall_debts", "overall = proto.overall_debts()" in src, True)
 
 
+def test_say_recheck_window() -> None:
+    print("\n[76] say 复核窗口：无占位符两轮复核，mid-turn 不误报（F-14 口径）")
+    import argparse
+    import contextlib
+    import io
+    import tempfile
+    import xteam_lib as _lib
+
+    BUSY = " ● Thinking · 15m 29s\n"
+
+    class FlipHerdr:
+        """agent_status 按调用次数翻转：第 flip_at 次起返回 working。"""
+        def __init__(self, flip_at: int) -> None:
+            self._flip_at = flip_at
+            self.calls: list = []
+        def agent_status(self, pane_id: str) -> str:
+            self.calls.append("agent_status")
+            return "working" if len(self.calls) >= self._flip_at else "done"
+        def read_pane(self, pane_id: str, lines: int = 60) -> str:
+            self.calls.append("read_pane")
+            return BUSY
+        def _run(self, *args):
+            self.calls.append(" ".join(args))
+            return {}
+
+    # 常量钉死：具名、非零、bin/xteam 与 lib 是同一份（spec §2.1 复核窗口）。
+    check("SAY_RECHECK_S 具名且非零", _lib.SAY_RECHECK_S > 0, True)
+    check("bin/xteam 用的是同一个常量", _cli.SAY_RECHECK_S, _lib.SAY_RECHECK_S)
+
+    # 单测不真睡（窗口存在由 e2e 计时证明），临时缩小复核间隔，跑完恢复。
+    real = _cli.SAY_RECHECK_S
+    _cli.SAY_RECHECK_S = 0.01
+    try:
+        # mid-turn：第 2 轮复核才转 working → 送达（修复前只有 1 轮必然误报）。
+        h = FlipHerdr(2)
+        check("第2轮转working → 送达", _cli._confirm_delivery(h, "p3"),
+              (True, "working", False))
+        check("复核序列 = status/读尾巴/status（无 send-keys）",
+              h.calls, ["agent_status", "read_pane", "agent_status"])
+
+        # 两轮都不动 → 未送达（真失败仍要报）。
+        h = FlipHerdr(999)
+        check("两轮皆done → 未送达", _cli._confirm_delivery(h, "p3"),
+              (False, "done", False))
+        check("未送达也查了第 2 轮",
+              h.calls, ["agent_status", "read_pane", "agent_status"])
+    finally:
+        _cli.SAY_RECHECK_S = real
+
+    # prompt 失败走冻结的 prompt-failed 分支（F-5 §2.2 第三种渲染），rc=1。
+    class FailHerdr:
+        def __init__(self, scope=None) -> None:
+            pass
+        def find_workspace(self, label):
+            return {"workspace_id": "wQ"}
+        def role_map(self, workspace_id):
+            return {"dev": {"pane_id": "wQ:p3"}}
+        def doorbell(self, pane, message, wait_s=0.0):
+            return "prompt-failed: boom"
+
+    real_herdr = _cli.Herdr
+    _cli.Herdr = FailHerdr
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / ".xteam").mkdir()
+            args = argparse.Namespace(project=td, workspace="w1",
+                                      role="dev", message="x", settle=0)
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                 contextlib.redirect_stderr(err):
+                rc = _cli.cmd_say(args)
+            check("prompt失败 rc=1（不吞成成功）", rc, 1)
+            check("prompt失败主行含 prompt-failed（冻结格式）",
+                  "prompt-failed" in out.getvalue(), True)
+            check("prompt失败 stderr 含投递失败",
+                  "投递失败" in err.getvalue(), True)
+    finally:
+        _cli.Herdr = real_herdr
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -3089,6 +3169,7 @@ def main() -> int:
         test_recap_asked_set_converges,
         test_unstarted_queue_gate_for_pm_nags,
         test_status_merges_overall_synthetic_debts,
+        test_say_recheck_window,
     ):
         fn()
     print()

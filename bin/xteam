@@ -52,6 +52,7 @@ from xteam_lib import (  # noqa: E402
     fmt_duration,
     latest_recap,
     RECAP_CONTEXT_COOLDOWN,
+    SAY_RECHECK_S,
     roles_touched_task,
     list_models,
     search_models,
@@ -1642,6 +1643,10 @@ def _confirm_delivery(herdr: Herdr, pane: str) -> tuple[bool, str, bool]:
     `❭ Press Enter to send queued messages now`（= 输入行为空）才补一次
     send-keys enter 再复核；输入行有内容时不抢按回车——会把用户打了一半的
     字一起提交（Herdr.doorbell() 注释钉的那条实测）。
+
+    无占位符也不一轮定死：mid-turn 的目标会把门铃排进 TUI 队列、回合结束才
+    提交，第 1 轮没转 working 是常态——隔 SAY_RECHECK_S 再查第 2 轮，
+    两轮皆非 working 才算未送达。
     """
     cur = herdr.agent_status(pane)
     if cur == "working":
@@ -1651,7 +1656,9 @@ def _confirm_delivery(herdr: Herdr, pane: str) -> tuple[bool, str, bool]:
     except Exception:                            # noqa: BLE001
         tail = ""
     if "❭ Press Enter to send queued messages now" not in tail:
-        return False, cur, False
+        time.sleep(SAY_RECHECK_S)
+        cur = herdr.agent_status(pane)
+        return cur == "working", cur, False
     try:
         herdr._run("pane", "send-keys", pane, "enter")
     except RuntimeError:
