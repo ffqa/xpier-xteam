@@ -150,6 +150,26 @@ xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己�
 `xteam update` 只回答「有没有新的」，**不自动升级**：在你正跑着三个 pane 的时候换掉
 底下代码，而 pane 里那份上下文是按旧规则养成的。换成之后跑一次 `xteam sync` 即可。
 
+## 上下文重置（/new、/clear）之后，身份不丢
+
+长跑里 context 一定会满，而 `/new` / `/clear` 之后 agent **不该变成陌生人**。
+xteam 把两件事分开存：**身份**放系统提示词，**现状**放文件。
+
+| 你可能做的事 | 会发生什么 |
+|---|---|
+| 在 pane 里敲 `/new` 或 `/clear` | 身份仍在（见下）；下一条消息它会先跑 `xteam whoami` 把现状读回来 |
+| `xteam reopen pm` | 计划内的重开：先要 recap → `/new` → 身份与现状自动投回，**pane 和进程都不换** |
+| `xteam swap pm` | 换的是**进程**（能换 kind/model）；任何 kind 都能用，代价是重建 pane |
+| context 涨到 75% | 巡检落事件 + 响通知，建议你 `xteam reopen <角色>`（**不自动重开**：丢不丢对话里没落文件的推理，由你判断） |
+
+身份为什么清不掉（omp / pi，实测 2026-10-07）：xteam 起 agent 时带上
+`--append-system-prompt .xteam/identity/<角色>.md`（章程全文 + 一段「重置后先 whoami」
+的引导）。`/new` 换的是**会话**、`/clear` 丢的是**消息**，两者都动不了进程的系统提示词。
+其余 kind 没有这个 flag 时照旧把章程投进对话，并在每条门铃前自带一句身份与自检提醒。
+
+`xteam whoami` 是 agent 的看板视图：你欠什么义务、哪些切片没闭合、你上次的 recap 尾巴、
+时间线尾部、该读哪些文件 —— 不依赖 herdr，pane 全关着也能看。
+
 ## 默认跑在 omp 上，不是 opencode
 
 opencode 的交互 TUI **不认 `--model`**（实测 v2.0.20），只能吃它自己
@@ -229,6 +249,8 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam say pm "…"` | 门铃。之后只跟 pm 说话 |
 | `xteam status` | 谁在干什么、谁欠着活、每个状态从几点开始 |
 | `xteam stamp <角色> "…"` | 记一条共享时间线（`--waiting` 声明在等人类） |
+| `xteam whoami` | 我这个角色是谁、欠什么、上次做到哪（一屏）—— 上下文被清空后第一件事 |
+| `xteam reopen <角色>` | **原地重开**：recap → 新会话 → 身份与现状自动投回（context 快满时用） |
 | `xteam watch status\|once\|stop` | 巡检：状态 / 手动跑一轮 / 停 |
 | `xteam projects` | 治理了哪些项目、依赖关系、各自未闭合的活 |
 | `xteam swap <角色> <agent>` | 中途换 agent，不用重启整套 |

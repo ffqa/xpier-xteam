@@ -27,6 +27,7 @@
       closed.md      PM 写  本切片闭合
   session.json         xteam up 写的会话记录（workspace / pane 映射）
   team.json            角色用的 agent / model（可选，up 自动落盘）
+  identity/            <角色>.md：身份文件（挂进系统提示词，重置清不掉）
   watch/               巡检状态与事件
 ```
 
@@ -201,6 +202,26 @@ xteam say <role> "<短消息，一两句话指路>"
 - **返回码不代表已提交。** 目标非 `working` 时文本只进 TUI 队列，`xteam say` 已自动补
   `send-keys enter`。送达判据是对方 `agent_status` 转 `working`。
 - 角色名（`pm`/`tl`/`dev`）是唯一寻址物，**不要用 pane_id**——它跨 workspace 会重复。
+
+## 会话被重置之后（/new、/clear、压缩）
+
+身份**不在对话里，在系统提示词里**：omp 由 xteam 起进程时挂上
+`.xteam/identity/<你的角色>.md`（章程全文 + 重置后的自检引导）；没有这个 flag 的
+kind 由 xteam 投在对话里，且每条门铃自带一句身份提醒。重置清掉的是对话，
+清不掉身份 —— 但重置**会**让你丢掉现状。
+
+所以任何一次「感觉上下文是新的」（刚 `/new`、刚 `/clear`、被压缩过、被换人重开）：
+
+1. 先跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、你上次的 recap、时间线尾部；
+2. 还不够再读 `.xteam/PROTOCOL.md` 与 `.xteam/memory/*-recap.md`；
+3. **不要问「现在该做什么」** —— 答案在 whoami 的输出里，读完直接接手。
+
+人也可以让 xteam 把这件事做成流程：`xteam reopen <角色>` = 先要一份 recap →
+换一个干净的会话（**同一个 pane、同一个进程**）→ 身份与现状重新投回。
+context 涨到 75% 时巡检会提醒人做这件事（**不会自动做** —— 丢掉对话里还没落文件的
+推理值不值得，由人判断）。换 kind / 换 model 用 `xteam swap <角色>`。
+
+**要紧的结论先落文件**（工件 / recap / stamp），别只留在对话里 —— 对话是易失的。
 
 ## 输出写法（STE 精简版）
 

@@ -291,17 +291,123 @@ def tui_model_ok(kind: str) -> bool:
     return k in TUI_MODEL_OK
 
 
+# ---------------------------------------------------------------- 身份注入
+
+# 把角色身份**放进系统提示词**的 kind 表：kind → 追加系统提示词的 CLI flag。
+#
+# 存在的理由：`/new`、`/clear`、上下文压缩都清对话，**不清系统提示词**。
+# 身份（你是哪个角色、章程是什么、上下文没了先干什么）放这里，
+# 「会话一重置就失忆重来」这个前提就不成立了 —— 那正是长跑里最贵的故障：
+# 人一 /new，agent 退回「你好，请问要做什么」，整条协作链要重新解释一遍。
+#
+# **实测是唯一入选标准**（2026-10-07）：
+#   · omp 18.4.9：`herdr agent start … -- --append-system-prompt <file>` 起的 TUI，
+#     `/new`（换会话，会话文件路径随之变化）与 `/clear`（Context reset — N
+#     messages dropped; session continues）都清不掉这份身份；
+#   · pi：同一套 TUI（omp 是它的发行版），同样认这个 flag、同样扛过 `/new`。
+# 换 kind 进来之前同样要实测：起一个 pane 投这个 flag，/new 之后再问它
+# 「你是谁、该干什么」，答得出来才算。`xteam doctor --probe` 只管 --model，
+# 这条不在它的射程内。
+SYSTEM_PROMPT_ARG: dict[str, str] = {
+    "omp": "--append-system-prompt",
+    "pi": "--append-system-prompt",
+}
+
+# 原地开新会话的斜杠命令：kind → 命令。
+# 实测 omp / pi：`/new` 开新会话（omp 的 herdr `agent_session` 路径随之变化），
+# 而 `/clear` 只是「丢消息、会话继续」—— 重开要的是前者的效果。
+RESET_COMMAND: dict[str, str] = {"omp": "/new", "pi": "/new"}
+
+# 「新会话真的开了」的回执：omp 打 `[ok] New session started`，pi 打
+# `✓ New session started`。herdr 的 agent_session 只对 omp 这类 kind 提供，
+# 对 pi 没有 —— 所以做重开时这条回执是**兜底的生效判据**（数出现次数，
+# 不是「有没有」：TUI 的滚动区里可能留着上一次的）。
+RESET_EVIDENCE = "New session started"
+
+# context 占用超过这里就建议原地重开（`xteam reopen`）。为什么给人建议而不是
+# 自动重开：重开丢掉的正是对话里**还没落文件**的推理，值不值得丢由人判断；
+# 但提醒不能省 —— 上下文一满，agent 就开始「压缩之后凭印象干活」。
+REOPEN_ADVISE_PCT = 75
+REOPEN_ADVISE_COOLDOWN = 1800      # 同一角色两次提醒之间的最短间隔（秒）
+
+
+def identity_path(root: Path, role: str) -> Path:
+    """角色身份文件的落盘位置（.xteam/identity/<role>.md，随 .xteam 一起 gitignore）。"""
+    return root / XTEAM_DIRNAME / "identity" / f"{role}.md"
+
+
+IDENTITY_TEMPLATE = """\
+你是「{label}」项目的 {role}（{cn}）—— xteam 三 pane 协作（pm / tl / dev）的现任成员。
+项目根目录：{root}
+你在一个 pane 里运行（环境变量 XTEAM_ROLE={role}）。
+
+## 会话被重置之后（/new、/clear、上下文压缩、被换人重开）
+身份不会丢 —— 它就在这条系统提示词里；重置清掉的是对话，不是它。
+但**现状必须重新读**：你是进行中的项目里的 {role}，不是今天才接手。
+新会话的第一条消息处理之前：
+  1. 跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、你上次的 recap、时间线尾部
+  2. 还不够就读 `.xteam/PROTOCOL.md`（协议全文）与 `.xteam/memory/*-recap.md`
+  3. **不要问「现在该做什么」** —— 答案在 whoami 的输出里
+你会真的丢掉的只有对话细节。要紧的结论一律先落文件（工件 / recap / stamp），
+别只留在对话里 —— 对话是易失的，.xteam/ 不是。
+
+## 角色章程（全文，长期有效）
+{charter}
+"""
+
+
+def write_identity(root: Path, role: str, roles_dir: Path, label: str = "") -> Path:
+    """生成角色的「系统提示词版」身份文件，返回路径。
+
+    up / swap / reopen 都往这里写一份，再把路径挂进 agent 的启动参数
+    （SYSTEM_PROMPT_ARG），让身份常驻系统提示词。与 roles/<role>.md 的关系：
+    章程全文一字不动地附在后面，前面那段引导**只有这份文件才有** ——
+    告诉一个刚被清空上下文的 agent「你是谁、先跑 whoami、别问该做什么」。
+
+    roles_dir 由调用方给（和 stale_rules 一样）：资源目录的解析只有一个来源
+    （bin/xteam 的 `_find_root()`），这里不自己再推一遍。
+    """
+    charter_path = roles_dir / f"{role}.md"
+    charter = charter_path.read_text(encoding="utf-8") if charter_path.exists() else ""
+    cn = ROLES.get(role, ("", ""))[1]           # 未知角色给空中文名，不炸
+    text = IDENTITY_TEMPLATE.format(label=label or root.name, role=role,
+                                    cn=cn, root=root, charter=charter)
+    path = identity_path(root, role)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def context_hint(role: str, kind: str) -> str:
+    """门铃前缀：给「身份不在系统提示词里」的 kind 补一句身份与自检提示。
+
+    支持的 kind 返回空串 —— 它们的身份常驻系统提示词，每条门铃再贴一遍只是
+    噪音。不支持的 kind（身份只能投在对话里）必须贴：人一 /new，那不是
+    「忘了一点」，是**全部忘光**，连自己是谁都不知道。
+    """
+    if kind in SYSTEM_PROMPT_ARG:
+        return ""
+    return (f"【xteam】你是 {role}。若上下文是新的（/new、/clear、压缩之后）："
+            f"先跑 `xteam whoami` 读现状，不要从头问。\n\n")
+
+
+def reset_command(kind: str) -> str:
+    """原地开新会话的命令；这个 kind 没有就返回空串（调用方转 `xteam swap`）。"""
+    return RESET_COMMAND.get(kind, "")
+
+
 # ---------------------------------------------------------------- 角色规格
 
 
 @dataclass(frozen=True)
 class RoleSpec:
-    """一个角色的启动规格：用什么 agent、什么模型。"""
+    """一个角色的启动规格：用什么 agent、什么模型、身份文件在哪。"""
 
     role: str
     kind: str          # herdr agent kind
     cn: str            # 中文名
     model: str = ""    # 模型名，写法由 kind 决定
+    identity: str = "" # 身份文件路径（走系统提示词注入的 kind 才有）
 
     def supports_tui_model(self) -> bool:
         # 走 tui_model_ok 而不是静态表 —— 否则 probe 验证过的 agent 会
@@ -314,9 +420,16 @@ class RoleSpec:
 
     def agent_args(self) -> list[str]:
         """传给 `herdr agent start -- <args>` 的参数。"""
-        if not self.model or not self.supports_tui_model():
-            return []
-        return ["--model", self.model]
+        args: list[str] = []
+        if self.model and self.supports_tui_model():
+            args += ["--model", self.model]
+        # 身份文件走系统提示词（kind 支持时）：/new、/clear、压缩都清不掉它。
+        # 不支持的 kind 维持原样 —— 它们的身份由 up/swap/reopen 投进对话，
+        # 门铃再补一句 context_hint 兜底。
+        flag = SYSTEM_PROMPT_ARG.get(self.kind, "")
+        if self.identity and flag:
+            args += [flag, self.identity]
+        return args
 
     def preflight(self, allow_openrouter: bool = False) -> None:
         """启动前把「起不来 / 会多花钱」讲清楚，别让它白等 120s 超时。"""
@@ -467,6 +580,18 @@ class Herdr:
             if agent.get("pane_id") == pane_id:
                 return str(agent.get("agent_status", "unknown"))
         return "absent"
+
+    def agent_session(self, pane_id: str) -> str:
+        """pane 当前会话的标识（herdr 只对部分 kind 提供，如 omp 的会话文件路径）。
+
+        用途是**判会话是否被换过**：`/new` 会换（新会话文件），`/clear` 不会
+        （丢消息、会话继续）—— 所以它只能证明「换了」，不能证明「没换」。
+        读不到（kind 不提供、agent 不在）返回空串，调用方自己决定怎么兜底。
+        """
+        for agent in self.agents():
+            if agent.get("pane_id") == pane_id:
+                return str((agent.get("agent_session") or {}).get("value") or "")
+        return ""
 
     def read_pane(self, pane_id: str, lines: int = 60) -> str:
         proc = subprocess.run([self.bin, "pane", "read", pane_id, "--lines", str(lines)],
@@ -913,10 +1038,16 @@ class Protocol:
         谁都不欠账，于是谁都不动，**人成了唯一的推进力**。
         """
         out: dict[str, list[str]] = {}
-        for t in self.all_tasks():
+        ns_label = self._next_slice_label()
+        for t in self._tasks_by_queue_order():
             for role, ob in self.debts(t).items():
-                out.setdefault(role, []).append(f"{t.name}:{ob}")
-        if not out.get("pm") and self._unstarted_items():
+                # next-slice 的标签指向「下一个未开工项」，不是产出它的那片
+                # 已闭合切片——闭合片名出现在催办里就是误导（F-20 证据 B）。
+                name = ns_label if ob == "next-slice" and ns_label else t.name
+                out.setdefault(role, []).append(f"{name}:{ob}")
+        if (not out.get("pm") and self._unstarted_items()
+                and not self.pending_gate_tasks()):
+            # 待判窗口内同样不催 PM 开新片——新片开工就是往判中的树上写东西。
             out["pm"] = ["(队列):start-next"]
         # **队列全闭合但 REPORT.md 缺失 → PM 欠 report。** 切片 closed 只意味
         # 「这片做完了」，而人类要的是「整个项目做完后能部署、能测试、有人接」。
@@ -1066,7 +1197,11 @@ class Protocol:
                 and not _verdict_passed(task)
                 and _verdict_delivery(task) >= _delivery_round(task)
             )
-            if not delivered or fail_pending:
+            # 「已交付未判」窗口开着时，其它切片不许开工：gate 必须判在一棵
+            # 可归因的树上，树里混进下一片的半成品 FAIL 就没法归因（F-16）。
+            # 待判片自己到不了这——delivered 且无对准它的 FAIL 才算 pending。
+            if (not delivered or fail_pending) \
+                    and not self.pending_gate_tasks():
                 out["dev"] = "implement"
             elif ((task / "verdict.json").exists()
                     and _verdict_round(task) != _consumed_round(task)):
@@ -1247,11 +1382,19 @@ class Protocol:
         return [t for t in self.open_tasks() if not self.deps_blocking(t)]
 
     def obligations(self) -> dict[str, list[tuple[str, str]]]:
-        """role -> [(task_slug, obligation_name), ...]。"""
+        """role -> [(task_slug, obligation_name), ...]。
+
+        任务按 QUEUE 序遍历（`_tasks_by_queue_order`）——同一角色多片可做时
+        `pending[0]` 取序号最小那片，不再被任务目录的字母序牵着走（F-20）；
+        `next-slice` 条目的 slug 指向队列第一个未开工项（`_next_slice_label`），
+        已闭合片名不进标签。"""
         found: dict[str, list[tuple[str, str]]] = {r: [] for r in DEFAULT_ROLES}
-        for task in self.all_tasks():
+        ns_label = self._next_slice_label()
+        for task in self._tasks_by_queue_order():
             for role, obligation in self.debts(task).items():
-                found[role].append((task.name, obligation))
+                slug = ns_label if obligation == "next-slice" and ns_label \
+                    else task.name
+                found[role].append((slug, obligation))
         return found
 
     # -- 队列 --
@@ -1298,11 +1441,79 @@ class Protocol:
                 if i["state"] not in ("done", "已闭合")
                 and not (self.tasks / i["slice"] / "spec.md").exists()]
 
+    def pending_gate_tasks(self) -> list[str]:
+        """「已交付未判」的切片名 —— delivered.json 在、这次交付还没被 verdict 覆盖。
+
+        窗口从 delivered.json 落盘开到 verdict.delivery 对准这次交付
+        （ready.json 有无不算数——交付即冻结，TL review 期间同样在窗口内）。
+        窗口存在时其它切片的 dev implement 义务不成立、overall 的 start-next
+        也不补：gate 必须判在一棵可归因的树上（F-16）。FAIL 已对准当前交付的
+        不算 pending——verdict 落地窗口就关了，fail_pending 照常走。
+        """
+        pending = []
+        for t in self.all_tasks():
+            if _is_closed(t) or not (t / "delivered.json").exists():
+                continue
+            if (not (t / "verdict.json").exists()
+                    or _verdict_delivery(t) < _delivery_round(t)):
+                pending.append(t.name)
+        return pending
+
+    def undispatched_tasks(self, now_ts: float | None = None) -> list[str]:
+        """request.md 落地却迟迟没人领的切片名 —— TL 拆完没门铃 dev 派发时
+        的机器兜底（F-23）。
+
+        判据只看文件事实：`request.md` 在 + `delivered.json` 不在 +
+        `request.md` 的 mtime 早于 now - `IDLE_ALERT_SECS`（沿用巡检既有
+        阈值 600s，不新增常量）。刚落地的（mtime 新）不点名——给 TL 留出
+        门铃的时间窗，不误报；closed 片与已交付片天然不算「没人领」。
+        """
+        now_ts = time.time() if now_ts is None else now_ts
+        out = []
+        for t in self._tasks_by_queue_order():
+            req = t / "request.md"
+            if _is_closed(t) or (t / "delivered.json").exists() \
+                    or not req.exists():
+                continue
+            try:
+                if req.stat().st_mtime < now_ts - IDLE_ALERT_SECS:
+                    out.append(t.name)
+            except OSError:
+                continue
+        return out
+
     def recommended_task(self) -> dict | None:
         for item in self.queue_items():
             if item["recommended"]:
                 return item
         return None
+
+    def _queue_order(self) -> dict[str, int]:
+        """QUEUE.md 的 切片名 → 序 映射（done 项也记序 —— 序是「谁先来」，
+        不是「做没做完」）。QUEUE 缺失/解析失败 → 空映射，调用方退回现状
+        （F-20/AC-5：解析坏了不许把 status 打死）。"""
+        try:
+            return {i["slice"]: i["order"] for i in self.queue_items()}
+        except Exception:                            # noqa: BLE001
+            return {}
+
+    def _tasks_by_queue_order(self) -> list[Path]:
+        """all_tasks() 按 QUEUE 序重排：有记序的按序号小在前，没记序的
+        （bench/临时布景）保持目录序缀后。义务**种类**一行不动——只改同一
+        角色多片可做时谁排第一（status/巡检取 pending[0]）。"""
+        order = self._queue_order()
+        return sorted(
+            self.all_tasks(),
+            key=lambda t: (t.name not in order,
+                           order.get(t.name, 0), t.name))
+
+    def _next_slice_label(self) -> str:
+        """`next-slice` 的标签：队列里**序号最小**的未开工项名
+        （`_unstarted_items` 的口径：state 未完成且无 spec.md）。
+        没有未开工项 → ""（此时 next-slice 本就发不出——debts() 已让位）。
+        已闭合切片的名字永不进标签。"""
+        items = sorted(self._unstarted_items(), key=lambda i: i["order"])
+        return items[0]["slice"] if items else ""
 
 
 OBLIGATIONS: dict[str, str] = {
@@ -1413,21 +1624,38 @@ def agent_catalog(installed: set[str] | None = None,
         "",
         "验证某个 agent 认不认 --model：xteam doctor --probe <kind> --model <模型名>",
         "查可用模型：devin models / opencode models / omp models",
+        "",
+        "身份注入（/new、/clear 之后身份不丢）："
+        + "、".join(sorted(SYSTEM_PROMPT_ARG))
+        + " —— 起进程时带 " + "、".join(sorted(set(SYSTEM_PROMPT_ARG.values())))
+        + "，实测过的才在表里。",
+        "  别的 kind 想加进来必须自己实测一遍：起一个 pane 投这个 flag，"
+        "/new 之后再问它「你是谁」，答得出才算。",
     ]
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- context 感知
 
-# pane 状态栏里 context 占用的两种格式（实测）：
+# pane 状态栏里 context 占用的四种格式（实测）：
 #   opencode:  "392.8K (37%)"
 #   devin:     "168k / 262k tokens (64%)"
+#   omp:       "…> $1.18 >----------------------------51%---------------|-------1M-"
+#              （进度条：百分号夹在横杠里，右边跟 `|` + 该模型的窗口上限；
+#                实测 2026-10-07 omp 18.4.9。小数会出现：新会话显示 "-0.7%"）
+#   pi:        "… $0.025 (sub) 2.6%/500k (auto)"      （占用 / 窗口上限）
 # herdr 的 agent list **不暴露 token 字段**，只能从 pane 可见文本解析；
 # 而 pane read 对 working 中的 agent 会拒绝——所以只在 idle 时采样，正好符合
 # 「一个切片做完了才想 recap」的使用场景。
+#
+# omp / pi 这两条是补的：前两条（opencode/devin）都要求**带括号**，而它们不带，
+# 于是 `_maybe_request_recap` 的 context 分支在默认 agent 上从来不触发 ——
+# 一个只在别的 kind 上工作的阈值等于没有。
 CONTEXT_PCT_PATTERNS = (
     re.compile(r"([0-9.]+[KMG]?)\s*\(\s*([0-9]+)%\s*\)"),
     re.compile(r"([0-9.]+[kKmM]?)\s*/\s*([0-9.]+[kKmM]?)\s*tokens\s*\(\s*([0-9]+)%\s*\)"),
+    re.compile(r"([0-9]+(?:\.[0-9]+)?)%[-─—]*\|[-─—\s]*[0-9.]+[KMG]?"),
+    re.compile(r"([0-9]+(?:\.[0-9]+)?)%/[0-9.]+[kKmM]?"),
 )
 
 
@@ -1436,7 +1664,12 @@ def parse_context_pct(pane_text: str) -> int | None:
     for pat in CONTEXT_PCT_PATTERNS:
         m = pat.search(pane_text)
         if m:
-            return int(m.group(m.lastindex))
+            try:
+                # float 先过一道：omp 的进度条会显示小数（"-0.7%"），
+                # int("0.7") 会抛 ValueError，把「解析不了」变成崩。
+                return int(float(m.group(m.lastindex)))
+            except ValueError:
+                continue
     return None
 
 

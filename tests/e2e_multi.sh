@@ -590,25 +590,31 @@ AL="$(printf '%s\n' "$LOG" | grep -nF 'agent list' | tail -1 | cut -d: -f1)"
   || bad "MP-16.2 补 enter 后缺复核" "$LOG"
 assert_has "MP-16.3 主行含 已送达（" "已送达（"
 
-# 布景 B：dev 一开始就 working → 不读尾巴不补 enter（已送达，不许画蛇添足）。
+# 布景 B：dev 一开始就 working（mid-turn）+ 尾巴有排队占位符 → v3/AC-8：
+# 已 working 也要读一次尾巴，占位符在就补一次 enter 再复核。
 reset16 working
 run xin16 "$T" "$BASE/tailC.txt" "$BASE/tailB.txt" say dev "x"
 assert_rc  "MP-16.4 布景B rc=0" 0
 assert_has "MP-16.4 主行含 已送达（" "已送达（"
-printf '%s' "$(cat "$BASE/mp16.log")" | grep -qF 'pane send-keys' \
-  && bad "MP-16.4 已 working 还补了 enter" "$(cat "$BASE/mp16.log")" \
-  || ok  "MP-16.4 无 send-keys（不画蛇添足）"
+[ "$(grep -c 'pane send-keys' "$BASE/mp16.log")" -eq 1 ] \
+  && ok  "MP-16.4 mid-turn+占位符恰补一次 enter" \
+  || bad "MP-16.4 mid-turn 门铃排队没补 enter" "$(cat "$BASE/mp16.log")"
 
-# 布景 C：dev done + 尾巴 B（无占位符=输入行可能有内容）→ 不补，报未送达。
+# 布景 C：dev done + 尾巴 B（无占位符=输入行可能有内容）→ 不补；
+# prompt 已成功 → 「已投递·未确认」rc=0（F-19：不再报未送达假阴性）。
 reset16 done
 # 需要分开看 stdout/stderr，不能用 run()（它把 2>&1 合并了）。
 # LAST_OUT=$(...) 这条赋值语句本身的 $? 就是命令的 rc——必须紧接着取。
 LAST_OUT="$(xin16 "$T" "$BASE/tailB.txt" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp16.err")"; LAST_RC=$?
-assert_rc  "MP-16.5 布景C rc≠0" nz
-assert_has "MP-16.5 主行含 未送达（" "未送达（"
+assert_rc  "MP-16.5 布景C rc=0（已投递非失败）" 0
+assert_has "MP-16.5 主行含 已投递" "已投递"
+assert_has "MP-16.5 主行含 未确认" "未确认"
+printf '%s' "$LAST_OUT" | grep -qF '未送达' \
+  && bad "MP-16.5 还在报未送达" "$LAST_OUT" \
+  || ok  "MP-16.5 stdout 不含未送达"
 grep -qF '未送达' "$BASE/mp16.err" \
-  && ok  "MP-16.5 stderr 含未送达" \
-  || bad "MP-16.5 stderr 缺未送达" "$(cat "$BASE/mp16.err")"
+  && bad "MP-16.5 stderr 含未送达" "$(cat "$BASE/mp16.err")" \
+  || ok  "MP-16.5 stderr 不含未送达"
 printf '%s' "$(cat "$BASE/mp16.log")" | grep -qF 'pane send-keys' \
   && bad "MP-16.5 无占位符还抢了回车" "$(cat "$BASE/mp16.log")" \
   || ok  "MP-16.5 无 send-keys（不抢按回车）"
@@ -1024,14 +1030,18 @@ grep -qF '投递失败' "$BASE/mp22.err" \
   && ok  "MP-22.2 stderr 含投递失败" \
   || bad "MP-22.2 stderr 缺投递失败" "$(cat "$BASE/mp22.err")"
 
-# MP-22.3：真失败——prompt 成功但两轮都不动（恒 done）、无占位符。
+# MP-22.3：prompt 成功但两轮都不动（恒 done）、无占位符 → F-19 新态：
+# 「已投递·未确认」rc=0（消息进了 pane，没看到它开始跑≠失败）。
 reset22
 LAST_OUT="$(FLIP_AT=999 xin22 "$T" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp22.err")"; LAST_RC=$?
-assert_rc "MP-22.3 两轮不动 rc≠0" nz
-assert_has "MP-22.3 主行含 未送达（" "未送达（"
+assert_rc "MP-22.3 两轮不动 rc=0" 0
+assert_has "MP-22.3 主行含 已投递·未确认" "已投递·未确认"
+printf '%s' "$LAST_OUT" | grep -qF '未送达' \
+  && bad "MP-22.3 还在报未送达" "$LAST_OUT" \
+  || ok  "MP-22.3 stdout 不含未送达"
 grep -qF '未送达' "$BASE/mp22.err" \
-  && ok  "MP-22.3 stderr 含未送达" \
-  || bad "MP-22.3 stderr 缺未送达" "$(cat "$BASE/mp22.err")"
+  && bad "MP-22.3 stderr 含未送达" "$(cat "$BASE/mp22.err")" \
+  || ok  "MP-22.3 stderr 不含未送达"
 printf '%s' "$(cat "$BASE/mp22.log")" | grep -qF 'pane send-keys' \
   && bad "MP-22.3 无占位符还抢了回车" "$(cat "$BASE/mp22.log")" \
   || ok  "MP-22.3 无 send-keys（不抢按回车）"
@@ -1046,6 +1056,490 @@ assert_has "MP-22.4 主行含 已送达（" "已送达（"
   || bad "MP-22.4 send-keys 次数异常" "$(cat "$BASE/mp22.log")"
 
 # MP-22.5 回归：MP-12~MP-21 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-24
+step "MP-24" "已交付未判窗口冻结其它 implement；verdict 对准后恢复"
+
+T="$BASE/mp24"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-24.0 init 布景 rc=0" 0
+
+# 布景（spec §2.1）：a = 已交付未判（delivered+ready、无 verdict）→ 待 gate；
+# b = 只有 request.md → 修复前 dev 欠它的 implement。
+d="$T/.xteam/tasks/a"; mkdir -p "$d"
+printf '# spec\n'       > "$d/spec.md"
+printf '# request\n'    > "$d/request.md"
+printf '{"round":1}\n'    > "$d/delivered.json"
+printf '{"delivery":1}\n' > "$d/ready.json"
+d="$T/.xteam/tasks/b"; mkdir -p "$d"
+printf '# spec\n'    > "$d/spec.md"
+printf '# request\n' > "$d/request.md"
+
+# 替身：三 pane 恒 idle（同 MP-21 的静态形状），label 参数化。
+mkdir -p "$BASE/bin24"
+cat > "$BASE/bin24/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wG","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wG:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wG:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wG","tab_id":"wG:t1"},{"pane_id":"wG:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wG","tab_id":"wG:t1"},{"pane_id":"wG:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wG","tab_id":"wG:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wG:p1","cwd":"'"$ROOT"'"},{"pane_id":"wG:p2","cwd":"'"$ROOT"'"},{"pane_id":"wG:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin24/herdr"
+xin24() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin24:$PATH" LABEL=mp24 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp24 "$@" </dev/null)
+}
+
+# MP-24.1：窗口内 dev 不欠 B 的 implement + 提示行点名待判片；
+#         pm 的 gate 义务不动（它是关窗口的人）。
+run xin24 "$T" status
+assert_rc   "MP-24.1 status rc=0" 0
+assert_line "MP-24.1 dev 行 owes=none（冻结）" "dev " "none"
+assert_has  "MP-24.1 提示行含「待 gate」" "待 gate"
+assert_has  "MP-24.1 提示行点名 a" "待 gate：a"
+assert_line "MP-24.1 pm 行仍欠 gate a（窗口要有人关）" "pm " "gate"
+
+# MP-24.2：verdict 对准这次交付（+ consumed 静默该片）→ 窗口关，义务恢复。
+printf '{"round":1,"delivery":1,"verdict":"PASS"}\n' > "$T/.xteam/tasks/a/verdict.json"
+printf '{"round":1}\n' > "$T/.xteam/tasks/a/consumed.json"
+run xin24 "$T" status
+assert_rc   "MP-24.2 status rc=0" 0
+assert_line "MP-24.2 dev 行恢复 implement b" "dev " "implement"
+assert_line "MP-24.2 dev 行指向 b" "dev " "b"
+printf '%s' "$LAST_OUT" | grep -qF '待 gate' \
+  && bad "MP-24.2 窗口关了还提示待 gate" "$LAST_OUT" \
+  || ok  "MP-24.2 无待 gate 提示（不误挂）"
+
+# MP-24.3：没有待判片（只有 b 的 request.md）→ dev 欠 implement b（现状不变）。
+rm -rf "$T/.xteam/tasks/a"
+run xin24 "$T" status
+assert_rc   "MP-24.3 status rc=0" 0
+assert_line "MP-24.3 dev 行是 implement b（防回归）" "dev " "implement"
+printf '%s' "$LAST_OUT" | grep -qF '待 gate' \
+  && bad "MP-24.3 无待判片还提示待 gate" "$LAST_OUT" \
+  || ok  "MP-24.3 无待 gate 提示"
+
+# MP-24.4 回归：MP-12~MP-22 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-25
+step "MP-25" "doctor 报 PATH 上的 xteam 全命中；遮蔽警告+--version 提示（F-18）"
+
+T="$BASE/mp25"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-25.0 init 布景 rc=0" 0
+
+# 布景（spec §3 替身必须是 install.sh 生成格式，否则判定被带偏）：
+#   bin25a/xteam = 指向「另一份安装」的启动器（exec python3 <other>/lib/xteam）
+#   bin25b/xteam = 指向本仓库 bin/xteam 的软链（同一份安装的另一个入口）
+mkdir -p "$BASE/mp25_other/lib"
+printf '# impl of OTHER install\n' > "$BASE/mp25_other/lib/xteam"
+mkdir -p "$BASE/bin25a" "$BASE/bin25b" "$BASE/bin25empty"
+cat > "$BASE/bin25a/xteam" <<EOF
+#!/usr/bin/env bash
+export PM_TEAM_HOME="\${PM_TEAM_HOME:-$BASE/mp25_other/share/xteam}"
+exec python3 "$BASE/mp25_other/lib/xteam" "\$@"
+EOF
+chmod +x "$BASE/bin25a/xteam"
+ln -s "$REPO/bin/xteam" "$BASE/bin25b/xteam"
+
+# MP-25.1 遮蔽：PATH 第 1 份是另一份安装 → 两路径+警告+修复命令，rc 仍 0
+run env PATH="$BASE/bin25a:$BASE/bin25b:/usr/bin:/bin" \
+  python3 "$REPO/bin/xteam" --project "$T" doctor
+assert_rc  "MP-25.1 doctor rc=0（提示不是致命项）" 0
+assert_has "MP-25.1 有「PATH 上的 xteam」节" "PATH 上的 xteam"
+assert_line "MP-25.1 第 1 份=遮蔽源（顺序=优先级）" "1. " "bin25a/xteam"
+assert_has "MP-25.1 列出第 2 份（按优先级顺序）" "bin25b/xteam"
+assert_has "MP-25.1 报本次运行份" "$REPO/bin/xteam"
+assert_has "MP-25.1 警告含遮蔽路径" "遮蔽"
+assert_has "MP-25.1 警告含 mv 修复命令" 'mv "'
+
+run env PATH="$BASE/bin25a:$BASE/bin25b:/usr/bin:/bin" \
+  python3 "$REPO/bin/xteam" --version
+assert_rc  "MP-25.5 --version rc=0" 0
+assert_has "MP-25.5 遮蔽时多一行提示" "PATH 上的 xteam 是"
+assert_has "MP-25.5 提示含遮蔽路径" "bin25a/xteam"
+
+# MP-25.2 同一份安装：软链在前 → 不报遮蔽（不误报）
+run env PATH="$BASE/bin25b:/usr/bin:/bin" \
+  python3 "$REPO/bin/xteam" --project "$T" doctor
+assert_rc  "MP-25.2 doctor rc=0" 0
+assert_has "MP-25.2 节仍在（命中如实列出）" "bin25b/xteam"
+printf '%s' "$LAST_OUT" | grep -qF '遮蔽' \
+  && bad "MP-25.2 同一份安装误报遮蔽" "$LAST_OUT" \
+  || ok  "MP-25.2 同一份安装不报遮蔽"
+
+# MP-25.3 PATH 上只有一份=本次运行这份 → 不报
+run env PATH="$BASE/bin25empty:/usr/bin:/bin" \
+  python3 "$REPO/bin/xteam" --project "$T" doctor
+assert_rc  "MP-25.3 doctor rc=0" 0
+assert_has "MP-25.3 如实说 PATH 上没有" "PATH 上没有 xteam"
+printf '%s' "$LAST_OUT" | grep -qF '遮蔽' \
+  && bad "MP-25.3 无命中误报遮蔽" "$LAST_OUT" \
+  || ok  "MP-25.3 无命中不报遮蔽"
+
+# MP-25.4 --version 不遮蔽时逐字形状=改前 5 行且不含 ⚠
+run env PATH="$BASE/bin25b:/usr/bin:/bin" \
+  python3 "$REPO/bin/xteam" --version
+assert_rc "MP-25.4 --version rc=0" 0
+[ "$(printf '%s\n' "$LAST_OUT" | wc -l | tr -d ' ')" -eq 5 ] \
+  && ok "MP-25.4 仍是 5 行" \
+  || bad "MP-25.4 行数变了" "$LAST_OUT"
+printf '%s' "$LAST_OUT" | grep -qF '⚠' \
+  && bad "MP-25.4 不遮蔽却有 ⚠" "$LAST_OUT" \
+  || ok "MP-25.4 不含 ⚠"
+printf '%s\n' "$LAST_OUT" | grep -qE '^xteam [0-9]+\.[0-9]+\.[0-9]+' \
+  && ok "MP-25.4 首行版本号形状不变" \
+  || bad "MP-25.4 首行变了" "$LAST_OUT"
+
+# MP-25.5 回归：MP-12~MP-24 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-26
+step "MP-26" "say 三态单值（已送达/已投递·未确认/投递失败）+ 墙钟与 T 无关（F-19）"
+
+T="$BASE/mp26"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-26.0 init 布景 rc=0" 0
+
+# 替身（三态可切）：agent prompt 记时刻 T0；dev 的 agent_status =
+#   FORCE_ST（恒 working/idle 预设）优先，否则 T0 起过 FLIP_S 秒才 working
+#   （默认 999 = 恒 idle）；MARK 由 send-keys 落；pane read 回 $TAIL。
+mkdir -p "$BASE/bin26"
+cat > "$BASE/bin26/herdr" <<'EOF'
+#!/bin/sh
+{ printf '%s %s %s' "$1" "$2" "$3"; [ "$2" = "send-keys" ] && printf ' %s' "$4"; printf '\n'; } >> "$LOGF"
+T0=$(cat "$T0F" 2>/dev/null || echo 0); NOW=$(date +%s)
+if [ -f "$MARK" ]; then ST=working
+elif [ -n "$FORCE_ST" ]; then ST="$FORCE_ST"
+elif [ "$T0" -gt 0 ] && [ $((NOW-T0)) -ge "${FLIP_S:-999}" ]; then ST=working
+else ST=idle; fi
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wV","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wV:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wV:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wV","tab_id":"wV:t1"},{"pane_id":"wV:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wV","tab_id":"wV:t1"},{"pane_id":"wV:p3","name":"dev-'"$LABEL"'","agent_status":"'"$ST"'","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wV","tab_id":"wV:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wV:p1","cwd":"'"$ROOT"'"},{"pane_id":"wV:p2","cwd":"'"$ROOT"'"},{"pane_id":"wV:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  "agent prompt")   date +%s > "$T0F"; if [ -n "$PROMPT_FAIL" ]; then printf 'boom\n' >&2; exit 1; fi; : ;;
+  "pane read")      cat "$TAIL" ;;
+  "pane send-keys") touch "$MARK"; printf '%s\n' '{"result": {}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin26/herdr"
+xin26() {
+  local t="$1" tail="$2"; shift 2
+  (cd "$t" && PATH="$BASE/bin26:$PATH" LABEL=mp26 ROOT="$t" \
+    T0F="$BASE/mp26.t0" MARK="$BASE/mp26.mark" LOGF="$BASE/mp26.log" \
+    TAIL="$tail" FLIP_S="${FLIP_S:-999}" FORCE_ST="${FORCE_ST:-}" \
+    PROMPT_FAIL="${PROMPT_FAIL:-}" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp26 "$@" </dev/null)
+}
+reset26() { rm -f "$BASE/mp26.t0" "$BASE/mp26.mark" "$BASE/mp26.log" "$BASE/mp26.err"; }
+wall_s() { python3 -c 'import time,sys; t=float(sys.argv[1]); print(f"{time.time()-t:.1f}")' "$1"; }
+now_s()  { python3 -c 'import time; print(time.time())'; }
+
+# MP-26.1（AC-1）：目标立刻 working（FORCE_ST=working、尾巴无占位符）→ 已送达 rc0。
+reset26
+FORCE_ST=working run xin26 "$T" "$BASE/tailB.txt" say dev "x"
+assert_rc  "MP-26.1 立刻 working rc=0" 0
+assert_has "MP-26.1 主行含 已送达" "已送达（"
+printf '%s' "$(cat "$BASE/mp26.log")" | grep -qF 'pane send-keys' \
+  && bad "MP-26.1 输入行有内容还按了 enter（F-6 边界破了）" "$(cat "$BASE/mp26.log")" \
+  || ok  "MP-26.1(AC-9) 输入行有内容→无 send-keys"
+
+# MP-26.2（AC-2）：目标恒 idle → 「已投递·未确认」rc0，stdout/stderr 均无未送达。
+reset26
+T0=$(now_s)
+LAST_OUT="$(FLIP_S=999 xin26 "$T" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp26.err")"; LAST_RC=$?
+E2=$(wall_s "$T0")
+assert_rc  "MP-26.2 恒 idle rc=0" 0
+assert_has "MP-26.2 含 已投递" "已投递"
+assert_has "MP-26.2 含 未确认" "未确认"
+printf '%s' "$LAST_OUT" | grep -qE '未送达|已送达' \
+  && bad "MP-26.2 误报 未送达/已送达" "$LAST_OUT" \
+  || ok  "MP-26.2 单值措辞（不含未送达/已送达）"
+grep -qF '未送达' "$BASE/mp26.err" \
+  && bad "MP-26.2 stderr 含未送达" "$(cat "$BASE/mp26.err")" \
+  || ok  "MP-26.2 stderr 不含未送达"
+
+# MP-26.3（AC-3+AC-5）：延迟 3s 才 working（超出 1s 复核窗口）→ 已投递·未确认 rc0，
+# 墙钟 ≤6s 且与 T 无关（不睡等）。
+reset26
+T0=$(now_s)
+LAST_OUT="$(FLIP_S=3 xin26 "$T" "$BASE/tailB.txt" say dev "x" 2>/dev/null)"; LAST_RC=$?
+E3=$(wall_s "$T0")
+assert_rc  "MP-26.3 延迟3s rc=0" 0
+assert_has "MP-26.3 延迟3s 是已投递·未确认" "已投递·未确认"
+printf '%s' "$LAST_OUT" | grep -qF '已送达' \
+  && bad "MP-26.3 睡等目标翻状态了" "$LAST_OUT" \
+  || ok  "MP-26.3 不含已送达（没睡等）"
+
+reset26
+T0=$(now_s)
+LAST_OUT="$(FLIP_S=30 xin26 "$T" "$BASE/tailB.txt" say dev "x" 2>/dev/null)"; LAST_RC=$?
+E30=$(wall_s "$T0")
+assert_rc  "MP-26.3 T=30s rc=0" 0
+assert_has "MP-26.3 T=30s 同措辞" "已投递·未确认"
+DIFF=$(python3 -c "print(abs(float('$E3')-float('$E30')))")
+[ "$(python3 -c "print(float('$E3')<=6 and float('$E30')<=6)")" = "True" ] \
+  && ok  "MP-26.5 墙钟 T=3s:${E3}s / T=30s:${E30}s 均 ≤6s" \
+  || bad "MP-26.5 墙钟超 6s" "T=3s:${E3}s T=30s:${E30}s"
+[ "$(python3 -c "print(float('$DIFF')<=2)")" = "True" ] \
+  && ok  "MP-26.5 墙钟与 T 无关（差 ${DIFF}s ≤2s）" \
+  || bad "MP-26.5 墙钟随 T 变大" "T=3s:${E3}s T=30s:${E30}s"
+
+# MP-26.4（AC-4）：agent prompt 非 0 → 投递失败 rc=1（唯一真失败，不许降级）。
+reset26
+LAST_OUT="$(PROMPT_FAIL=1 xin26 "$T" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp26.err")"; LAST_RC=$?
+assert_rc "MP-26.4 prompt 失败 rc≠0" nz
+grep -qF '投递失败' "$BASE/mp26.err" \
+  && ok  "MP-26.4 stderr 含投递失败" \
+  || bad "MP-26.4 stderr 缺投递失败" "$(cat "$BASE/mp26.err")"
+
+# MP-26.6（AC-8）：目标 mid-turn（恒 working）+ 尾巴有占位符 → 必须读 pane
+# 补一次 enter 再复核。
+reset26
+FORCE_ST=working run xin26 "$T" "$BASE/tailC.txt" say dev "x"
+assert_rc  "MP-26.6 mid-turn+占位符 rc=0" 0
+assert_has "MP-26.6 主行含 已送达" "已送达（"
+[ "$(grep -c 'pane send-keys' "$BASE/mp26.log")" -eq 1 ] \
+  && ok  "MP-26.6(AC-8) mid-turn 占位符恰补一次 enter" \
+  || bad "MP-26.6(AC-8) mid-turn 排队门铃没补 enter" "$(cat "$BASE/mp26.log")"
+
+# MP-26.7 回归：MP-12~MP-25 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-27
+step "MP-27" "义务名按 QUEUE 序挑片 + next-slice 标签取首个 todo（F-20）"
+
+T="$BASE/mp27"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-27.0 init 布景 rc=0" 0
+
+# 布景（spec §3）：目录名与 QUEUE 序故意错开——aa-early 目录序在前、
+# zz-late 队列序在前；两片同处 spec v1（tl:assess），义务动词不是判据。
+for s in zz-late aa-early; do
+  d="$T/.xteam/tasks/$s"; mkdir -p "$d"
+  printf '# spec\n'       > "$d/spec.md"
+  printf '{"round":1}\n'  > "$d/spec.json"
+done
+printf '| 1 | zz-late | doing | |\n| 2 | aa-early | doing | |\n' \
+  >> "$T/.xteam/QUEUE.md"
+
+# 替身：三 pane 恒 idle（同 MP-24 的静态形状）。
+mkdir -p "$BASE/bin27"
+cat > "$BASE/bin27/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wH","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wH:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wH:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wH","tab_id":"wH:t1"},{"pane_id":"wH:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wH","tab_id":"wH:t1"},{"pane_id":"wH:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wH","tab_id":"wH:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wH:p1","cwd":"'"$ROOT"'"},{"pane_id":"wH:p2","cwd":"'"$ROOT"'"},{"pane_id":"wH:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin27/herdr"
+xin27() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin27:$PATH" LABEL=mp27 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp27 "$@" </dev/null)
+}
+
+# MP-27.1（AC-1/证据A）：错开序 → tl pending[0] = 队列序 1 的 zz-late，
+# 不是目录序在前的 aa-early。
+run xin27 "$T" status
+assert_rc   "MP-27.1 status rc=0" 0
+assert_line "MP-27.1 tl 行指向 zz-late（队列序）" "tl " "zz-late"
+assert_line "MP-27.1 tl 行不含 aa-early（目录序让位）" "tl " "" "aa-early"
+
+# MP-27.2（AC-2）：序与目录序一致 → 仍取 aa-early（行为不变，双向钉死）。
+printf '# 队列\n\n| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | aa-early | doing | |\n| 2 | zz-late | doing | |\n' \
+  > "$T/.xteam/QUEUE.md"
+run xin27 "$T" status
+assert_rc   "MP-27.2 status rc=0" 0
+assert_line "MP-27.2 tl 行指向 aa-early（一致序不变）" "tl " "aa-early"
+assert_line "MP-27.2 tl 行不含 zz-late" "tl " "" "zz-late"
+
+# MP-27.3（AC-3/证据B）：闭合片 done-old + 队列 todo 项 fresh-next（无目录
+# = 未开工）→ pm 的 next-slice 标签 = fresh-next；输出逐名 grep 无闭合片名。
+d="$T/.xteam/tasks/done-old"; mkdir -p "$d"
+printf '# spec\n'  > "$d/spec.md"
+printf 'closed\n'  > "$d/closed.md"
+printf '# 队列\n\n| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | done-old | done | |\n| 2 | fresh-next | todo | |\n' \
+  > "$T/.xteam/QUEUE.md"
+run xin27 "$T" status
+assert_rc   "MP-27.3 status rc=0" 0
+assert_line "MP-27.3 pm 行含 fresh-next（首个 todo 项）" "pm " "fresh-next"
+assert_line "MP-27.3 pm 行是 next-slice" "pm " "next-slice"
+printf '%s' "$LAST_OUT" | grep -qF 'done-old' \
+  && bad "MP-27.3 输出出现闭合片名 done-old" "$LAST_OUT" \
+  || ok  "MP-27.3 输出无闭合片名（逐名 grep）"
+
+# MP-27.4（AC-4）：队列全 done → 无未开工项 → next-slice 让位，PM 欠 report
+#（现状路径不变）。
+printf '# 队列\n\n| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | done-old | done | |\n' \
+  > "$T/.xteam/QUEUE.md"
+run xin27 "$T" status
+assert_rc   "MP-27.4 status rc=0" 0
+assert_line "MP-27.4 pm 行欠 report（让位路径不变）" "pm " "report"
+
+# MP-27.5（AC-5）：QUEUE 缺失 → 不崩，退回目录序；坏格式同样。
+rm "$T/.xteam/QUEUE.md"
+run xin27 "$T" status
+assert_rc   "MP-27.5 QUEUE 缺失 status rc=0" 0
+assert_line "MP-27.5 缺失时 tl 回退目录序 aa-early" "tl " "aa-early"
+printf '这不是表格\n???\n' > "$T/.xteam/QUEUE.md"
+run xin27 "$T" status
+assert_rc   "MP-27.5 坏 QUEUE status rc=0" 0
+assert_line "MP-27.5 坏格式 tl 仍回退目录序 aa-early" "tl " "aa-early"
+
+# MP-27.6 回归：MP-12~MP-26 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-28
+step "MP-28" "status 头部版本漂移警告：运行版 ≠ pane 部署版时报（F-21）"
+
+T="$BASE/mp28"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-28.0 init 布景 rc=0" 0
+
+# 替身：三 pane 恒 idle（同 MP-24/MP-27 的静态形状）。
+mkdir -p "$BASE/bin28"
+cat > "$BASE/bin28/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wI","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wI:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wI:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wI","tab_id":"wI:t1"},{"pane_id":"wI:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wI","tab_id":"wI:t1"},{"pane_id":"wI:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wI","tab_id":"wI:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wI:p1","cwd":"'"$ROOT"'"},{"pane_id":"wI:p2","cwd":"'"$ROOT"'"},{"pane_id":"wI:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin28/herdr"
+xin28() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin28:$PATH" LABEL=mp28 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp28 "$@" </dev/null)
+}
+REPOV="$(cat "$REPO/VERSION")"
+
+# MP-28.1（AC-1）：session.json 记 pane 版 0.0.1 → 警告行含两版本+修复指引。
+printf '{"workspace":"mp28","panes":{},"xteam_version":"0.0.1"}\n' \
+  > "$T/.xteam/session.json"
+run xin28 "$T" status
+assert_rc   "MP-28.1 status rc=0" 0
+assert_has  "MP-28.1 警告行含 pane 版 0.0.1" "pane 里投的是 0.0.1"
+assert_has  "MP-28.1 警告行含运行版 $REPOV" "xteam $REPOV"
+assert_has  "MP-28.1 警告行含修复指引" "xteam up"
+
+# MP-28.2（真实记录位）：session.json 无键、rules.json 记 0.0.1 → 同样警告
+#（up 实际把版本写在 rules.json——spec 写 session.json 是名义口径，两个都认）。
+printf '{"workspace":"mp28","panes":{}}\n' > "$T/.xteam/session.json"
+printf '{"xteam_version":"0.0.1"}\n'    > "$T/.xteam/rules.json"
+run xin28 "$T" status
+assert_rc   "MP-28.2 status rc=0" 0
+assert_has  "MP-28.2 警告行含 pane 版 0.0.1" "pane 里投的是 0.0.1"
+assert_has  "MP-28.2 警告行含运行版 $REPOV" "xteam $REPOV"
+assert_has  "MP-28.2 警告行含修复指引" "xteam up"
+
+# MP-28.3（AC-2）：两版本一致 → 无警告行（不制造噪音）。
+printf "{\"xteam_version\":\"$REPOV\"}\n" > "$T/.xteam/rules.json"
+run xin28 "$T" status
+assert_rc   "MP-28.3 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qF '版本漂移' \
+  && bad "MP-28.3 版本一致还打警告" "$LAST_OUT" \
+  || ok  "MP-28.3 一致→无警告行"
+
+# MP-28.4（AC-3）：session.json 无键 + rules.json 缺 → 不崩不警告。
+rm -f "$T/.xteam/rules.json"
+run xin28 "$T" status
+assert_rc   "MP-28.4 status rc=0（无版本记录）" 0
+printf '%s' "$LAST_OUT" | grep -qF '版本漂移' \
+  && bad "MP-28.4 无记录还打警告" "$LAST_OUT" \
+  || ok  "MP-28.4 无记录→无警告行"
+# session.json 整个缺失同样静默
+rm -f "$T/.xteam/session.json"
+run xin28 "$T" status
+assert_rc   "MP-28.4 session.json 缺失 rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qF '版本漂移' \
+  && bad "MP-28.4 session 缺失还打警告" "$LAST_OUT" \
+  || ok  "MP-28.4 session 缺失→无警告行"
+
+# MP-28.5 回归：MP-12~MP-27 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-29
+step "MP-29" "request 落地超阈值未交付 → status 点名 TL 派发（F-23）"
+
+T="$BASE/mp29"
+mkrepo "$T" app
+run xin "$T" init --repo-kind single
+assert_rc "MP-29.0 init 布景 rc=0" 0
+
+# 布景（spec §3）：stale-req 有 request.md、无 delivered.json；mtime 用
+# os.utime 拨回 601s 前模拟超阈值（不真实睡眠）。
+d="$T/.xteam/tasks/stale-req"; mkdir -p "$d"
+printf '# spec\n'    > "$d/spec.md"
+printf '# request\n' > "$d/request.md"
+python3 - "$d/request.md" <<'PY'
+import os, sys, time
+t = time.time() - 601
+os.utime(sys.argv[1], (t, t))
+PY
+
+# 替身：三 pane 恒 idle（同 MP-24/MP-28 的静态形状）。
+mkdir -p "$BASE/bin29"
+cat > "$BASE/bin29/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wJ","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wJ:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wJ:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wJ","tab_id":"wJ:t1"},{"pane_id":"wJ:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wJ","tab_id":"wJ:t1"},{"pane_id":"wJ:p3","name":"dev-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wJ","tab_id":"wJ:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wJ:p1","cwd":"'"$ROOT"'"},{"pane_id":"wJ:p2","cwd":"'"$ROOT"'"},{"pane_id":"wJ:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin29/herdr"
+xin29() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin29:$PATH" LABEL=mp29 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp29 "$@" </dev/null)
+}
+
+# MP-29.1（AC-1）：超阈值 → status 有提示行，点名 stale-req 去「派发」，
+# 且措辞是给 TL 的（「门铃 dev」），不是只把 implement 挂 dev 头上。
+run xin29 "$T" status
+assert_rc   "MP-29.1 status rc=0" 0
+assert_has  "MP-29.1 提示行在（派发超时）" "request 派发超时"
+assert_has  "MP-29.1 点名该片 stale-req" "stale-req"
+assert_has  "MP-29.1 含「派发」字样" "派发"
+assert_has  "MP-29.1 指向 TL 门铃 dev" "门铃 dev"
+
+# MP-29.2（AC-2）：mtime 拨回当前 → 未超阈值，提示行消失（不误报）。
+python3 - "$d/request.md" <<'PY'
+import os, sys, time
+t = time.time()
+os.utime(sys.argv[1], (t, t))
+PY
+run xin29 "$T" status
+assert_rc   "MP-29.2 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qF 'request 派发超时' \
+  && bad "MP-29.2 未超阈值还点名派发" "$LAST_OUT" \
+  || ok  "MP-29.2 刚落地不催（不误报）"
+
+# MP-29.3：已交付（delivered.json 在）→ 即使 mtime 老也不点名。
+python3 - "$d/request.md" <<'PY'
+import os, sys, time
+t = time.time() - 3600
+os.utime(sys.argv[1], (t, t))
+PY
+printf '{"round":1}\n' > "$d/delivered.json"
+run xin29 "$T" status
+assert_rc   "MP-29.3 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qF 'request 派发超时' \
+  && bad "MP-29.3 已交付还点名派发" "$LAST_OUT" \
+  || ok  "MP-29.3 已交付不点名"
+
+# MP-29.4 回归：MP-12~MP-28 断言继续全过即自动满足（末行 N/N）。
 
 # ---------------------------------------------------------------- 收尾
 printf '\n'

@@ -56,6 +56,7 @@ verify:
 	@echo '▸ 门禁前两层（静态 + 单测）'
 	@python3 tests/lint_names.py
 	@python3 tests/lint_shell.py install.sh tests/smoke.sh pack.sh brew-publish.sh tests/e2e_multi.sh
+	@bash tests/lint_release_tag.sh
 	@python3 -m py_compile bin/xteam bin/xteam_lib.py tests/test_protocol.py
 	@python3 tests/test_protocol.py | tail -2
 	@echo '▸ 多项目治理 e2e（tests/e2e_multi.sh，hermetic）'
@@ -112,14 +113,14 @@ release: verify
 	  if ! grep -qE "^[0-9]+\.[0-9]+\.[0-9]+$$" <<<"$${NEWV}"; then \
 	    echo "VERSION 不是 X.Y.Z 形式：$${NEWV}" >&2; exit 1; fi; \
 	  echo "▸ 打 tag 并推送"; \
-	  if git rev-parse "xteam-v${NEWV}" >/dev/null 2>&1; then \
-	    echo "  pack.sh 已经打过 xteam-v${NEWV}；强制对齐到当前 HEAD"; \
+	  if git rev-parse "xteam-v$${NEWV}" >/dev/null 2>&1; then \
+	    echo "  pack.sh 已经打过 xteam-v$${NEWV}；强制对齐到当前 HEAD"; \
 	  fi; \
-	  git tag -f -a "xteam-v${NEWV}" -m "release ${NEWV}" >/dev/null; \
-	  echo "  tag 指向 $$(git rev-parse --short "xteam-v${NEWV}^{commit}")"; \
+	  git tag -f -a "xteam-v$${NEWV}" -m "release $${NEWV}" >/dev/null; \
+	  echo "  tag 指向 $$(git rev-parse --short "xteam-v$${NEWV}^{commit}")"; \
 	  git push origin main; \
-	  git push --force origin "xteam-v${NEWV}"; \
-	  echo; echo "✓ tag xteam-v${NEWV} 已推送"; \
+	  git push --force origin "xteam-v$${NEWV}"; \
+	  echo; echo "✓ tag xteam-v$${NEWV} 已推送"; \
 	  echo "  CI 会接着：核对 tag 与 VERSION → 打包 → 建 Release → 更新 $(TAP)"; \
 	  echo "  看进度：gh run watch  （或 gh run list）"; \
 	  echo; echo "  发完后："; \

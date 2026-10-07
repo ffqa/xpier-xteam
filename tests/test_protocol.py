@@ -52,6 +52,7 @@ _cli = SourceFileLoader("xteam_cli", str(_find_cli())).load_module()
 _parse_options = _cli._parse_options
 
 from xteam_lib import (  # noqa: E402
+    IDLE_ALERT_SECS,
     RECAP_CONTEXT_COOLDOWN,
     DEFAULT_MODEL_HINT,
     HERDR_KINDS,
@@ -312,8 +313,8 @@ def test_all_closed_without_report_pm_owes_report() -> None:
             "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
             "| 1 | a | todo | |\n", encoding="utf-8")
         b3.advance_to("closed")
-        check("队列有活 + 闭合 → PM 欠 next-slice",
-              b3.proto.overall_debts().get("pm"), ["handoff:next-slice"])
+        check("队列有活 + 闭合 → PM 欠 next-slice（F-20：标签指首个未开工项，非闭合片名）",
+              b3.proto.overall_debts().get("pm"), ["a:next-slice"])
         check("此时不欠 report（还没到结项）",
               "report" in str(b3.proto.overall_debts().get("pm")), False)
         # 把队列标完 → 义务应当让位给 report，且 next-slice 消失（不是两条并存）
@@ -967,8 +968,9 @@ def test_index_summarizes_all_tasks() -> None:
         check("闭合后 stage=closed", idx["tasks"][0]["stage"], "closed")
         check("闭合后 open 归零", idx["counts"]["open"], 0)
         # 闭合后 PM 仍欠 next-slice（该开下一项了）——这是设计意图，不是残留
-        check("闭合后 PM 欠 next-slice（该派下一项）",
-              idx["owes"].get("pm"), ["a:next-slice"])
+        # F-20：标签指向队列第一个未开工项 b；闭合片名 a 永不进标签（证据 B）。
+        check("闭合后 PM 欠 next-slice（F-20：标签指下一项 b，非闭合片 a）",
+              idx["owes"].get("pm"), ["b:next-slice"])
         check("闭合后 tl/dev 无欠账",
               [r for r in idx["owes"] if r != "pm"], [])
 
@@ -1241,6 +1243,9 @@ def test_swap_guard_blocks_while_working() -> None:
     check("拦截理由说清代价", "正在做的上下文" in g("working", False), True)
     check("--force 放行", g("working", True), "")
     check("idle 直接放行", g("idle", False), "")
+    # done 和 idle 语义相同（herdr：都表示可以接受输入，区别只是看没看过）。
+    # 漏掉它 = 刚投完 intro 的 agent 会被自己的安全阀挡住，而它根本没在干活。
+    check("done 放行（= idle，只是没被看到过）", g("done", False), "")
     check("blocked 放行（它已停下，没什么可丢）", g("blocked", False), "")
     check("状态未知放行（不因读不到就挡住人）", g("unknown", False), "")
 
@@ -2799,11 +2804,21 @@ def test_confirm_delivery_conditional_enter() -> None:
             self.calls.append(" ".join(args))
             return {}
 
-    # 已经 working：直接算送达，不读尾巴不补 enter。
-    h = BellHerdr(["working"], {"p3": QUEUED})
-    check("已 working → 送达", _cli._confirm_delivery(h, "p3"),
-          (True, "working", False))
-    check("已 working 不读尾巴不补键", h.calls, ["agent_status"])
+    # 已 working + 占位符（v3/AC-8：mid-turn 时门铃是排队进 TUI 的，
+    # 必须读一次尾巴——占位符在就补一次 enter 再复核）。
+    h = BellHerdr(["working", "working"], {"p3": QUEUED})
+    check("已 working+占位符 → 补 enter 后送达",
+          _cli._confirm_delivery(h, "p3"), (True, "working", True))
+    check("序列=status/读尾巴/send-keys/status",
+          h.calls, ["agent_status", "read_pane",
+                    "pane send-keys p3 enter", "agent_status"])
+
+    # 已 working + 输入行有内容（无占位符）→ 不按 enter（F-6 边界）。
+    h = BellHerdr(["working"], {"p3": BUSY})
+    check("已 working+有内容 → 送达不补键",
+          _cli._confirm_delivery(h, "p3"), (True, "working", False))
+    check("序列=status/读尾巴（无 send-keys）",
+          h.calls, ["agent_status", "read_pane"])
 
     # done + 尾巴有占位符 → 补 enter → 复核转 working。
     h = BellHerdr(["done", "working"], {"p3": QUEUED})
@@ -3092,6 +3107,610 @@ def test_say_recheck_window() -> None:
         _cli.Herdr = real_herdr
 
 
+def test_gate_window_freezes_other_implement() -> None:
+    print("\n[77] 已交付未判窗口冻结其它 implement；verdict 对准恢复（F-16）")
+    b = Bench("a")
+    try:
+        # a 推进到已交付（无 ready/verdict）：TL review 期间同样是窗口。
+        b.advance_to("delivered")
+        tb = b.proto.tasks / "b"
+        tb.mkdir()
+        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        check("ready 未写也在窗口（交付即冻结）",
+              b.proto.pending_gate_tasks(), ["a"])
+        check("窗口内 b 的 implement 冻结（dev 不欠）", b.owes("dev"), [])
+        check("tl 仍欠 chase（窗口要有人关）", b.owes("tl"), ["chase"])
+        # start-next 同条件冻结：队列放未开工项且 PM 无 per-task 债也不补。
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | q1 | todo | |\n",
+            encoding="utf-8")
+        check("窗口内未开工项也不催 PM 开新片",
+              b.proto.overall_debts().get("pm"), None)
+        b.advance_to("ready")
+        check("ready 后未判 → 仍 pending", b.proto.pending_gate_tasks(), ["a"])
+        check("pm 欠 gate（对准 ready 的 verdict 缺）", b.owes("pm"), ["gate"])
+        # verdict 对准这次交付 → 窗口关，义务恢复。
+        b.advance_to("verdict")     # {"round":1,"delivery":1,"verdict":"PASS"}
+        check("verdict 对准 → pending 清空", b.proto.pending_gate_tasks(), [])
+        check("窗口关 → b 的 implement 回来",
+              "implement" in b.owes("dev"), True)
+        check("a 自己转欠 consume（不被冻）", "consume" in b.owes("dev"), True)
+        b.advance_to("consumed")
+        check("a 静默后 dev 只剩 b:implement", b.owes("dev"), ["implement"])
+        # FAIL 对准当前交付 → 不算 pending（fail_pending 照常欠 implement）。
+        b.write("verdict.json", {"round": 1, "delivery": 1, "verdict": "FAIL"})
+        check("FAIL 已对准 → 非 pending", b.proto.pending_gate_tasks(), [])
+        check("FAIL 的 a 照常欠 implement（fail_pending 保留）",
+              "implement" in b.owes("dev"), True)
+        # verdict 只对准旧交付：重交 r2 未判 → 窗口重新开。
+        b.write("delivered.json",
+                {"round": 2, "head": "ccc", "verification": []})
+        check("verdict 对准旧交付 → 重交仍 pending",
+              b.proto.pending_gate_tasks(), ["a"])
+        check("重交未判窗口内 b 又冻结", b.owes("dev"), [])
+    finally:
+        b.cleanup()
+
+    # 无待判片：行为与现状一致（防回归）。
+    b2 = Bench("solo")
+    try:
+        b2.advance_to("request")
+        check("无待判片 → solo 欠 implement",
+              b2.owes("dev"), ["implement"])
+        check("无待判片 → pending_gate 为空",
+              b2.proto.pending_gate_tasks(), [])
+    finally:
+        b2.cleanup()
+
+
+def test_shadowed_install_detection() -> None:
+    print("\n[78] PATH 遮蔽检测：全命中顺序 / 启动器解析 / 同一份双向（F-18）")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # 布景：mine = 本次运行的实现；other/lib = 另一份安装。
+        me = tmp / "mine" / "bin" / "xteam"
+        me.parent.mkdir(parents=True)
+        me.write_text("# impl of THIS install\n", encoding="utf-8")
+        me.chmod(0o755)
+        other_lib = tmp / "other" / "lib"
+        other_lib.mkdir(parents=True)
+        other_impl = other_lib / "xteam"
+        other_impl.write_text("# impl of OTHER install\n", encoding="utf-8")
+
+        # install.sh 生成格式的启动器（指向另一份安装）。
+        bin_a = tmp / "bin_a"; bin_a.mkdir()
+        launcher = bin_a / "xteam"
+        launcher.write_text(
+            "#!/usr/bin/env bash\n"
+            f"export PM_TEAM_HOME=\"${{PM_TEAM_HOME:-{tmp}/other/share}}\"\n"
+            f"exec python3 \"{other_impl}\" \"$@\"\n", encoding="utf-8")
+        launcher.chmod(0o755)
+
+        # 同一份安装的两种入口：软链 + 指向同一实现的启动器。
+        bin_b = tmp / "bin_b"; bin_b.mkdir()
+        link = bin_b / "xteam"
+        link.symlink_to(me)
+        bin_c = tmp / "bin_c"; bin_c.mkdir()
+        same_launcher = bin_c / "xteam"
+        same_launcher.write_text(
+            "#!/usr/bin/env bash\n"
+            f"exec python3 \"{me}\" \"$@\"\n", encoding="utf-8")
+        same_launcher.chmod(0o755)
+        # 不可执行的同名文件不算命中。
+        noexec = tmp / "noexec"; noexec.mkdir()
+        (noexec / "xteam").write_text("nope\n", encoding="utf-8")
+
+        hits = _cli._path_hits("xteam", f"{bin_a}:{bin_b}:{noexec}")
+        check("全命中按优先级顺序（不可执行不列）", hits, [launcher, link])
+        dup = _cli._path_hits("xteam", f"{bin_b}:{bin_b}")
+        check("重复目录如实列出", dup, [link, link])
+        check("空 PATH 无命中", _cli._path_hits("xteam", str(tmp / "none")), [])
+
+        check("启动器解析到 exec 的真身",
+              _cli._resolve_entry(launcher), other_impl.resolve())
+        check("软链解析到链目标", _cli._resolve_entry(link), me.resolve())
+        check("脚本本体解析自身",
+              _cli._resolve_entry(other_impl), other_impl.resolve())
+
+        check("首份指另一份安装 → 遮蔽",
+              _cli._shadow_hit([launcher, link], me.resolve()), launcher)
+        check("首份是同一份的软链 → 不误报",
+              _cli._shadow_hit([link], me.resolve()), None)
+        check("首份是同 root 的启动器 → 不误报",
+              _cli._shadow_hit([same_launcher], me.resolve()), None)
+        check("PATH 无命中 → 不遮蔽",
+              _cli._shadow_hit([], me.resolve()), None)
+        check("遮蔽只认第 1 份（第 2 份不同不碍事）",
+              _cli._shadow_hit([link, launcher], me.resolve()), None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_say_three_state_render() -> None:
+    print("\n[79] say 三态单值 + mid-turn 占位符补 enter（F-19 v2/v3）")
+    import argparse
+    import contextlib
+    import io
+
+    PH = "❭ Press Enter to send queued messages now\n"
+    CONTENT = " ● Thinking · 15m 29s\n❭ Guide Devin while it works\n"
+
+    class CtlHerdr:
+        """doorbell 恒成功（status=idle）；agent_status 由队列驱动；尾巴由 tail 定。"""
+        def __init__(self, statuses: list, tail: str) -> None:
+            self._st = list(statuses)
+            self._tail = tail
+            self.calls: list = []
+        def find_workspace(self, label):
+            return {"workspace_id": "wV"}
+        def role_map(self, workspace_id):
+            return {"dev": {"pane_id": "wV:p3"}}
+        def doorbell(self, pane, message, wait_s=0.0):
+            return "status=idle"
+        def agent_status(self, pane_id: str) -> str:
+            self.calls.append("agent_status")
+            return self._st.pop(0) if self._st else "idle"
+        def read_pane(self, pane_id: str, lines: int = 60) -> str:
+            self.calls.append("read_pane")
+            return self._tail
+        def _run(self, *args):
+            self.calls.append(" ".join(args))
+            return {}
+
+    def say_with(stub) -> tuple[int, str, str]:
+        real_herdr = _cli.Herdr
+        _cli.Herdr = lambda scope=None: stub
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                (Path(td) / ".xteam").mkdir()
+                args = argparse.Namespace(project=td, workspace="w1",
+                                          role="dev", message="x", settle=0)
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), \
+                     contextlib.redirect_stderr(err):
+                    rc = _cli.cmd_say(args)
+            return rc, out.getvalue(), err.getvalue()
+        finally:
+            _cli.Herdr = real_herdr
+
+    real_sleep = _cli.SAY_RECHECK_S
+    _cli.SAY_RECHECK_S = 0.01
+    try:
+        # (a) 立刻 working、输入行有内容 → 已送达 rc0，绝不按 enter（AC-1/AC-9）。
+        h = CtlHerdr(["working"], CONTENT)
+        rc, out, err = say_with(h)
+        check("立刻working → 已送达 rc0", rc, 0)
+        check("(a) 主行含已送达", "已送达" in out, True)
+        check("(a/AC-9) 有内容不按 enter",
+              [c for c in h.calls if "send-keys" in c], [])
+        check("(a) 已 working 也读了 pane（v3）", "read_pane" in h.calls, True)
+
+        # (b) 恒 idle → 已投递·未确认 rc0（AC-2；不许说未送达/已送达）。
+        h = CtlHerdr(["idle", "idle"], CONTENT)
+        rc, out, err = say_with(h)
+        check("恒idle → rc=0（非失败）", rc, 0)
+        check("(b) 含已投递", "已投递" in out, True)
+        check("(b) 含未确认", "未确认" in out, True)
+        check("(b) stdout 不含未送达/已送达",
+              ("未送达" in out) or ("已送达" in out), False)
+        check("(b) stderr 不含未送达", "未送达" in err, False)
+
+        # (b') 延迟转 working（队列第 3 次才 working = 窗口外）→ 同样 (b)。
+        h = CtlHerdr(["idle", "idle", "working"], CONTENT)
+        rc, out, err = say_with(h)
+        check("延迟转working 仍是已投递·未确认", "已投递·未确认" in out, True)
+
+        # AC-8：mid-turn（working）+ 排队占位符 → 读 pane → 补一次 enter 再复核。
+        h = CtlHerdr(["working", "working"], PH)
+        rc, out, err = say_with(h)
+        check("mid-turn+占位符 → 已送达 rc0", rc, 0)
+        check("(AC-8) 占位符在 → 恰补一次 enter",
+              [c for c in h.calls if "send-keys" in c],
+              ["pane send-keys wV:p3 enter"])
+    finally:
+        _cli.SAY_RECHECK_S = real_sleep
+
+
+def test_queue_order_picks_slice_and_next_slice_label() -> None:
+    print("\n[80] 义务名按 QUEUE 序挑片 + next-slice 标签取首个 todo（F-20）")
+    QH = "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+    b = Bench("zz-late")
+    try:
+        b.advance_to("specv")                       # spec.json r1 → tl:assess
+        second = b.proto.tasks / "aa-early"
+        second.mkdir(parents=True, exist_ok=True)
+        (second / "spec.md").write_text("# spec\n", encoding="utf-8")
+        (second / "spec.json").write_text('{"round": 1}', encoding="utf-8")
+
+        # 无 QUEUE → 目录序回退（AC-5 的退回形态）
+        check("无 QUEUE：tl pending[0] 取目录序 aa-early",
+              b.proto.obligations()["tl"][0], ("aa-early", "assess"))
+
+        q = b.proto.dir / "QUEUE.md"
+        q.write_text(QH + "| 1 | zz-late | doing | |\n"
+                          "| 2 | aa-early | doing | |\n", encoding="utf-8")
+        check("错开序：tl pending[0] 取 QUEUE 序 zz-late",
+              b.proto.obligations()["tl"][0], ("zz-late", "assess"))
+        check("overall_debts 同样按队列序",
+              b.proto.overall_debts()["tl"][0], "zz-late:assess")
+
+        q.write_text(QH + "| 1 | aa-early | doing | |\n"
+                          "| 2 | zz-late | doing | |\n", encoding="utf-8")
+        check("一致序：tl pending[0] 仍 aa-early（不变）",
+              b.proto.obligations()["tl"][0], ("aa-early", "assess"))
+
+        q.write_text(QH + "| 1 | zz-late | doing | |\n", encoding="utf-8")
+        check("有记序在前、无记序保持目录序缀后",
+              [t.name for t in b.proto._tasks_by_queue_order()],
+              ["zz-late", "aa-early"])
+
+        q.write_text(QH + "| 9 | done-old | done | |\n"
+                          "| 3 | zz-late | doing | |\n", encoding="utf-8")
+        check("_queue_order 连 done 项也记序",
+              b.proto._queue_order().get("done-old"), 9)
+
+        q.write_text("这不是表格\n???\n", encoding="utf-8")
+        check("坏 QUEUE：_queue_order 为空", b.proto._queue_order(), {})
+        check("坏 QUEUE：tl pending[0] 回退目录序（不崩）",
+              b.proto.obligations()["tl"][0], ("aa-early", "assess"))
+    finally:
+        b.cleanup()
+
+    # next-slice 标签 = 首个未开工项；闭合片名永不进标签（AC-3/证据B）
+    c = Bench("done-old")
+    try:
+        c.advance_to("closed")
+        q = c.proto.dir / "QUEUE.md"
+        q.write_text(QH + "| 1 | done-old | done | |\n"
+                          "| 2 | fresh-next | todo | |\n", encoding="utf-8")
+        check("next-slice 标签 = 首个 todo 项 fresh-next",
+              c.proto.obligations()["pm"][0], ("fresh-next", "next-slice"))
+        check("overall_debts 标签同口径",
+              c.proto.overall_debts()["pm"], ["fresh-next:next-slice"])
+        check("闭合片名不进任何欠账标签",
+              "done-old" in (str(c.proto.overall_debts())
+                             + str(c.proto.obligations())), False)
+        check("_next_slice_label 直验", c.proto._next_slice_label(),
+              "fresh-next")
+
+        q.write_text(QH + "| 1 | done-old | done | |\n", encoding="utf-8")
+        check("无未开工项 → 标签空", c.proto._next_slice_label(), "")
+        check("无未开工项 → next-slice 让位（现状不变）",
+              "next-slice" in str(c.proto.obligations()["pm"]), False)
+    finally:
+        c.cleanup()
+
+
+def test_pane_version_drift_warning() -> None:
+    print("\n[81] status 头部版本漂移警告三态（F-21）")
+    b = Bench("a")
+    try:
+        xdir = b.proto.dir
+        real_version = _cli._version()
+
+        # 三态：不等 → 警告行；一致 → None；无记录 → None
+        (xdir / "rules.json").write_text(
+            '{"xteam_version": "0.0.1"}', encoding="utf-8")
+        line = _cli._pane_version_drift(b.tmp)
+        check("版本不等 → 返回警告行", isinstance(line, str), True)
+        check("警告行含 pane 版", "0.0.1" in line, True)
+        check("警告行含运行版", real_version in line, True)
+        check("警告行含修复指引", "xteam up" in line, True)
+
+        (xdir / "rules.json").write_text(
+            f'{{"xteam_version": "{real_version}"}}', encoding="utf-8")
+        check("版本一致 → 不警告", _cli._pane_version_drift(b.tmp), None)
+
+        (xdir / "rules.json").unlink()
+        check("无记录 → 不警告（老会话不吵）",
+              _cli._pane_version_drift(b.tmp), None)
+
+        # session.json 有键时按字面口径也认（spec 的名义源）
+        (xdir / "session.json").write_text(
+            '{"xteam_version": "0.0.1"}', encoding="utf-8")
+        line = _cli._pane_version_drift(b.tmp)
+        check("session.json 的 xteam_version 也触发", isinstance(line, str), True)
+        check("session 口径同样含两版本",
+              "0.0.1" in line and real_version in line, True)
+        (xdir / "session.json").write_text('{"panes": {}}', encoding="utf-8")
+        check("session 无键且 rules 无 → 不警告",
+              _cli._pane_version_drift(b.tmp), None)
+    finally:
+        b.cleanup()
+
+
+def test_undispatched_tasks_threshold() -> None:
+    print("\n[82] request 派发超时点名 TL（mtime > IDLE_ALERT_SECS 才算没人领，F-23）")
+    import os
+    import time as _t
+    b = Bench("stale")
+    try:
+        b.advance_to("request")                     # request.md 在、无 delivered
+        req = b.task / "request.md"
+
+        # 未超阈值：刚落地的 request 不该点名 TL（不误报，AC-2）
+        check("刚落地 → 不点名", b.proto.undispatched_tasks(), [])
+
+        # 超阈值：mtime 拨回 601s 前 → 点名
+        old = _t.time() - 601
+        os.utime(req, (old, old))
+        check("mtime 601s 前 → 点名 stale",
+              b.proto.undispatched_tasks(), ["stale"])
+
+        # 恰好阈值边上不算超（< now-600 才算超；now_ts 可注入钉死边界）
+        edge = _t.time() - IDLE_ALERT_SECS + 5
+        os.utime(req, (edge, edge))
+        check("阈值内（599s 前）→ 不点名",
+              b.proto.undispatched_tasks(), [])
+        edge = _t.time() - IDLE_ALERT_SECS - 5
+        os.utime(req, (edge, edge))
+        check("阈值外（605s 前）→ 点名",
+              b.proto.undispatched_tasks(), ["stale"])
+
+        # delivered.json 在 = 已领走，不再点名
+        b.advance_to("delivered")
+        check("已交付 → 不点名", b.proto.undispatched_tasks(), [])
+
+        # closed 片即使有滞留 request 也不点名
+        c = Bench("gone")
+        try:
+            c.advance_to("closed")
+            r = c.task / "request.md"
+            o = _t.time() - 3600
+            os.utime(r, (o, o))
+            check("closed → 不点名", c.proto.undispatched_tasks(), [])
+        finally:
+            c.cleanup()
+
+        # 队列序也适用：两片同时超时按 QUEUE 序点名
+        d = Bench("zz")
+        try:
+            d.advance_to("request")
+            (d.proto.tasks / "aa").mkdir(parents=True, exist_ok=True)
+            (d.proto.tasks / "aa" / "request.md").write_text(
+                "# 拆解\n", encoding="utf-8")
+            for name in ("zz", "aa"):
+                p = d.proto.tasks / name / "request.md"
+                o = _t.time() - 900
+                os.utime(p, (o, o))
+            (d.proto.dir / "QUEUE.md").write_text(
+                "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+                "| 1 | zz | doing | |\n| 2 | aa | doing | |\n",
+                encoding="utf-8")
+            check("超时多片按 QUEUE 序点名", d.proto.undispatched_tasks(),
+                  ["zz", "aa"])
+        finally:
+            d.cleanup()
+    finally:
+        b.cleanup()
+
+
+def test_identity_goes_into_system_prompt() -> None:
+    print("\n[81] 身份进系统提示词：/new、/clear 清不掉它")
+    import xteam_lib
+    from xteam_lib import (SYSTEM_PROMPT_ARG, RESET_COMMAND, RoleSpec,
+                           context_hint, reset_command, write_identity,
+                           identity_path)
+    # 表本身：omp / pi 是实测过的（别的 kind 加进来之前必须同样实测）
+    check("omp 认 --append-system-prompt", SYSTEM_PROMPT_ARG.get("omp"),
+          "--append-system-prompt")
+    check("pi 也认（与 omp 同一套 TUI，实测 /new 后身份仍在）",
+          SYSTEM_PROMPT_ARG.get("pi"), "--append-system-prompt")
+    check("omp 的原地重开命令是 /new", RESET_COMMAND.get("omp"), "/new")
+    check("pi 的原地重开命令是 /new（实测）", RESET_COMMAND.get("pi"), "/new")
+    check("没实测过的 kind 不硬塞 flag（如 opencode）",
+          SYSTEM_PROMPT_ARG.get("opencode"), None)
+    check("没实测过的 kind 不改写它的启动行为",
+          RESET_COMMAND.get("devin"), None)
+
+    # agent_args：带身份文件才加 flag，且**不能吞掉 --model**
+    with_id = RoleSpec("pm", "omp", "产品经理", "gpt-5", "/p/.xteam/identity/pm.md")
+    check("omp 带身份时拼上 flag 和路径", with_id.agent_args(),
+          ["--model", "gpt-5", "--append-system-prompt",
+           "/p/.xteam/identity/pm.md"])
+    check("omp 不带身份时维持原样",
+          RoleSpec("pm", "omp", "产品经理", "gpt-5").agent_args(),
+          ["--model", "gpt-5"])
+    check("不支持的 kind 有了身份也不硬塞",
+          RoleSpec("dev", "devin", "开发", "", "/p/id.md").agent_args(), [])
+
+    root = Path(tempfile.mkdtemp())
+    try:
+        path = write_identity(root, "pm", _cli.ROLES_DIR, label="demo")
+        check("身份文件落在 .xteam/identity/<role>.md",
+              path, identity_path(root, "pm"))
+        text = path.read_text(encoding="utf-8")
+        charter = (_cli.ROLES_DIR / "pm.md").read_text(encoding="utf-8").strip()
+        check("章程全文一字不落地附在后面", charter[:200] in text, True)
+        check("带上角色与项目名", ("pm" in text and "demo" in text), True)
+        check("写明重置后先 whoami", "xteam whoami" in text, True)
+        check("写明身份不会被重置清掉", "系统提示词" in text, True)
+
+        # 门铃前缀：只有「身份不在系统提示词里」的 kind 才需要
+        check("omp 不加门铃噪音", context_hint("pm", "omp"), "")
+        devin_hint = context_hint("dev", "devin")
+        check("devin 的门铃自带身份提醒",
+              ("dev" in devin_hint and "xteam whoami" in devin_hint), True)
+        check("devin 没有原地重开命令（该走 swap）", reset_command("devin"), "")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_context_pct_all_three_kinds() -> None:
+    print("\n[82] context 占用解析：omp 的进度条格式也要认（默认 agent 就是它）")
+    from xteam_lib import parse_context_pct, REOPEN_ADVISE_PCT
+    check("opencode 格式（带括号）", parse_context_pct(" 392.8K (37%)"), 37)
+    check("devin 格式", parse_context_pct(" 168k / 262k tokens (64%)"), 64)
+    # 实测 omp 状态栏（2026-10-07）：百分号夹在横杠里，右边跟 `|` + 窗口上限
+    check("omp 进度条格式", parse_context_pct(
+        " pi > [max] X > [T] /p > $1.18 >----------------------51%------------|-----1M-"),
+        51)
+    check("omp 新会话的小数（0.7%）", parse_context_pct(
+        " pi > [max] X > [T] /p > $0.00 >-0.7%----------------|-----1M-"), 0)
+    check("pi 的占用/窗口格式", parse_context_pct(
+        " ↑12k ↓100 R512 CH4.0% $0.025 (sub) 2.6%/500k (auto)"), 2)
+    check("解析不出就不猜", parse_context_pct("no numbers here"), None)
+    # 阈值两处（recap 60 / 重开 75）都吃这个解析：必须真的能跨过
+    check("omp 的 80% 能触发重开建议",
+          (parse_context_pct("-----80%------|----1M-") or 0) >= REOPEN_ADVISE_PCT,
+          True)
+
+
+def test_whoami_and_reopen_intro() -> None:
+    print("\n[83] whoami 一屏交回现场；重开的 intro 不重复烧章程")
+    import contextlib
+    import io
+    b = Bench("identity-probe")
+    try:
+        b.advance_to("ready")                   # 这一级：PM 欠 gate
+        root, proto = b.tmp, b.proto
+        mem = proto.dir / "memory"
+        mem.mkdir(parents=True, exist_ok=True)
+        (mem / "pm-recap.md").write_text(
+            "## 做完什么\n- 队列清了\n## 下一步 / 遗留\n- 等 identity-probe 的 verdict\n",
+            encoding="utf-8")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = _cli.cmd_whoami(argparse.Namespace(project=str(root), role="pm"))
+        out = buf.getvalue()
+        check("whoami 正常返回", rc, 0)
+        check("说清你是谁", "你是 pm" in out, True)
+        check("列出你欠的义务", "identity-probe:gate" in out, True)
+        check("列出未闭合切片", "identity-probe" in out, True)
+        check("带你上次的 recap 尾巴",
+              "等 identity-probe 的 verdict" in out, True)
+        check("给出该读的路径", "PROTOCOL.md" in out, True)
+
+        # 没有 .xteam 的目录要报错，而不是假装有内容
+        bare = Path(tempfile.mkdtemp())
+        try:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _cli.cmd_whoami(argparse.Namespace(project=str(bare), role="pm"))
+                code = 0
+            except SystemExit as exc:
+                code = exc.code or 0
+            check("没有 .xteam 时明确报错（不假装成功）", code != 0, True)
+        finally:
+            shutil.rmtree(bare, ignore_errors=True)
+
+        # intro：身份在系统提示词里的 kind 不重复抄章程；别的 kind 必须抄全文
+        charter = (_cli.ROLES_DIR / "pm.md").read_text(encoding="utf-8").strip()
+        head = charter[:200]
+        intro_omp = _cli._restart_intro(root, proto, "pm", "omp", "why")
+        check("omp 的 intro 不重复抄章程", head in intro_omp, False)
+        check("omp 的 intro 指向系统提示词", "系统提示词" in intro_omp, True)
+        check("omp 的 intro 仍带现状", "identity-probe" in intro_omp, True)
+        intro_devin = _cli._restart_intro(root, proto, "pm", "devin", "why")
+        check("devin 的 intro 带章程全文", head in intro_devin, True)
+        intro_forced = _cli._restart_intro(root, proto, "pm", "omp", "why",
+                                           with_charter=True)
+        check("显式要求时照样带（up 复用老 pane 的场景）",
+              head in intro_forced, True)
+
+        # 重置生效判据：会话变了（omp）或新出现回执（pi）；读不到才不否决
+        class FakeHerdr:
+            def __init__(self, sessions, pane_text="", seq=None):
+                self.sessions = sessions
+                self.text = pane_text
+                self.reads = 0
+                self.seq = seq or []
+            def agent_session(self, pane):
+                v = self.sessions[min(self.reads, len(self.sessions) - 1)]
+                return v
+            def read_pane(self, pane, lines=200):
+                self.reads += 1
+                if self.seq:
+                    return self.seq[min(self.reads, len(self.seq) - 1)]
+                return self.text
+        ok, why = _cli._wait_reset_ok(FakeHerdr(["a"]), "p", "a", 0, timeout=0)
+        check("会话没变也没有回执 → 判定没生效", ok, False)
+        ok, why = _cli._wait_reset_ok(FakeHerdr(["b"]), "p", "a", 0, timeout=1)
+        check("会话标识变了 → 生效", (ok, why), (True, "会话标识已变"))
+        # pi 不暴露会话：靠 pane 里多出一条 New session started 回执
+        ok, why = _cli._wait_reset_ok(
+            FakeHerdr([""], seq=["", "✓ New session started"]), "p", "", 0,
+            timeout=1)
+        check("回执多了一条 → 生效", (ok, "回执" in why), (True, True))
+        # 滚动区里**留着旧回执**（次数没涨）→ 不能当成新会话
+        ok, why = _cli._wait_reset_ok(
+            FakeHerdr([""], pane_text="[ok] New session started"), "p", "", 1,
+            timeout=0)
+        check("旧回执不算生效（数次数，不数有无）", ok, False)
+        ok, why = _cli._wait_reset_ok(FakeHerdr([""], pane_text=""), "p", "", 0,
+                                      timeout=0)
+        check("该 kind 什么都不暴露时不否决（说清依据）",
+              (ok, "无法确认" in why), (True, True))
+
+        # session.json 的身份记录：决定 reopen 要不要把章程抄进对话
+        check("没记身份 → 按「没有」处理", _cli._session_identity({}, "pm"), "")
+        check("记了身份就认",
+              _cli._session_identity({"identity": {"pm": "/p/id.md"}}, "pm"),
+              "/p/id.md")
+
+        # 巡检的重开建议：落事件 + 时间线 + 通知，冷却期内不重复喊
+        tr = IdleTracker(root / "idle.state")
+        logged: list = []
+        real_notify = _cli.notify
+        _cli.notify = lambda t, b: logged.append((t, b))
+        try:
+            class PaneHerdr:
+                def read_pane(self, pane, lines=10):
+                    return " $1.18 >----------------80%----------|-----1M-"
+            role_map = {"pm": {"pane_id": "p", "agent_status": "idle"}}
+            events = proto.dir / "watch" / "events.log"
+            _cli._maybe_advise_reopen(root, PaneHerdr(), role_map, tr, events)
+            check("高位 context 落事件",
+                  "REOPEN-SUGGEST" in events.read_text(encoding="utf-8"), True)
+            timeline = (proto.dir / "watch" / "timeline.log").read_text(
+                encoding="utf-8")
+            check("建议里给出可执行的命令", "xteam reopen pm" in timeline, True)
+            check("响通知（唯一能打断人的通道）", len(logged), 1)
+            _cli._maybe_advise_reopen(root, PaneHerdr(), role_map, tr, events)
+            check("冷却期内不重复喊", len(logged), 1)
+
+            class LowHerdr:
+                def read_pane(self, pane, lines=10):
+                    return " $0.00 >-0.7%---------|-----1M-"
+            _cli._maybe_advise_reopen(root, LowHerdr(), role_map, tr, events)
+            check("重开后（数字掉下来）冷却被清掉",
+                  "reopen:pm" in tr.state, False)
+
+            class WorkingHerdr:
+                def read_pane(self, pane, lines=10):
+                    raise AssertionError("working 时不该读 pane")
+            _cli._maybe_advise_reopen(
+                root, WorkingHerdr(),
+                {"pm": {"pane_id": "p", "agent_status": "working"}}, tr, events)
+            check("working 时不打扰（也不采样）", len(logged), 1)
+        finally:
+            _cli.notify = real_notify
+    finally:
+        b.cleanup()
+
+
+def test_charter_reply_timestamp_rule() -> None:
+    print("\n[84] 三角色章程钉死「对人类文字回复首行带 [YYYY-MM-DD HH:MM:SS]」（F-24）")
+    tokens = ("文字回复", "第一行", "[YYYY-MM-DD HH:MM:SS]")
+
+    def has_rule(text: str) -> bool:
+        return all(t in text for t in tokens)
+
+    for role in ("pm", "tl", "dev"):
+        text = repo_doc(f"roles/{role}.md").read_text(encoding="utf-8")
+        check(f"{role}.md 含首行时间戳硬规则", has_rule(text), True)
+
+    # 双向钉死：没有这句的旧章程必须过不了守卫
+    old = ("## 每次输出都带时间戳\n\n```bash\nxteam stamp dev \"x\"\n```\n\n"
+           "**不要手写时间戳。** 手写的可靠性等于「你对自己何时看过表」的记忆。\n")
+    check("缺这句的旧章程过不了守卫", has_rule(old), False)
+    compliant = ("对人类的文字回复，第一行必须含当前系统时间 "
+                 "[YYYY-MM-DD HH:MM:SS]。")
+    for t in tokens:
+        check(f"三字样缺「{t}」不算数", has_rule(compliant.replace(t, "")), False)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -3170,6 +3789,16 @@ def main() -> int:
         test_unstarted_queue_gate_for_pm_nags,
         test_status_merges_overall_synthetic_debts,
         test_say_recheck_window,
+        test_gate_window_freezes_other_implement,
+        test_shadowed_install_detection,
+        test_say_three_state_render,
+        test_queue_order_picks_slice_and_next_slice_label,
+        test_pane_version_drift_warning,
+        test_undispatched_tasks_threshold,
+        test_identity_goes_into_system_prompt,
+        test_context_pct_all_three_kinds,
+        test_whoami_and_reopen_intro,
+        test_charter_reply_timestamp_rule,
     ):
         fn()
     print()

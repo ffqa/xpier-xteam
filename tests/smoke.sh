@@ -394,8 +394,23 @@ d3=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "chase")
 [ "$d3" -ge 1 ] && ok "已交付 → TL 欠 chase" || bad "交付未产生 chase 义务"
 
 printf 'done\n' > .xteam/tasks/smoke/closed.md
+# **next-slice 的前提是队列里还有未开工项**（4d52a83 起：队列空时这条义务让位给
+# 「结项 report」，因为「还有下一片要做」和「全做完了」是两种状态）。不补这一行，
+# 这片闭合后 PM 欠的是 report —— 而这一步验的是「闭合后别停」。
+printf '| 1 | next-one | todo | |\n' >> .xteam/QUEUE.md
 d4=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "next-slice")
-[ "$d4" -ge 1 ] && ok "已闭合 → PM 欠 next-slice" || bad "闭合未产生 next-slice 义务"
+[ "$d4" -ge 1 ] && ok "已闭合 + 队列有未开工项 → PM 欠 next-slice" \
+  || bad "闭合未产生 next-slice 义务"
+
+# 队列也被清空时，闭合片不该再催 next-slice —— 改由 report 义务接手（结项）。
+grep -v 'next-one' .xteam/QUEUE.md > .xteam/QUEUE.md.tmp || true
+mv .xteam/QUEUE.md.tmp .xteam/QUEUE.md
+d4b=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "report")
+[ "$d4b" -ge 1 ] && ok "队列清空 → PM 改欠结项 report" \
+  || bad "队列清空却没人欠结项 report"
+
+# 补回队列项，后面的步骤仍按「有下一片」的状态跑
+printf '| 1 | next-one | todo | |\n' >> .xteam/QUEUE.md
 
 # ------------------------------------------------- 生命周期：up 复用 / down 只关 pane
 step "生命周期" "down 只关 pane 保留 workspace；再 up 复用同一个"
