@@ -17,6 +17,9 @@
 #
 # 用法：bash tests/e2e_multi.sh   （无参数；退出码 0 = 全过，末行 N/N 通过）
 set -uo pipefail
+# 不留解释器字节码缓存：整套件的所有 python3 调用（xin/xin12/xin13/xin16
+# 与内联 python3 -c）都继承它，「不写用户目录」在字节级成立（F-10）。
+export PYTHONDONTWRITEBYTECODE=1
 
 if [ $# -gt 0 ]; then
   echo "用法：bash tests/e2e_multi.sh（无参数）" >&2
@@ -53,7 +56,7 @@ export PATH
 # 在临时仓根下跑仓库版 xteam；stdin 封死，防止意外交互把脚本挂住。
 xin() {
   local t="$1"; shift
-  (cd "$t" && python3 "$REPO/bin/xteam" --project "$t" "$@" </dev/null)
+  (cd "$t" && PYTHONDONTWRITEBYTECODE=1 python3 "$REPO/bin/xteam" --project "$t" "$@" </dev/null)
 }
 
 # 建一个 git 仓 + 若干空的直接子目录（init 只要求直接子目录存在）。
@@ -402,9 +405,12 @@ assert_rc "MP-14.0 init 布景 rc=0" 0
 
 # env -i 把环境清空再显式给回 PATH/HOME：PATH 里既没有真 herdr 也没有
 # 上面的替身；HOME 留着是因为 python/xteam 会读它（spec AC-1 布景要求）。
+# PYTHONDONTWRITEBYTECODE 也得显式给回（env -i 会清掉脚本级 export）——
+# 这组调用解析到 /usr/bin/python3（3.9），不给变量就会把 pyc 落进
+# ~/Library/Caches/com.apple.python/，「不写用户目录」的字节级声明破功。
 # down / swap 只许打临时仓 —— T 正是 BASE 下的 mktemp 仓，脚本结束随 trap 清掉。
 for c in "restore" "status" "watch once" "sync" "down" "swap pm pi"; do
-  run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+  run env -i PATH=/usr/bin:/bin HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
     python3 "$REPO/bin/xteam" --project "$T" $c
   assert_rc "MP-14.1 $c rc≠0" nz
   printf '%s' "$LAST_OUT" | grep -qF 'Traceback (most recent call last)' \
@@ -414,16 +420,16 @@ for c in "restore" "status" "watch once" "sync" "down" "swap pm pi"; do
 done
 
 # AC-2 旁路：同环境下不依赖 herdr 的命令照常。
-run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+run env -i PATH=/usr/bin:/bin HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
   python3 "$REPO/bin/xteam" --project "$T" projects
 assert_rc "MP-14.4 projects rc=0" 0
-run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+run env -i PATH=/usr/bin:/bin HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
   python3 "$REPO/bin/xteam" --project "$T" doctor
 assert_rc "MP-14.5 doctor rc=0" 0
-run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+run env -i PATH=/usr/bin:/bin HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
   python3 "$REPO/bin/xteam" --project "$T" agents
 assert_rc "MP-14.6 agents rc=0" 0
-run env -i PATH=/usr/bin:/bin HOME="$HOME" \
+run env -i PATH=/usr/bin:/bin HOME="$HOME" PYTHONDONTWRITEBYTECODE=1 \
   python3 "$REPO/bin/xteam" --project "$T" stamp pm x
 assert_rc "MP-14.7 stamp pm x rc=0" 0
 
@@ -530,6 +536,426 @@ printf '%s' "$LAST_OUT" | grep -qF '停在' \
   || ok  "MP-15.6 输出不含「停在」说明"
 
 # MP-15.5 回归：本文件 112 条既有断言全部继续通过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-16
+step "MP-16" "say 的送达判据是目标转 working；排队占位符才补 enter"
+
+T="$BASE/mp16"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-16.0 init 布景 rc=0" 0
+
+# 有状态替身（spec §2.1 钉的形状）：dev 的 agent_status 由 STATE 文件决定；
+# pane read 无标记回 TAIL_BEFORE、有标记回 TAIL_AFTER；pane send-keys 落标记
+# 并把 STATE 拨成 working（模拟「补 enter 后消息真的被提交」）；
+# 每次调用把「子命令 第3参 第4参」追加进 LOGF，供序列断言核对。
+mkdir -p "$BASE/bin16"
+cat > "$BASE/bin16/herdr" <<'EOF'
+#!/bin/sh
+# 一次调用一行日志：子命令+第3参；send-keys 追加第4参（要能看到 enter）。
+{ printf '%s %s %s' "$1" "$2" "$3"; [ "$2" = "send-keys" ] && printf ' %s' "$4"; printf '\n'; } >> "$LOGF"
+ST="$(cat "$STATE" 2>/dev/null || printf 'done')"
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wS","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wS:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wS:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"},{"pane_id":"wS:p3","name":"dev-'"$LABEL"'","agent_status":"'"$ST"'","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wS","tab_id":"wS:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wS:p1","cwd":"'"$ROOT"'"},{"pane_id":"wS:p2","cwd":"'"$ROOT"'"},{"pane_id":"wS:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  "agent prompt")   : ;;
+  "pane read")      if [ -f "$MARK" ]; then cat "$TAIL_AFTER"; else cat "$TAIL_BEFORE"; fi ;;
+  "pane send-keys") touch "$MARK"; printf 'working' > "$STATE"; printf '%s\n' '{"result": {}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin16/herdr"
+xin16() {
+  local t="$1" tb="$2" ta="$3"; shift 3
+  (cd "$t" && PATH="$BASE/bin16:$PATH" LABEL=e2ews ROOT="$t" \
+    STATE="$BASE/mp16.state" MARK="$BASE/mp16.mark" LOGF="$BASE/mp16.log" \
+    TAIL_BEFORE="$tb" TAIL_AFTER="$ta" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace e2ews "$@" </dev/null)
+}
+reset16() { printf '%s' "$1" > "$BASE/mp16.state"; rm -f "$BASE/mp16.mark" "$BASE/mp16.log"; }
+
+# 布景 A：dev done + 尾巴 C（有排队占位符）→ 补一次 enter → 复核转 working。
+reset16 done
+run xin16 "$T" "$BASE/tailC.txt" "$BASE/tailB.txt" say dev "x"
+assert_rc  "MP-16.0 布景A say rc=0" 0
+LOG="$(cat "$BASE/mp16.log")"
+printf '%s' "$LOG" | grep -qF 'pane send-keys wS:p3 enter' \
+  && ok  "MP-16.1 日志有 pane send-keys enter（真补了一次）" \
+  || bad "MP-16.1 日志缺 pane send-keys" "$LOG"
+SK="$(printf '%s\n' "$LOG" | grep -nF 'pane send-keys' | head -1 | cut -d: -f1)"
+AL="$(printf '%s\n' "$LOG" | grep -nF 'agent list' | tail -1 | cut -d: -f1)"
+{ [ -n "$SK" ] && [ -n "$AL" ] && [ "$AL" -gt "$SK" ]; } \
+  && ok  "MP-16.2 send-keys 之后还有一次 agent list（补完复核送达）" \
+  || bad "MP-16.2 补 enter 后缺复核" "$LOG"
+assert_has "MP-16.3 主行含 已送达（" "已送达（"
+
+# 布景 B：dev 一开始就 working → 不读尾巴不补 enter（已送达，不许画蛇添足）。
+reset16 working
+run xin16 "$T" "$BASE/tailC.txt" "$BASE/tailB.txt" say dev "x"
+assert_rc  "MP-16.4 布景B rc=0" 0
+assert_has "MP-16.4 主行含 已送达（" "已送达（"
+printf '%s' "$(cat "$BASE/mp16.log")" | grep -qF 'pane send-keys' \
+  && bad "MP-16.4 已 working 还补了 enter" "$(cat "$BASE/mp16.log")" \
+  || ok  "MP-16.4 无 send-keys（不画蛇添足）"
+
+# 布景 C：dev done + 尾巴 B（无占位符=输入行可能有内容）→ 不补，报未送达。
+reset16 done
+# 需要分开看 stdout/stderr，不能用 run()（它把 2>&1 合并了）。
+# LAST_OUT=$(...) 这条赋值语句本身的 $? 就是命令的 rc——必须紧接着取。
+LAST_OUT="$(xin16 "$T" "$BASE/tailB.txt" "$BASE/tailB.txt" say dev "x" 2>"$BASE/mp16.err")"; LAST_RC=$?
+assert_rc  "MP-16.5 布景C rc≠0" nz
+assert_has "MP-16.5 主行含 未送达（" "未送达（"
+grep -qF '未送达' "$BASE/mp16.err" \
+  && ok  "MP-16.5 stderr 含未送达" \
+  || bad "MP-16.5 stderr 缺未送达" "$(cat "$BASE/mp16.err")"
+printf '%s' "$(cat "$BASE/mp16.log")" | grep -qF 'pane send-keys' \
+  && bad "MP-16.5 无占位符还抢了回车" "$(cat "$BASE/mp16.log")" \
+  || ok  "MP-16.5 无 send-keys（不抢按回车）"
+
+# MP-16.6 回归：MP-12~MP-15 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-17
+step "MP-17" "CLI 面快照经 main() 定型：rules.json 落真实子命令集"
+
+T="$BASE/mp17"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-17.0 init 布景 rc=0" 0
+
+# spec §2.1 手法：exec 整份 bin/xteam 源码、argv=['xteam','--version']，
+# __name__=__main__ 触发 sys.exit(main()) → 快照经过 main() 的 add_parser
+# 全程；再调 _save_sync_state(root) 落 rules.json 读回。绕过 main() 直接给
+# _CLI_SURFACE 赋值不算数——MP-17.1 就是防这个作弊。
+run python3 - "$REPO/bin/xteam" "$T" <<'PYEOF'
+import json, sys
+from pathlib import Path
+src, root = sys.argv[1], sys.argv[2]
+g = {"__name__": "__main__", "__file__": src}
+sys.argv = ["xteam", "--version"]
+try:
+    exec(compile(open(src, encoding="utf-8").read(), src, "exec"), g)
+except SystemExit:
+    pass
+g["_save_sync_state"](Path(root))
+print("SURFACE=" + json.dumps(g["_cli_surface"]()))
+d = json.load(open(Path(root) / ".xteam" / "rules.json"))
+print("RULESCLI=" + json.dumps(d.get("cli")))
+PYEOF
+assert_rc "MP-17.0 exec+save_sync_state rc=0" 0
+SURF="$(printf '%s\n' "$LAST_OUT" | grep -F 'SURFACE=' | cut -d= -f2-)"
+RCLI="$(printf '%s\n' "$LAST_OUT" | grep -F 'RULESCLI=' | cut -d= -f2-)"
+{ [ -n "$SURF" ] && [ "$SURF" != "[]" ]; } \
+  && ok  "MP-17.1 经 main() 后 _cli_surface() 非空" \
+  || bad "MP-17.1 _cli_surface() 仍是空" "$SURF"
+for c in say status watch contracts up; do
+  printf '%s' "$SURF" | grep -qF "\"$c\"" \
+    && ok  "MP-17.1 CLI 面含 $c" \
+    || bad "MP-17.1 CLI 面缺 $c" "$SURF"
+done
+{ [ "$RCLI" = "$SURF" ] && [ -n "$RCLI" ] && [ "$RCLI" != "[]" ]; } \
+  && ok  "MP-17.2 rules.json 的 cli 与 surface 相同且非空" \
+  || bad "MP-17.2 rules.json cli 不符" "$RCLI"
+
+# MP-17.3：rules.json 的 cli 去掉 contracts → status 应报新增告知。
+# 替身复用 MP-12 的 bin12（答 workspace/agent/pane list；pane read 落空 JSON，
+# 检测器返回 False —— 不会触发 F-4 的 blocked 判定）。
+python3 -c '
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding="utf-8"))
+d["cli"] = [c for c in d["cli"] if c != "contracts"]
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+' "$T/.xteam/rules.json"
+run xin12 "$T" status
+assert_rc  "MP-17.3 status rc=0" 0
+assert_has "MP-17.3 输出含新增告知" "新增了这些子命令"
+assert_has "MP-17.3 告知点名 contracts" "contracts"
+
+# MP-17.4：cli 写回当前全集 → 同一路径不许常驻误报。
+python3 -c '
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding="utf-8"))
+d["cli"] = json.loads(sys.argv[2])
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+' "$T/.xteam/rules.json" "$SURF"
+run xin12 "$T" status
+assert_rc  "MP-17.4 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qF '新增了这些子命令' \
+  && bad "MP-17.4 cli 一致仍报新增（常驻误报）" "$LAST_OUT" \
+  || ok  "MP-17.4 cli 一致不误报"
+
+# MP-17.5 回归：MP-12~MP-16 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-18
+step "MP-18" "巡检自比指纹：自身代码变了报 SELF-STALE（带冷却，不自动重启）"
+
+T="$BASE/mp18"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-18.0 init 布景 rc=0" 0
+
+# _watch_cycle 的 workspace 名取自 session.json（没有则回退目录名），不看
+# --workspace —— 写一条绑定记录模拟「up 过的 workspace」，替身按 e2ews 应答。
+printf '{"workspace":"e2ews","panes":["pm","tl","dev"]}\n' \
+  > "$T/.xteam/session.json"
+# 替身复用 MP-12 的 bin12（答 workspace/agent/pane list）——_watch_cycle 里
+# ws 判空在 nag 段之前，没有替身 workspace 走不到比对。
+EVLOG="$T/.xteam/watch/events.log"
+
+# MP-18.1：无 self.json（旧版本启动的巡检就没有这条记录）→ 无基准不误报。
+rm -f "$T/.xteam/watch/self.json"
+run xin12 "$T" watch once
+assert_rc "MP-18.1 once rc=0" 0
+{ [ -f "$EVLOG" ] && grep -qF 'SELF-STALE' "$EVLOG"; } \
+  && bad "MP-18.1 无基准却报了 SELF-STALE" "$(tail -5 "$EVLOG")" \
+  || ok  "MP-18.1 无 self.json 不报 SELF-STALE"
+
+# MP-18.2：写一个不同的指纹 → events.log 新增 SELF-STALE 且提到「重启」。
+mkdir -p "$T/.xteam/watch"
+printf '{"bin_xteam_sha256": "%064d"}\n' 0 > "$T/.xteam/watch/self.json"
+run xin12 "$T" watch once
+assert_rc "MP-18.2 once rc=0" 0
+STALE_LINE="$(grep -F 'SELF-STALE' "$EVLOG" | tail -1)"
+[ -n "$STALE_LINE" ] \
+  && ok  "MP-18.2 events.log 有 SELF-STALE 行" \
+  || bad "MP-18.2 指纹不一致却没报 SELF-STALE" "$(tail -5 "$EVLOG")"
+printf '%s' "$STALE_LINE" | grep -qF '重启' \
+  && ok  "MP-18.2 行内提到重启" \
+  || bad "MP-18.2 SELF-STALE 行没提重启" "$STALE_LINE"
+
+# MP-18.3：写当前指纹（bin/xteam 的 sha256，realpath 解析符号链接）→
+# 新一轮不再新增 SELF-STALE（不许常驻误报）。
+# **先撤冷却武装**：MP-18.2 刚为 nag:self-stale 关闸 30min，不删 idle.state
+# 的话本轮无论指纹一致与否都 0 新增——断言恒真、测了个寂寞（F-10 的
+# 修复前失败证据）。与 MP-19 的 zero_recap_ts 同一个「主动绕冷却」套路。
+CUR="$(python3 -c 'import hashlib,os,sys
+print(hashlib.sha256(open(os.path.realpath(sys.argv[1]),"rb").read()).hexdigest())' \
+  "$REPO/bin/xteam")"
+printf '{"bin_xteam_sha256": "%s"}\n' "$CUR" > "$T/.xteam/watch/self.json"
+rm -f "$T/.xteam/watch/idle.state"
+N_BEFORE=""; N_AFTER=""
+{ [ -f "$EVLOG" ] && N_BEFORE="$(grep -cF 'SELF-STALE' "$EVLOG" || true)"; }
+run xin12 "$T" watch once
+assert_rc "MP-18.3 once rc=0" 0
+{ [ -f "$EVLOG" ] && N_AFTER="$(grep -cF 'SELF-STALE' "$EVLOG" || true)"; }
+{ [ -n "$N_BEFORE" ] && [ -n "$N_AFTER" ] && [ "$N_AFTER" = "$N_BEFORE" ]; } \
+  && ok  "MP-18.3 指纹一致不新增 SELF-STALE" \
+  || bad "MP-18.3 指纹一致仍报（常驻误报）" \
+       "EVLOG存在=$([ -f "$EVLOG" ] && echo y || echo n) N_BEFORE=$N_BEFORE N_AFTER=$N_AFTER"
+
+# MP-18.4 回归：MP-12~MP-17 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-19
+step "MP-19" "recap 问询收敛：每片各问一次，问完静默（不再 s1→s2 震荡）"
+
+T="$BASE/mp19"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-19.0 init 布景 rc=0" 0
+
+# 三个已闭合切片：spec.md/spec.json → pm 参与、request.md → tl 参与、
+# closed.md = 闭合标记。**不写 session.json**：_read_label 回落目录名
+# （spec §2.1 实测走的就是这条路），替身 label 必须等于它 → xin13 传 mp19。
+for s in s1 s2 s3; do
+  d="$T/.xteam/tasks/$s"; mkdir -p "$d"
+  printf '# spec\n'     > "$d/spec.md"
+  printf '{"round":1}\n' > "$d/spec.json"
+  printf '# request\n'  > "$d/request.md"
+  printf 'closed\n'     > "$d/closed.md"
+done
+EVLOG="$T/.xteam/watch/events.log"
+IDLE="$T/.xteam/watch/idle.state"
+
+# 每轮跑前把 pm.recap_asked_at 归零：绕 30min 冷却，否则测不到多轮
+# （spec §2.1 的手法；冷却入口位置不许动，是 [57] 钉的）。
+zero_recap_ts() {
+  mkdir -p "$(dirname "$1")"
+  python3 -c '
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p, encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    d = {}
+d.setdefault("pm", {})["recap_asked_at"] = 0
+json.dump(d, open(p, "w", encoding="utf-8"))
+' "$1"
+}
+npc() { grep -cF 'RECAP-ASK pm ' "$EVLOG" 2>/dev/null || true; }
+
+zero_recap_ts "$IDLE"
+run xin13 "$T" mp19 "$T" watch once
+assert_rc "MP-19.1 第1轮 rc=0" 0
+grep -qF 'SAMPLE' "$EVLOG" \
+  && ok  "MP-19.0 events.log 有 SAMPLE（布景没空转）" \
+  || bad "MP-19.0 无 SAMPLE——布景空转" "$(tail -5 "$EVLOG" 2>/dev/null)"
+[ "$(npc)" = "1" ] \
+  && ok  "MP-19.1 第1轮恰新增 1 条 RECAP-ASK pm" \
+  || bad "MP-19.1 第1轮计数不对" "$(npc)"
+
+for round in 2 3; do
+  zero_recap_ts "$IDLE"
+  run xin13 "$T" mp19 "$T" watch once
+  assert_rc "MP-19.2 第 ${round} 轮 rc=0" 0
+done
+[ "$(npc)" = "3" ] \
+  && ok  "MP-19.2 三轮累计恰 3 条（每轮各问一片）" \
+  || bad "MP-19.2 三轮累计不对" "$(npc)"
+for s in s1 s2 s3; do
+  grep -F 'RECAP-ASK pm ' "$EVLOG" | grep -qF "切片 $s 闭合" \
+    && ok  "MP-19.2 reasons 覆盖 $s" \
+    || bad "MP-19.2 没问过 $s" "$(grep -F 'RECAP-ASK' "$EVLOG")"
+done
+
+zero_recap_ts "$IDLE"
+run xin13 "$T" mp19 "$T" watch once
+assert_rc "MP-19.3 第4轮 rc=0" 0
+[ "$(npc)" = "3" ] \
+  && ok  "MP-19.3 第4轮零新增（收敛）" \
+  || bad "MP-19.3 第4轮还在问（不收敛）" "$(grep -F 'RECAP-ASK' "$EVLOG")"
+
+# MP-19.4 回归：MP-12~MP-18 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-20
+step "MP-20" "队列项已开工不催 PM；未开工（无 spec.md / 目录缺失）仍催（双向）"
+
+T="$BASE/mp20"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-20.0 init 布景 rc=0" 0
+
+# 布景对齐 spec §1.1 采样：1 个已闭合切片 f-done + 队列 1 项 q1（state=doing）。
+# q1 的 spec.md 在 = 已开工（PM 的第一件产物已出）；request.md 在 = dev 正在实现
+# → dev 欠 implement，替身把它报成 working（链条在跑），idle_hits 才为空。
+d="$T/.xteam/tasks/f-done"; mkdir -p "$d"
+printf '# spec\n'   > "$d/spec.md"
+printf 'closed\n'   > "$d/closed.md"
+d="$T/.xteam/tasks/q1"; mkdir -p "$d"
+printf '# spec\n'    > "$d/spec.md"
+printf '# request\n' > "$d/request.md"
+printf '| 1 | q1 | doing | |\n' >> "$T/.xteam/QUEUE.md"
+
+# 替身：pm/tl idle，dev working（spec §1.1 的同型：下游在跑、PM 闲着）。
+mkdir -p "$BASE/bin20"
+cat > "$BASE/bin20/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wQ","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wQ:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wQ:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"},{"pane_id":"wQ:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"},{"pane_id":"wQ:p3","name":"dev-'"$LABEL"'","agent_status":"working","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wQ","tab_id":"wQ:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wQ:p1","cwd":"'"$ROOT"'"},{"pane_id":"wQ:p2","cwd":"'"$ROOT"'"},{"pane_id":"wQ:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin20/herdr"
+xin20() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin20:$PATH" LABEL=mp20 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp20 "$@" </dev/null)
+}
+
+# MP-20.1：spec.md 在（已开工）→ PM 不欠；无 idle 欠账 → 打「✓ 无欠账角色」。
+run xin20 "$T" status
+assert_rc   "MP-20.1 status rc=0" 0
+assert_line "MP-20.1 pm 行 owes=none（已开工不催）" "pm " "none"
+assert_has  "MP-20.1 打印 ✓ 无欠账角色" "✓ 无欠账角色"
+
+# MP-20.2：删 spec.md → q1 变未开工 → PM 欠 next-slice（或 start-next）。
+rm "$T/.xteam/tasks/q1/spec.md"
+run xin20 "$T" status
+assert_rc "MP-20.2 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qE 'pm.*(next-slice|start-next)' \
+  && ok  "MP-20.2 删 spec.md 后 PM 欠 next-slice/start-next" \
+  || bad "MP-20.2 删 spec.md 后 PM 仍不欠（未开工没催）" "$LAST_OUT"
+
+# MP-20.3：删掉整个 tasks/q1（未开工的另一种形态）→ 同样催。
+rm -rf "$T/.xteam/tasks/q1"
+run xin20 "$T" status
+assert_rc "MP-20.3 status rc=0" 0
+printf '%s' "$LAST_OUT" | grep -qE 'pm.*(next-slice|start-next)' \
+  && ok  "MP-20.3 目录缺失 PM 欠 next-slice/start-next" \
+  || bad "MP-20.3 目录缺失 PM 仍不欠" "$LAST_OUT"
+
+# MP-20.4 防回归：队列清空 + 有闭合切片 + 无 REPORT → PM 欠 report；写完清空。
+# report 是 overall 层义务：status/巡检读的是 obligations()（只聚合 per-task），
+# 结构上不含它；机读面是 watch once 每轮写的 index.json 的 owes（=overall_debts）。
+printf '# 队列\n\n| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n' \
+  > "$T/.xteam/QUEUE.md"
+run xin20 "$T" watch once
+assert_rc "MP-20.4 watch once rc=0" 0
+run python3 -c '
+import json, sys
+pm = (json.load(open(sys.argv[1]))["owes"].get("pm") or [])
+sys.exit(0 if any("report" in o for o in pm)
+           and not any("next-slice" in o for o in pm) else 1)
+' "$T/.xteam/index.json"
+assert_rc "MP-20.4 队列空+闭合 → PM 欠 report（且不含 next-slice）" 0
+printf '# 结项\n' > "$T/.xteam/REPORT.md"
+run xin20 "$T" watch once
+assert_rc "MP-20.4b watch once rc=0" 0
+run python3 -c '
+import json, sys
+sys.exit(0 if not json.load(open(sys.argv[1]))["owes"].get("pm") else 1)
+' "$T/.xteam/index.json"
+assert_rc "MP-20.4b 写完 REPORT 后 PM 清空" 0
+
+# MP-20.5 回归：MP-12~MP-19 断言继续全过即自动满足（末行 N/N）。
+
+# ---------------------------------------------------------------- MP-21
+step "MP-21" "report 义务进 status 角色表：看得见 + 不误报 + 不挤掉 next-slice"
+
+T="$BASE/mp21"
+mkrepo "$T" fe api admin
+run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
+assert_rc "MP-21.0 init 布景 rc=0" 0
+
+# 布景：1 个已闭合切片 + 队列空（init 默认无 pending 行）+ 无 REPORT.md。
+# (项目):report 是 overall_debts() 层义务——修复前 status 角色表显示 pm=none。
+d="$T/.xteam/tasks/f-done"; mkdir -p "$d"
+printf '# spec\n' > "$d/spec.md"
+printf 'closed\n'  > "$d/closed.md"
+
+# 替身同 MP-20 的形状（pm/tl idle、dev working），label 参数化。
+mkdir -p "$BASE/bin21"
+cat > "$BASE/bin21/herdr" <<'EOF'
+#!/bin/sh
+case "$1 $2" in
+  "workspace list") printf '%s\n' '{"result": {"workspaces": [{"workspace_id":"wR","label":"'"$LABEL"'","pane_count":3,"tab_count":1,"active_tab_id":"wR:t1","agent_status":"idle","focused":false}]}}' ;;
+  "agent list")     printf '%s\n' '{"result": {"agents": [{"pane_id":"wR:p1","name":"pm-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wR","tab_id":"wR:t1"},{"pane_id":"wR:p2","name":"tl-'"$LABEL"'","agent_status":"idle","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wR","tab_id":"wR:t1"},{"pane_id":"wR:p3","name":"dev-'"$LABEL"'","agent_status":"working","state_change_seq":1,"cwd":"'"$ROOT"'","workspace_id":"wR","tab_id":"wR:t1"}]}}' ;;
+  "pane list")      printf '%s\n' '{"result": {"panes": [{"pane_id":"wR:p1","cwd":"'"$ROOT"'"},{"pane_id":"wR:p2","cwd":"'"$ROOT"'"},{"pane_id":"wR:p3","cwd":"'"$ROOT"'"}]}}' ;;
+  *) printf '%s\n' '{"result": {}}' ;;
+esac
+EOF
+chmod +x "$BASE/bin21/herdr"
+xin21() {
+  local t="$1"; shift
+  (cd "$t" && PATH="$BASE/bin21:$PATH" LABEL=mp21 ROOT="$t" \
+    python3 "$REPO/bin/xteam" --project "$t" --workspace mp21 "$@" </dev/null)
+}
+
+# MP-21.1：pm 行含 report，且「该动没动」段有 pm 提示行。
+run xin21 "$T" status
+assert_rc   "MP-21.1 status rc=0" 0
+assert_line "MP-21.1 pm 行含 report" "pm " "report"
+assert_has  "MP-21.1 该动没动段有 pm 欠 report" "欠 report"
+
+# MP-21.2：写 REPORT.md → pm 行不再含 report（义务消失，不误报）。
+printf '# 结项\n' > "$T/.xteam/REPORT.md"
+run xin21 "$T" status
+assert_rc   "MP-21.2 status rc=0" 0
+assert_line "MP-21.2 pm 行不含 report（不误报）" "pm " "none" "report"
+assert_has  "MP-21.2 恢复 ✓ 无欠账角色" "✓ 无欠账角色"
+
+# MP-21.3：队列有未开工项（tasks/q9 无 spec.md）→ pm 行是 next-slice 不是 report。
+rm -f "$T/.xteam/REPORT.md"
+printf '| 1 | q9 | todo | |\n' >> "$T/.xteam/QUEUE.md"
+run xin21 "$T" status
+assert_rc   "MP-21.3 status rc=0" 0
+assert_line "MP-21.3 pm 行是 next-slice" "pm " "next-slice"
+assert_line "MP-21.3 pm 行不含 report（不挤掉）" "pm " "" "report"
+
+# MP-21.4 回归：MP-12~MP-20 断言继续全过即自动满足（末行 N/N）。
 
 # ---------------------------------------------------------------- 收尾
 printf '\n'

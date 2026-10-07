@@ -2827,6 +2827,191 @@ def test_confirm_delivery_conditional_enter() -> None:
           (False, "done", True))
 
 
+def test_cli_surface_populated_through_main() -> None:
+    print("\n[71] CLI 面快照经过 main() 才定型（F-6 口径）")
+    import contextlib
+    import io
+
+    orig_argv = sys.argv
+    orig_surface = list(_cli._CLI_SURFACE)
+    try:
+        sys.argv = ["xteam", "--version"]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                _cli.main()          # 快照必须在所有 add_parser 之后才取得到全集
+            except SystemExit:
+                pass
+        surface = _cli._cli_surface()
+        check("经 main() 后 CLI 面非空", bool(surface), True)
+        for c in ("say", "status", "watch", "contracts", "up"):
+            check(f"CLI 面含 {c}", c in surface, True)
+        check("二级子命令不进一级面",
+              "list" not in surface and "new" not in surface
+              and "run" not in surface, True)
+    finally:
+        sys.argv = orig_argv
+        _cli._CLI_SURFACE[:] = orig_surface   # 快照别漏给后面的用例
+
+
+def test_nag_self_stale_three_states() -> None:
+    print("\n[72] _nag_self_stale 三态：缺失/损坏静默 · 不一致报 · 一致不报")
+    import hashlib
+
+    tmp = Path(tempfile.mkdtemp())
+    logf = tmp / "watch" / "events.log"
+    tracker = IdleTracker(tmp / "watch" / "idle.state")
+    self_file = tmp / ".xteam" / "watch" / "self.json"
+
+    def stale_lines() -> list[str]:
+        if not logf.exists():
+            return []
+        return [ln for ln in logf.read_text(encoding="utf-8").splitlines()
+                if "SELF-STALE" in ln]
+
+    # 记录缺失 → 静默。
+    _cli._nag_self_stale(tmp, logf, tracker)
+    check("无 self.json 不报", stale_lines(), [])
+
+    # 记录损坏 → 静默（不得崩）。
+    self_file.parent.mkdir(parents=True, exist_ok=True)
+    self_file.write_text("{broken", encoding="utf-8")
+    _cli._nag_self_stale(tmp, logf, tracker)
+    check("self.json 损坏不报", stale_lines(), [])
+
+    # 指纹不同 → SELF-STALE 且提重启；冷却内不重复喊。
+    self_file.write_text(json.dumps({"bin_xteam_sha256": "0" * 64}),
+                         encoding="utf-8")
+    _cli._nag_self_stale(tmp, logf, tracker)
+    lines = stale_lines()
+    check("指纹不一致报 SELF-STALE", len(lines), 1)
+    check("SELF-STALE 行提到重启", "重启" in lines[0], True)
+    _cli._nag_self_stale(tmp, logf, tracker)
+    check("冷却内不重复报", len(stale_lines()), 1)
+
+    # 指纹相同 → 不报，且清掉冷却（下次真变能立刻喊）。
+    cur = hashlib.sha256(Path(_cli.__file__).resolve()
+                         .read_bytes()).hexdigest()
+    self_file.write_text(json.dumps({"bin_xteam_sha256": cur}),
+                         encoding="utf-8")
+    _cli._nag_self_stale(tmp, logf, tracker)
+    check("指纹一致不报", len(stale_lines()), 1)
+    check("一致后冷却已清", "nag:self-stale" not in tracker.state, True)
+
+
+def test_recap_asked_set_converges() -> None:
+    print("\n[73] recap 集合记账：三片各问一次后收敛；context 空串不污染")
+    tmp = Path(tempfile.mkdtemp())
+    tr = IdleTracker(tmp / "idle.state")
+    for t in ("s1", "s2", "s3"):
+        tr.set_recap_asked("pm", t)
+    check("三片都进已问集合", tr.recap_asked_all("pm"), {"s1", "s2", "s3"})
+    check("单槽位仍记最近一次（兼容读法）", tr.recap_asked_for("pm"), "s3")
+
+    tr.set_recap_asked("pm", "")            # context 分支写空串的那次
+    check("context 空串不进集合", tr.recap_asked_all("pm"),
+          {"s1", "s2", "s3"})
+    check("空串仍进单槽位（冷却用例语义不变）", tr.recap_asked_for("pm"), "")
+
+    tr.set_recap_asked("pm", "s1")
+    check("重复问同一片不重复记", tr.recap_asked_all("pm"),
+          {"s1", "s2", "s3"})
+    tr2 = IdleTracker(tmp / "idle.state")
+    check("集合跨实例持久", tr2.recap_asked_all("pm"), {"s1", "s2", "s3"})
+    check("alerted 阶梯仍不被污染（[52] 不变量）", tr2.alerted("pm"), 0)
+
+
+def test_unstarted_queue_gate_for_pm_nags() -> None:
+    print("\n[74] 未开工判据：spec.md 在=已开工不催 PM；无 spec.md/目录缺失仍催（F-11）")
+    # 闭合切片 + 队列 pending 项已开工 → PM 不欠（下游在跑是合法等待）
+    b = Bench("done1")
+    try:
+        (b.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | done1 | done | |\n| 2 | q1 | doing | |\n", encoding="utf-8")
+        b.advance_to("closed")
+        # q1 已开工 = spec.md 在；补到共识完成（TL 欠 decompose），让 PM 无 per-task
+        # 债务——才能看到「不补 start-next」是判据所致而不是被别的欠账盖住。
+        q1 = b.proto.tasks / "q1"
+        q1.mkdir()
+        (q1 / "spec.md").write_text("# spec\n", encoding="utf-8")
+        (q1 / "spec.json").write_text('{"round": 1}\n', encoding="utf-8")
+        (q1 / "assessment.json").write_text(
+            '{"spec_round": 1, "verdict": "agree"}\n', encoding="utf-8")
+        (q1 / "agreement.json").write_text(
+            '{"spec_round": 1}\n', encoding="utf-8")
+        check("队列项已开工 → next-slice 让位（PM 不欠）", b.owes("pm"), [])
+        check("已开工 → overall 也不补 start-next",
+              b.proto.overall_debts().get("pm"), None)
+        check("欠账落在下游 TL（decompose），不是 PM",
+              b.proto.overall_debts().get("tl"), ["q1:decompose"])
+        (q1 / "spec.md").unlink()
+        check("删 spec.md = 未开工 → PM 欠 next-slice",
+              b.owes("pm"), ["next-slice"])
+        shutil.rmtree(q1)
+        check("目录缺失（未开工另一形态）→ 仍欠 next-slice",
+              b.owes("pm"), ["next-slice"])
+    finally:
+        b.cleanup()
+
+    # start-next 补位：无人欠账 + 队列有未开工项才催；开工后不补
+    b2 = Bench("probe")
+    try:
+        b2.task.rmdir()                                    # 没有任何切片目录
+        (b2.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | q9 | todo | |\n", encoding="utf-8")
+        check("队列有未开工项且无人欠账 → PM 欠 start-next",
+              b2.proto.overall_debts().get("pm"), ["(队列):start-next"])
+        q9 = b2.proto.tasks / "q9"
+        q9.mkdir(parents=True)
+        (q9 / "spec.md").write_text("# spec\n", encoding="utf-8")
+        (q9 / "spec.json").write_text('{"round": 1}\n', encoding="utf-8")
+        (q9 / "assessment.json").write_text(
+            '{"spec_round": 1, "verdict": "agree"}\n', encoding="utf-8")
+        (q9 / "agreement.json").write_text(
+            '{"spec_round": 1}\n', encoding="utf-8")
+        check("q9 已过共识（已开工）→ PM 不欠 start-next",
+              b2.proto.overall_debts().get("pm"), None)
+        check("欠账落在下游 TL（decompose），不是 PM",
+              b2.proto.overall_debts().get("tl"), ["q9:decompose"])
+    finally:
+        b2.cleanup()
+
+    # 「队列空 + 闭合 → report」分支不受新判据影响（禁区，防回归再钉一次）
+    b3 = Bench("fin")
+    try:
+        (b3.proto.dir / "QUEUE.md").write_text(
+            "| # | 切片 | 状态 | 备注 |\n|---|---|---|---|\n"
+            "| 1 | fin | done | |\n", encoding="utf-8")
+        b3.advance_to("closed")
+        check("队列全 done + 闭合 + 无 REPORT → PM 欠 report（不变）",
+              b3.proto.overall_debts().get("pm"), ["(项目):report"])
+    finally:
+        b3.cleanup()
+
+
+def test_status_merges_overall_synthetic_debts() -> None:
+    print("\n[75] status 合并 overall 合成项：无 per-task 时显示、有则不覆盖（F-12）")
+    merge = _cli._merge_overall_pending
+    check("无 per-task + overall 有 report → 显示",
+          merge([], ["(项目):report"]), [("(项目)", "report")])
+    check("合成名拆回 (scope, obligation) 同形",
+          merge([], ["(队列):start-next"]), [("(队列)", "start-next")])
+    check("有 per-task 欠账 → 不覆盖（report 不挤掉 next-slice）",
+          merge([("f-done", "next-slice")], ["(项目):report"]),
+          [("f-done", "next-slice")])
+    check("两边都空 → 空", merge([], []), [])
+    check("多条合成项全映射",
+          merge([], ["(项目):report", "(队列):start-next"]),
+          [("(项目)", "report"), ("(队列)", "start-next")])
+
+    src = Path(_cli.__file__).read_text(encoding="utf-8")
+    check("cmd_status 走合并函数（接线在）",
+          "_merge_overall_pending(debts.get(role" in src, True)
+    check("合并前取了 overall_debts", "overall = proto.overall_debts()" in src, True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -2899,6 +3084,11 @@ def main() -> int:
         test_herdr_missing_converges_and_never_swallows,
         test_prompt_blocked_roles_detection,
         test_confirm_delivery_conditional_enter,
+        test_cli_surface_populated_through_main,
+        test_nag_self_stale_three_states,
+        test_recap_asked_set_converges,
+        test_unstarted_queue_gate_for_pm_nags,
+        test_status_merges_overall_synthetic_debts,
     ):
         fn()
     print()

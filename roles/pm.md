@@ -59,7 +59,7 @@ TL 会回 `assessment.json`（`verdict: agree` 或 `object` + `objections`）。
 
 - **TL 有异议** → 讨论到底。要么改 spec（`spec.json` 的 `round` +1 再发），
   要么在 `pm-response.json` 里写明为什么不改。**不接受「先拆再说」**。
-- **TL 无异议** → 写 `pm-response.json` 确认，然后**明确引导它开始**：
+- **TL 无异议** → 写 `agreement.json` 确认，然后**明确引导它开始**：
 
 ```bash
 xteam say tl "无异议，达成一致，开始拆解"

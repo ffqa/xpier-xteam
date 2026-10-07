@@ -38,7 +38,7 @@ xteam say pm "spec 评估：.xteam/tasks/<slug>/assessment.json"
 
 **沉默是违规的。** PM 不知道你有没有意见，就不会让 dev 开工，整条链就停在那。
 
-PM 回应后（`pm-response.json`），如果达成一致，你才写 `request.md` 开始拆解。
+PM 回应后（`agreement.json`），如果达成一致，你才写 `request.md` 开始拆解。
 如果 PM 改了 spec（`spec.json` 的 round +1），就对新版本重新评估一轮。
 
 ### 2. 拆解与细化

@@ -901,7 +901,7 @@ class Protocol:
     def overall_debts(self) -> dict[str, list[str]]:
         """role -> ["<task>:<obligation>", ...]，跨全部 task 汇总。
 
-        **队列有活却没人欠账时，PM 欠 `start-next`。**
+        **队列有未开工项却没人欠账时，PM 欠 `start-next`。**
         没有这一条会出现一个既没人在干活、也没人负责的真空：项目里还没有切片
         目录（或全部闭合），`debts()` 什么都不产出，于是 `idle + owes:none` 被巡检
         判成「合法终态」—— 而人类看到的是「三个 pane 全闲着，队列里明明有活」。
@@ -911,7 +911,7 @@ class Protocol:
         for t in self.all_tasks():
             for role, ob in self.debts(t).items():
                 out.setdefault(role, []).append(f"{t.name}:{ob}")
-        if not out.get("pm") and self.queue_counts()[0] > 0:
+        if not out.get("pm") and self._unstarted_items():
             out["pm"] = ["(队列):start-next"]
         # **队列全闭合但 REPORT.md 缺失 → PM 欠 report。** 切片 closed 只意味
         # 「这片做完了」，而人类要的是「整个项目做完后能部署、能测试、有人接」。
@@ -1081,11 +1081,11 @@ class Protocol:
 
         if closed:
             out["pm"] = "next-slice"
-        # **队列空了 next-slice 让位给 report。** 单个切片 closed 只意味「这片做完了」；
-        # 队列还有活时，催 PM 去取下一项是对的（别停）。队列空了再催「取下一项」就是空转——
-        # 真正的收尾是结项报告，由 overall_debts 按「队列空 + 有闭合切片 + 无 REPORT」判定。
-        # 这里只清「队列空」的情况：队列有活时 next-slice 照常。
-        if closed and self.queue_counts()[0] == 0:
+        # **队列里没有未开工项时 next-slice 让位。** 单个切片 closed 只意味「这片做完了」；
+        # 队列有未开工项时，催 PM 去取下一项是对的（别停）。队列空、或队列里的项全已开工
+        # （spec.md 已出、下游在跑）时再催就是空转/误催——前者由 overall_debts 的
+        # 「队列空 + 有闭合切片 + 无 REPORT」接去催 report，后者是 PM 的合法等待。
+        if closed and not self._unstarted_items():
             out.pop("pm", None)
         return out
 
@@ -1281,6 +1281,17 @@ class Protocol:
         items = self.queue_items()
         pending = [i for i in items if i["state"] not in ("done", "已闭合")]
         return len(pending), len(items)
+
+    def _unstarted_items(self) -> list[dict]:
+        """队列里未开工的项：state 未完成 且 `tasks/<slug>/spec.md` 不存在。
+
+        spec.md 是 PM 的第一件产物——它存在 = 片子已被开工（spec 共识/拆解/实现
+        交给下游在跑），此时 PM「不欠取下一项」是合法等待；只有还存在连 spec 都
+        没写的队列项（或目录整个缺失）时，催 PM 取下一项才有意义。
+        """
+        return [i for i in self.queue_items()
+                if i["state"] not in ("done", "已闭合")
+                and not (self.tasks / i["slice"] / "spec.md").exists()]
 
     def recommended_task(self) -> dict | None:
         for item in self.queue_items():
@@ -2413,9 +2424,25 @@ class IdleTracker:
         """
         return str(self.state.get(role, {}).get("recap_asked", ""))
 
+    def recap_asked_all(self, role: str) -> set[str]:
+        """已经向这个角色要过 recap 的**所有**切片名。
+
+        `recap_asked` 单槽位只能记一个切片：问完 s1 再问 s2，s1 就被冲掉，
+        下一轮判据以为 s1 没问过 → s1→s2→s1→s2 震荡，第三个切片永远轮不到。
+        判据必须读集合；单槽位只留作「最近一次问的对象」兼容读法（既有
+        用例与 context 空串语义都靠它），不再参与判据。
+        """
+        v = self.state.get(role, {}).get("recap_asked_all") or []
+        return {str(x) for x in v}
+
     def set_recap_asked(self, role: str, task: str) -> None:
-        self.state.setdefault(role, {})["recap_asked"] = task
-        self.state[role]["recap_asked_at"] = int(time.time())
+        rec = self.state.setdefault(role, {})
+        rec["recap_asked"] = task            # 单槽位仍写「最近一次」（兼容读法）
+        if task:                           # context 触发的空串不进集合
+            asked = rec.setdefault("recap_asked_all", [])
+            if task not in asked:
+                asked.append(task)
+        rec["recap_asked_at"] = int(time.time())
         self.flush()
 
     def recap_asked_ago(self, role: str) -> int:

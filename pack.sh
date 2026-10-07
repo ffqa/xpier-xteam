@@ -266,7 +266,8 @@ for must in "$NAME/bin/xteam" "$NAME/bin/xteam_lib.py" "$NAME/install.sh" \
             "$NAME/roles/pm.md" "$NAME/templates/PROTOCOL.md" \
             "$NAME/skills/ste/SKILL.md" \
             "$NAME/README.md" "$NAME/INSTALL.md" "$NAME/VERSION" \
-            "$NAME/LICENSE" "$NAME/CHANGELOG.md" "$NAME/tests/smoke.sh"; do
+            "$NAME/LICENSE" "$NAME/CHANGELOG.md" "$NAME/tests/smoke.sh" \
+            "$NAME/tests/e2e_multi.sh"; do
   echo "$CONTENTS" | grep -qx "$must" || die "包缺 $must"
 done
 

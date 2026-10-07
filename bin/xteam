@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1820,6 +1821,16 @@ def _dispatch(args: argparse.Namespace) -> int:
         raise
 
 
+def _merge_overall_pending(pending: list, overall: list) -> list:
+    """per-task 无欠账时回填 overall 合成项，并把 `scope:obligation` 拆回
+    obligations() 的同形 [(scope, obligation)]——`(项目):report` →
+    (`(项目)`, `report`)。per-task 已有欠账不覆盖：report 不得挤掉
+    next-slice（此时 overall 对该角色本来就为空，双保险）。"""
+    if pending:
+        return pending
+    return [tuple(x.split(":", 1)) for x in overall]
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     _require_herdr()
@@ -1860,13 +1871,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
 
     debts = proto.obligations()
+    # `(项目):report` / `(队列):start-next` 是 overall_debts() 层的合成义务，
+    # obligations() 只聚合 per-task —— 不合并它们，人看角色表会以为无欠账。
+    overall = proto.overall_debts()
     rows = []
     for role in BOOT_ORDER:
         agent = role_map.get(role)
         if not agent:
             continue
         status = agent.get("agent_status", "unknown")
-        pending = debts.get(role, [])
+        pending = _merge_overall_pending(debts.get(role, []), overall.get(role, []))
         if pending:
             owes = pending[0][1]
             where = f"{pending[0][0]}" + (f" +{len(pending)-1}" if len(pending) > 1 else "")
@@ -2012,6 +2026,37 @@ def _nag_drift(root: Path, logf: Path, tracker: IdleTracker) -> None:
         tracker.clear_nag("nag:update")
 
 
+def _self_sha() -> str:
+    """当前磁盘上 bin/xteam 的指纹（读的是文件，不是进程里的旧代码）。"""
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
+
+def _nag_self_stale(root: Path, logf: Path, tracker: IdleTracker) -> None:
+    """巡检在跑的代码 ≠ 磁盘上的 bin/xteam → SELF-STALE（带冷却，不自动重启）。
+
+    基准是 `watch run` 启动那一刻写下的 `.xteam/watch/self.json`。记录缺失或
+    损坏 → 静默返回（无基准不误报：旧版本启动的巡检就没有这条记录）。只提示
+    不重启——自杀式重启会引入「谁重启谁」的循环，与 pane 的「只提示不自动
+    重投」同一条纪律。
+    """
+    try:
+        recorded = json.loads((root / XTEAM_DIRNAME / "watch" / "self.json")
+                              .read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    base = str(recorded.get("bin_xteam_sha256") or "")
+    if not base:
+        return
+    if _self_sha() == base:
+        # 指纹回来了（回滚/重装回原样）：清冷却，下次真变立刻能喊。
+        tracker.clear_nag("nag:self-stale")
+        return
+    if tracker.nag_gate("nag:self-stale", NAG_DRIFT_TTL):
+        log_event(logf,
+                  "SELF-STALE 巡检在跑旧代码（与磁盘上的 bin/xteam 指纹不一致）"
+                  " —— xteam watch stop && xteam watch start 重启巡检")
+
+
 def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> None:
     proto = Protocol(root)
     proto.ensure()
@@ -2034,6 +2079,7 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
     #     不冷却的话一晚上能把人吵醒很多次。
     try:
         _nag_drift(root, logf, tracker)
+        _nag_self_stale(root, logf, tracker)
     except Exception as exc:                 # 提醒失败绝不能带倒巡检
         log_event(logf, f"DRIFT-CHECK-FAILED {type(exc).__name__}")
     # 「本来该有哪些角色」以 session.json 为准，而不是「BOOT_ORDER 全都算」。
@@ -2253,7 +2299,7 @@ def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path)
                 continue
             if role not in roles_touched_task(t):
                 continue                    # 没参与就别凭空编一段
-            if tracker.recap_asked_for(role) == t.name:
+            if t.name in tracker.recap_asked_all(role):
                 continue                    # 这个切片已经问过了
             need, why = True, f"切片 {t.name} 闭合"
             break
@@ -2897,6 +2943,14 @@ def cmd_watch_run(args: argparse.Namespace) -> int:
     pidfile = root / XTEAM_DIRNAME / "watch" / WATCHDOG_PID
     pidfile.write_text(str(os.getpid()))
     log_event(logf, f"WATCHDOG-STARTED pid={os.getpid()} project={root}")
+    # 启动那一刻的自身代码指纹，run 每轮拿它跟磁盘上的 bin/xteam 比
+    # （_nag_self_stale）。**只在这里写一次**：每轮重写等于比对恒等，功能是死的
+    # （F-6 同型）；`watch once` 是单轮诊断不是常驻进程，不写这条记录。
+    (root / XTEAM_DIRNAME / "watch" / "self.json").write_text(
+        json.dumps({"bin_xteam_sha256": _self_sha(),
+                    "pid": os.getpid(),
+                    "recorded_at": int(time.time())}, ensure_ascii=False),
+        encoding="utf-8")
 
     def bye(signum, _frame):
         log_event(logf, f"WATCHDOG-EXITED reason=signal{'' if signum != signal.SIGTERM else '=TERM'} pid={os.getpid()}")
@@ -3048,9 +3102,6 @@ def main() -> int:
     # 不能 required=True —— 那样 `xteam --version` / `xteam -h` 会先被
     # 「必须给子命令」拦下，用户根本看不到版本信息。改为缺命令时自己提示。
     sub = ap.add_subparsers(dest="cmd")
-    # 命令面在这里定型，所以就在这里快照 —— 任何新加的子命令自动被算进
-    # 「上次投给 pane 的那版 CLI 面」的差集里（见 _cli_surface）。
-    _CLI_SURFACE[:] = sorted(sub.choices)
 
     p = sub.add_parser("agents", help="列出可编排的 agent 及其模型能力（本机实测）")
     p.set_defaults(func=cmd_agents)
@@ -3205,6 +3256,11 @@ def main() -> int:
 
     p = sub.add_parser("down", help="关掉 workspace")
     p.set_defaults(func=cmd_down)
+
+    # 命令面到**这里**才定型，快照必须放在所有 add_parser 之后——
+    # 原来放在 choices 还是空集的位置执行，存进 rules.json 的 cli 永远是 []，
+    # cli_drift 的「新增了哪些子命令」告知也就永远触发不了（见 _cli_surface）。
+    _CLI_SURFACE[:] = sorted(sub.choices)
 
     check_assets()
     args = ap.parse_args()
