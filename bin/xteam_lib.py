@@ -464,7 +464,7 @@ def clean_pane_preview(raw: str, max_lines: int = 3) -> list[str]:
         if not text:
             continue
         stripped = text.strip("│┃╭╰╮╯┌┐└┘ \t")
-        if stripped in ("", "❯", "❭", ">", "█", "·", "|"):
+        if stripped in ("", "❯", "❭", ">", "█", "·", "|", "▼", "▲", "▶", "◀"):
             continue
         if any(re.search(pat, text, re.IGNORECASE) for pat in TUI_NOISE_PATTERNS):
             continue
