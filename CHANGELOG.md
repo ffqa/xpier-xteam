@@ -1,5 +1,12 @@
 # 变更记录
 
+## 0.2.10
+
+### 修复 `xteam board` 实时活动预览：剥离 TUI 边框与脚手架噪声，呈现真实业务输出
+
+- **智能清洗 TUI 边框与脚手架噪声**：新增 `clean_pane_preview()`，读足 35 行并强力过滤现代 Agent CLI（omp、grok、devin、claude 等）底部的输入框边框（`╰────`）、快捷键提示（`Shift+Tab:mode`、`Ctrl+.:shortcuts`）、光标 `█` 及模型审批状态栏，只保留真正有价值的 Agent 业务输出。
+- **呈现真实 Agent 活动与活动标题**：实时提取各角色正在执行的命令、思考耗时、关键疑问与状态变更，并附带各 Agent 的实时 Terminal 标题与 Kind 标识。
+
 ## 0.2.9
 
 ### 切片级会话轮换、冷读审查门禁与 0-Token 实时看版

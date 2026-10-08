@@ -426,17 +426,59 @@ def render_board(state: dict, color: bool = False) -> str:
     panes_live = []
     for r in roles:
         tail = r.get("tail")
-        if tail:
-            panes_live.append((r.get("role", ""), tail))
+        title = r.get("activity_title")
+        kind = r.get("agent_kind") or ""
+        if tail or title:
+            panes_live.append((r.get("role", ""), kind, title or "", tail or []))
     if panes_live:
         out.append("")
         out.append(_ansi("── 实时活动 (Pane Preview · 0 Token) ──────────────────", "36", color))
-        for r_name, lines in panes_live:
-            prefix = _ansi(f"  [{r_name:<4}]", "32", color)
-            for idx, line in enumerate(lines):
-                bullet = "└─" if idx == len(lines) - 1 else "├─"
-                out.append(f"{prefix} {bullet} {line[:95]}")
+        for r_name, kind, title, lines in panes_live:
+            kind_tag = f" ({kind})" if kind else ""
+            title_part = f" {title}" if title else ""
+            header = _ansi(f"  [{r_name:<4}]", "32", color) + _ansi(f"{title_part}{kind_tag}", "1", color)
+            out.append(header)
+            if lines:
+                for idx, line in enumerate(lines):
+                    bullet = "└─" if idx == len(lines) - 1 else "├─"
+                    out.append(f"         {bullet} {line[:95]}")
+            else:
+                out.append("         └─ （暂无活动输出）")
     return "\n".join(out)
+
+
+TUI_NOISE_PATTERNS = (
+    r"Shift\+Tab", r"Ctrl\+\.", r"Ctrl\+c", r"ctrl\+v to paste",
+    r"QuickTUI Server", r"always-approve", r"SWE-\d+", r"bypass permissions",
+    r"Ask Devin to", r"^[│┃\s]*[❯❭>][│┃\s]*$", r"^[─━═╭╮╰╯│┃┌┐└┘\s\-_=+~]+$",
+    r"^\s*█\s*$", r"^---EOF---$", r"^\s*·\s*$", r"^\s*\|\s*$",
+    r"^[└┌├│┃\s]*Exited with code 0\s*$",
+)
+
+
+def clean_pane_preview(raw: str, max_lines: int = 3) -> list[str]:
+    """清洗 pane 终端可见文本，剥离 TUI 底栏、输入框边框与快捷键状态栏噪声，提炼真实业务输出。"""
+    cleaned: list[str] = []
+    for line in raw.splitlines():
+        text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", line).strip()
+        if not text:
+            continue
+        stripped = text.strip("│┃╭╰╮╯┌┐└┘ \t")
+        if stripped in ("", "❯", "❭", ">", "█", "·", "|"):
+            continue
+        if any(re.search(pat, text, re.IGNORECASE) for pat in TUI_NOISE_PATTERNS):
+            continue
+        # 框线字符占比过高（边框横线）
+        box_chars = sum(1 for c in text if c in "─━═╭╮╰╯│┃┌┐└┘-+_~")
+        if len(text) > 4 and (box_chars / len(text)) > 0.4:
+            continue
+        # 剥离行首纯结构性前缀符号
+        text_clean = re.sub(r"^[│┃└┌├─\s]+", "", text).strip()
+        if not text_clean or text_clean in ("---EOF---", "█"):
+            continue
+        cleaned.append(text_clean)
+    return cleaned[-max_lines:]
+
 
 # 原地开新会话的斜杠命令：kind → 命令。
 # 实测 omp / pi：`/new` 开新会话（omp 的 herdr `agent_session` 路径随之变化），

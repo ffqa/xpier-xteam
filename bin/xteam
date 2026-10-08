@@ -40,6 +40,7 @@ from xteam_lib import (  # noqa: E402
     PHASES,
     Protocol,
     render_board,
+    clean_pane_preview,
     detect_choice_prompt,
     ROLES,
     RoleSpec,
@@ -2501,13 +2502,15 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         tail_lines = []
         if pane:
             try:
-                raw_text = herdr.read_pane(pane, lines=5, source="visible")
-                tail_lines = [re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", ln).strip()
-                              for ln in raw_text.splitlines() if ln.strip()][-2:]
+                raw_text = herdr.read_pane(pane, lines=35, source="visible")
+                tail_lines = clean_pane_preview(raw_text, max_lines=3)
             except Exception:                    # noqa: BLE001
                 tail_lines = []
+        title_summary = str(agent.get("terminal_title_stripped") or agent.get("terminal_title") or "").strip()
         rows.append({"role": role, "status": status, "owes": owes, "where": where,
                      "box": box, "pane": pane, "tail": tail_lines,
+                     "agent_kind": str(agent.get("agent") or ""),
+                     "activity_title": title_summary,
                      "held": fmt_duration(int(time.time()) - int(since)) if since else "-"})
 
     blocked_on_prompt = []
