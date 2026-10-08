@@ -4042,12 +4042,156 @@ def test_render_board_and_choice_detector() -> None:
     check("没有角色时说清是空的",
           "（没有在跑的角色）" in render_board({"roles": []}), True)
 
+    state_with_tail = {
+        "title": "xteam board",
+        "roles": [
+            {"role": "dev", "status": "working", "owes": "implement", "held": "1m",
+             "tail": ["cargo build ... ok", "cargo test ... passed"]},
+        ],
+    }
+    frame_tail = render_board(state_with_tail)
+    check("实时活动块在", "实时活动 (Pane Preview · 0 Token)" in frame_tail, True)
+    check("角色活动包含采样行", "cargo test ... passed" in frame_tail, True)
+
     # 实测形状：omp 的多选框（android_dev 里 tl 停的那个）。
     choice_tail = ("|   [ ] 应用管理                        |\n"
                    "|   [ ] Other (type your own)           |\n"
                    "| Space toggle · Enter next · Up/Down move · Esc cancel |\n")
     check("omp 的选择框 → 认出来", detect_choice_prompt(choice_tail), True)
     check("普通输出 → 不误判", detect_choice_prompt("正在跑测试…\n"), False)
+
+
+def test_down_fallback_and_tabs_tracking() -> None:
+    print("\n[96] down 的 tab 动态兜底与 session.json tabs 清理")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        (proto.dir / "session.json").write_text(json.dumps({
+            "workspace": "Sites",
+            "workspace_id": "w28",
+            "tabs": {},
+            "panes": {"tl": "w28:p8"},
+        }))
+
+        closed_tabs: list[str] = []
+
+        class FakeDownHerdr:
+            def __init__(self, scope: str = "") -> None:
+                self.scope = scope
+
+            def find_workspace(self, label: str) -> dict | None:
+                return {"workspace_id": "w28", "label": "Sites"}
+
+            def role_map(self, ws_id: str) -> dict[str, dict]:
+                return {"tl": {"name": "tl-Sites", "pane_id": "w28:p8", "tab_id": "w28:t8"}}
+
+            def _run(self, *args: str, **kwargs) -> dict:
+                if len(args) >= 2 and args[:2] == ("tab", "list"):
+                    return {"tabs": [{"tab_id": "w28:t8", "label": "tl-Sites"}]}
+                return {}
+
+            def close_tab(self, tab_id: str) -> None:
+                closed_tabs.append(tab_id)
+
+        orig_herdr = _cli.Herdr
+        orig_require = _cli._require_herdr
+        orig_watchdog = _cli._stop_watchdog
+        try:
+            _cli.Herdr = FakeDownHerdr
+            _cli._require_herdr = lambda: None
+            _cli._stop_watchdog = lambda r, p: None
+            rc = _cli.cmd_down(argparse.Namespace(project=str(root), workspace="Sites"))
+            check("down 成功返回 0", rc, 0)
+            check("session.json 为空时，通过 role_map 兜底关掉 tl 的 tab", closed_tabs, ["w28:t8"])
+            session_data = json.loads((proto.dir / "session.json").read_text(encoding="utf-8"))
+            check("down 之后 session 状态标为 panes-down", session_data.get("state"), "panes-down")
+            check("down 之后 panes 被清空", session_data.get("panes"), {})
+            check("down 之后 tabs 被清空", session_data.get("tabs"), {})
+        finally:
+            _cli.Herdr = orig_herdr
+            _cli._require_herdr = orig_require
+            _cli._stop_watchdog = orig_watchdog
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_auto_rotate_and_cold_review() -> None:
+    print("\n[97] 切片级会话轮换（Auto-Rotate）与冷读审查门禁（Cold-Context Review）")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+
+        # 1. IdleTracker 轮换跟踪
+        tracker_file = root / "idle.state"
+        tr = IdleTracker(tracker_file)
+        check("初始未轮换", tr.rotated_for("dev"), "")
+        check("初始轮换集合为空", tr.rotated_all("dev"), set())
+        tr.set_rotated("dev", "slice-1")
+        check("记下最近轮换切片", tr.rotated_for("dev"), "slice-1")
+        check("记下集合", tr.rotated_all("dev"), {"slice-1"})
+        tr.set_rotated("dev", "slice-2")
+        check("集合累加", tr.rotated_all("dev"), {"slice-1", "slice-2"})
+        # 持久化读回
+        tr2 = IdleTracker(tracker_file)
+        check("持久化读回集合", tr2.rotated_all("dev"), {"slice-1", "slice-2"})
+
+        # 2. _maybe_rotate_sessions 安全触发
+        task_dir = proto.tasks / "slice-1"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / "delivered.json").write_text(json.dumps({"round": 1}), encoding="utf-8")
+        (task_dir / "closed.md").write_text("# closed\n", encoding="utf-8")
+        mem_dir = proto.dir / "memory"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        (mem_dir / "dev-recap.md").write_text("## 做完什么\n全部通过\n", encoding="utf-8")
+
+        rotated_calls: list[str] = []
+        def fake_do_reopen(r, role, workspace="", force=False, no_recap=False,
+                           herdr=None, verbose=True):
+            rotated_calls.append(role)
+            return True, f"重开 {role} 成功"
+
+        orig_do_reopen = _cli.do_reopen
+        _cli.do_reopen = fake_do_reopen
+        try:
+            logf = root / "events.log"
+            fake_tr = IdleTracker(root / "idle2.state")
+            role_map = {"dev": {"agent_status": "idle", "pane_id": "p1"}}
+
+            orig_load_roles = _cli.load_roles
+            _cli.load_roles = lambda r: {"dev": RoleSpec("dev", "omp", "开发", "gpt-4o")}
+            try:
+                class DummyHerdr:
+                    scope = "test"
+                # 第一次触发：应该成功 rotate
+                _cli._maybe_rotate_sessions(root, DummyHerdr(), role_map, fake_tr, logf)
+                check("切片闭合且 idle 时触发 dev 轮换", rotated_calls, ["dev"])
+                check("tracker 记录已轮换切片", fake_tr.rotated_all("dev"), {"slice-1"})
+
+                # 第二次触发：同一个切片不重复轮换
+                _cli._maybe_rotate_sessions(root, DummyHerdr(), role_map, fake_tr, logf)
+                check("防抖：同一切片不重复轮换", len(rotated_calls), 1)
+
+                # 若 dev 正在 working，不打扰
+                task2 = proto.tasks / "slice-2"
+                task2.mkdir(parents=True, exist_ok=True)
+                (task2 / "delivered.json").write_text(json.dumps({"round": 1}), encoding="utf-8")
+                (task2 / "closed.md").write_text("# closed\n", encoding="utf-8")
+                role_map["dev"]["agent_status"] = "working"
+                _cli._maybe_rotate_sessions(root, DummyHerdr(), role_map, fake_tr, logf)
+                check("working 状态下跳过轮换", len(rotated_calls), 1)
+            finally:
+                _cli.load_roles = orig_load_roles
+        finally:
+            _cli.do_reopen = orig_do_reopen
+
+        # 3. 门铃冷读审查指示
+        intro = _cli._restart_intro(root, proto, "dev", "omp", "重置测试")
+        check("intro 包含单向系统恢复通知约束", "单向系统恢复通知" in intro, True)
+        check("intro 包含无需回复确认约束", "无需回复任何确认或解释" in intro, True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main() -> int:
@@ -4149,6 +4293,8 @@ def main() -> int:
         test_box_state_reads_omp_input_line,
         test_doorbell_guards_human_draft_and_retries_enter,
         test_render_board_and_choice_detector,
+        test_down_fallback_and_tabs_tracking,
+        test_auto_rotate_and_cold_review,
     ):
         fn()
     print()

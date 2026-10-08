@@ -422,6 +422,20 @@ def render_board(state: dict, color: bool = False) -> str:
         out.append(_ansi("── 最近事件 ─────────────────────────────────────────", "36", color))
         for e in events:
             out.append("  " + str(e))
+
+    panes_live = []
+    for r in roles:
+        tail = r.get("tail")
+        if tail:
+            panes_live.append((r.get("role", ""), tail))
+    if panes_live:
+        out.append("")
+        out.append(_ansi("── 实时活动 (Pane Preview · 0 Token) ──────────────────", "36", color))
+        for r_name, lines in panes_live:
+            prefix = _ansi(f"  [{r_name:<4}]", "32", color)
+            for idx, line in enumerate(lines):
+                bullet = "└─" if idx == len(lines) - 1 else "├─"
+                out.append(f"{prefix} {bullet} {line[:95]}")
     return "\n".join(out)
 
 # 原地开新会话的斜杠命令：kind → 命令。
@@ -3103,6 +3117,34 @@ class IdleTracker:
     def recap_asked_ago(self, role: str) -> int:
         """距上次要 recap 过了多少秒。没有记录返回很大值（= 可以问）。"""
         v = self.state.get(role, {}).get("recap_asked_at")
+        try:
+            return int(time.time()) - int(v) if v else 10 ** 9
+        except (TypeError, ValueError):
+            return 10 ** 9
+
+    def rotated_for(self, role: str) -> str:
+        """最近一次为哪个切片执行了会话轮换。空串=还没轮换过。"""
+        return str(self.state.get(role, {}).get("rotated_for", ""))
+
+    def rotated_all(self, role: str) -> set[str]:
+        """已经为该角色执行过会话轮换的所有切片名集合。"""
+        v = self.state.get(role, {}).get("rotated_all") or []
+        return {str(x) for x in v}
+
+    def set_rotated(self, role: str, task: str) -> None:
+        """记录已为该角色在该切片闭合后完成会话轮换。"""
+        rec = self.state.setdefault(role, {})
+        rec["rotated_for"] = task
+        if task:
+            all_rot = rec.setdefault("rotated_all", [])
+            if task not in all_rot:
+                all_rot.append(task)
+        rec["rotated_at"] = int(time.time())
+        self.flush()
+
+    def rotated_ago(self, role: str) -> int:
+        """距上次执行会话轮换过了多少秒。"""
+        v = self.state.get(role, {}).get("rotated_at")
         try:
             return int(time.time()) - int(v) if v else 10 ** 9
         except (TypeError, ValueError):

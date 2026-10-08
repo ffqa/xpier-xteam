@@ -1,5 +1,14 @@
 # 变更记录
 
+## 0.2.9
+
+### 切片级会话轮换、冷读审查门禁与 0-Token 实时看版
+
+- **切片级会话轮换（Auto-Rotate）**：吸取 Kander 瞬态执行经验，在切片闭合（`closed.md`）且 recap 归档后，巡检对空闲 DEV 原地执行 `/new` 并校验回执，注入极简现场指针，斩断数十万 Token 膨胀雪球，消除长会话陈旧记忆幻觉。每个切片严格防抖轮换一次。
+- **冷读审查门禁（Cold-Context Review Gate）**：TL review 与 PM gate 门铃及章程强化冷读指引，只凭需求规范（spec.md）、实测命令与快照 diff（`xteam review-tree`）独立判定，杜绝在 pane 中与 DEV 闲聊排错过程浪费 Token。重开引导词追加免回复确认硬约束。
+- **0-Token 实时终端看版**：`xteam board` 新增 `实时活动 (Pane Preview · 0 Token)` 模块，纯本地 PTY 采样各 pane 最新可见输出，零 API 调用，一屏统揽全队任务流转与真实执行终端。
+- **修 `xteam down` 动态兜底与 tabs 清理**：解决 `down` 误报已关闭 0 个 pane 的 bug，动态兜底关闭存活 tab 并清理 session 死引用；修 `up` 复用存活 pane 时遗漏记录 tabs 的缺陷。
+
 ## 0.2.8
 
 ### `xteam board`：一屏看板，重点是「为什么不动」

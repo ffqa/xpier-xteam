@@ -70,7 +70,7 @@ xteam say dev "<slug> 已拆解：看 .xteam/tasks/<slug>/request.md（注意禁
 
 `xteam watch` 会在 dev 交付时通知你。收到后：
 
-1. **读 `delivered.json` 里的实际命令输出**，不是 dev 的自述。
+1. **冷读审查（不读开发过程对话）**：读 `delivered.json` 里的实际命令输出，不是 dev 的自述。不要在会话里问 dev 怎么做的，只凭代码与命令客观审查。
 2. **先钉快照再判**：`xteam review-tree <slug>` 会打印这一片快照树的目录 ——
    在里面看 diff、跑测试。主树这时可能已经在跑下一片了，**只有快照里的结论算数**。
 3. **自己看 diff**：在快照树里 `git diff <base>..HEAD`。看它实际改了什么，不是它说改了什么。

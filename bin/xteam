@@ -484,6 +484,7 @@ def _mark_session_ended(root: Path, label: str, ws_id: str,
     data["resume_hint"] = (f"xteam --project {root} up . --watch "
                            f"&& xteam --project {root} restore")
     data["panes"] = {}          # 死引用，留着会误导
+    data["tabs"] = {}           # 死引用，留着会误导
     write_json(path, data, indent=2)
 
 
@@ -1269,10 +1270,12 @@ def cmd_sync(args: argparse.Namespace) -> int:
             continue
         parts = []
         if charter_changed:
-            # 章程变了要**重投全文**：规则要重新通读，摘一句摘要等于让 agent
-            # 拿旧理解去做事 —— 这正是章程存在的意义。
-            parts.append("【协议更新】你的角色章程已更新，请重读并立即生效：\n"
-                         + (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8"))
+            # 章程变了要重投全文，但明确禁止 agent 产生冗长的分析回复（节约 Token）
+            parts.append(
+                f"【协议更新】你的角色章程已更新（已落盘 .xteam/identity/{role}.md）。"
+                f"请吸收新规则并继续当前工作。这是一条单向系统通知，无需回复任何确认、总结或分析，请直接继续当前工作：\n"
+                + (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
+                + "\n\n（单向系统通知，无需回复确认，请直接继续当前工作。）")
             # 身份文件同步刷新：正在跑的 pane 改不了自己的系统提示词（那要重开），
             # 但**下一次 up / swap / reopen 起的 pane 必须拿到新版** —— 否则旧身份
             # 文件会一直把旧章程喂给新会话，而人以为已经同步过了。
@@ -1286,13 +1289,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
             parts.append(
                 "【协议更新】以下规则文件已更新，请自己重读并立即生效：\n"
                 + "\n".join(f"  · {f}" for f in files)
-                + "\n（章程本身没变，不用重读。）")
+                + "\n（章程本身没变，不用重读。单向系统通知，无需回复确认，请直接继续当前工作。）")
         if new_cmds:
             # 工具能力变化 → 告知即可，**不重投章程**。agent 靠 `xteam <cmd> --help`
             # 就拿得到，说明它知道有这些命令即可。
             parts.append(
                 f"【工具更新】xteam 新增了这些子命令，用法见 `xteam <命令> --help`："
-                f"{'、'.join(new_cmds)}")
+                f"{'、'.join(new_cmds)}（单向系统通知，无需回复确认）")
         result = herdr.doorbell(role_map[role]["pane_id"], "\n\n".join(parts),
                                 wait_s=3)
         what = ("章程+协议" if charter_changed and shared else
@@ -1491,7 +1494,8 @@ def _restart_intro(root: Path, proto: Protocol, role: str, kind: str, why: str,
         f"答案就在这里，读完直接干活；确实有歧义再问。\n\n"
         f"{brief}\n\n"
         f"{charter_block}"
-        f"接手后第一句应该是**陈述你接下来要做的那件事**，不是提问。"
+        f"接手后第一句应该是**陈述你接下来要做的那件事**，不是提问。\n"
+        f"这是单向系统恢复通知。读完直接干活，不要分析本通知，无需回复任何确认或解释。"
     )
 
 
@@ -1702,8 +1706,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         # 「我到底在跟哪个说话」。workspace 是长寿命容器，pane 才是易失的。
         ws_id = existing["workspace_id"]
         print(f"[{now()}] workspace {label!r} 已存在（{ws_id}）—— 复用，不新建")
-        live = {r: a["pane_id"] for r, a in
-                herdr.role_map(ws_id).items() if r in BOOT_ORDER}
+        live_roles = {r: a for r, a in
+                      herdr.role_map(ws_id).items() if r in BOOT_ORDER}
+        live = {r: a["pane_id"] for r, a in live_roles.items()}
         if live:
             print(f"[{now()}] 已在跑的角色：{'、'.join(sorted(live))}"
                   f"（不动它们）")
@@ -1714,6 +1719,8 @@ def cmd_up(args: argparse.Namespace) -> int:
                 return 0
             print(f"[{now()}] 补起缺失的角色：{'、'.join(stale)}")
     else:
+        live_roles = {}
+        live = {}
         ws = herdr.create_workspace(str(root), label)
         # herdr 的 create 返回体把实体嵌在具名键下（workspace_created.workspace），
         # 不是平铺的 workspace_id。平铺解析会在第一次 up 时直接失败。
@@ -1732,6 +1739,14 @@ def cmd_up(args: argparse.Namespace) -> int:
     for role in started_order(args):
         if existing and role in live:
             started[role] = live[role]      # 复用已有 pane，不重复起
+            agent_rec = live_roles.get(role) or {}
+            if agent_rec.get("tab_id"):
+                tabs_of[role] = agent_rec["tab_id"]
+            elif (proto.dir / "session.json").exists():
+                old_tab = (_read_json(proto.dir / "session.json").get("tabs") or {}).get(role)
+                if old_tab:
+                    tabs_of[role] = old_tab
+            used[role] = agent_rec.get("agent") or specs[role].describe() or "CLI 默认模型"
             continue
         spec = _with_default_model(specs[role])
         spec = _with_identity(spec, root, label)
@@ -2070,7 +2085,9 @@ def _wait_reset_ok(herdr: Herdr, pane: str, session_before: str,
         time.sleep(1)
 
 
-def cmd_reopen(args: argparse.Namespace) -> int:
+def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
+              no_recap: bool = False, recap_wait: int = 10,
+              herdr: Herdr | None = None, verbose: bool = True) -> tuple[bool, str]:
     """原地重开一个角色：先要 recap → 会话重置 → 身份与现状重新投回。
 
     与 swap 的分工（两者丢的都只是**对话**，协作状态在文件里，丢不掉）：
@@ -2078,50 +2095,51 @@ def cmd_reopen(args: argparse.Namespace) -> int:
       · reopen 不换进程，只把**会话**清干净 —— 快、轻、tab/pane/进程都不动，
         所以只有支持「原地开新会话」的 kind 能做（见 RESET_COMMAND）。
 
-    什么时候用：巡检在 context ≥ 75% 时提醒你；或人自己在 pane 里 /new 完，
-    想让 xteam 把现场接回来（那种情况加 --no-recap：已经没上下文可写了）。
+    返回 (ok: bool, message: str)。成功返回 True 及描述；失败返回 False 及说明，
+    供 CLI 和巡检自动化安全调用。
     """
-    root = Path(args.project).resolve()
-    role = args.role
     specs = load_roles(root)
     if role not in specs:
-        die(f"未知角色 {role!r}，可选：{', '.join(sorted(specs))}")
+        return False, f"未知角色 {role!r}，可选：{', '.join(sorted(specs))}"
     if role not in BOOT_ORDER:
-        die(f"角色 {role!r} 不在常驻名单里（常驻：{', '.join(BOOT_ORDER[:3])}）")
+        return False, f"角色 {role!r} 不在常驻名单里（常驻：{', '.join(BOOT_ORDER[:3])}）"
     spec = specs[role]
     reset = reset_command(spec.kind)
     if not reset:
-        die(f"{spec.kind} 没有「原地开新会话」的命令 —— 用 `xteam swap {role}`：\n"
-            f"  同 kind 重建 pane，效果一样（recap + 现状都会带上），只多花几秒。")
-    label, _ws_why = resolve_ws_label(root, args.workspace)
-    _require_herdr()
-    herdr = Herdr(scope=label)
+        return False, (f"{spec.kind} 没有「原地开新会话」的命令 —— 用 `xteam swap {role}`：\n"
+                      f"  同 kind 重建 pane，效果一样（recap + 现状都会带上），只多花几秒。")
+    label, _ws_why = resolve_ws_label(root, workspace)
+    if herdr is None:
+        _require_herdr()
+        herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
     if not ws:
-        die(f"workspace {label!r} 不在运行。先 `xteam up .`")
+        return False, f"workspace {label!r} 不在运行。先 `xteam up .`"
     agent = herdr.role_map(ws["workspace_id"]).get(role)
     if not agent:
-        die(f"{role} 不在 agent list 里（pane 可能已关）—— `xteam up .` 补起来再重开")
+        return False, f"{role} 不在 agent list 里（pane 可能已关）—— `xteam up .` 补起来再重开"
     pane = agent["pane_id"]
     state = herdr.agent_status(pane)
-    blocked = _swap_block_reason(state, args.force)
+    blocked = _swap_block_reason(state, force)
     if blocked:
-        die(f"{role} {blocked}")
+        return False, f"{role} {blocked}"
     # blocked 对 swap 是放行的（重建 pane，不需要旧 agent 回应），对 reopen 不行：
     # 它整条路都靠门铃（先要 recap、再投 /new），而 **agent prompt 对 blocked 会被拒**。
-    if state == "blocked" and not args.force:
-        die(f"{role} 停在权限/选项框上 —— 门铃投不进去，重开会卡在半路。\n"
-            f"  先清掉那个框（去 pane 里作答，或 `xteam watch once` 让巡检代答），\n"
-            f"  或改用 `xteam swap {role}`（重建 pane，不需要它回应）。")
+    if state == "blocked" and not force:
+        return False, (f"{role} 停在权限/选项框上 —— 门铃投不进去，重开会卡在半路。\n"
+                      f"  先清掉那个框（去 pane 里作答，或 `xteam watch once` 让巡检代答），\n"
+                      f"  或改用 `xteam swap {role}`（重建 pane，不需要它回应）。")
 
     proto = Protocol(root)
     session_path = proto.dir / "session.json"
     session = _read_json(session_path)
-    print(f"[{now()}] 重开 {role}（{spec.kind}，{state}）：{reset} → 新会话")
+    if verbose:
+        print(f"[{now()}] 重开 {role}（{spec.kind}，{state}）：{reset} → 新会话")
 
     # 1) 先要 recap —— 会话还在，这是最后一个能问到它的窗口
-    if not args.no_recap:
-        print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
+    if not no_recap:
+        if verbose:
+            print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
         herdr.doorbell(
             pane,
             f"你要被原地重开（换一个干净的会话，同一个 pane、同一个进程）。"
@@ -2129,9 +2147,10 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             f"{proto.dir}/memory/{role}-recap.md（15 行以内，只写这四节："
             f"做完什么 / 验证结果 / 关键决定与理由 / 下一步遗留，不得加节），"
             f"然后停下。",
-            wait_s=args.recap_wait)
-        print(f"[{now()}] recap："
-              f"{'已拿到' if latest_recap(root, role) else '没有（以 .xteam/ 工件为准）'}")
+            wait_s=recap_wait)
+        if verbose:
+            print(f"[{now()}] recap："
+                  f"{'已拿到' if latest_recap(root, role) else '没有（以 .xteam/ 工件为准）'}")
 
     # 2) 重置会话。**判据是「重置真的生效了」**，不是「命令投出去了」——
     #    投送与生效是两件事（和门铃的送达判据同一条纪律）。
@@ -2150,10 +2169,10 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             tail = herdr.read_pane(pane, 15).strip()[-400:]
         except Exception:                  # noqa: BLE001
             pass
-        die(f"重置没生效：{reset} 的投递结果={result}，"
-            f"但既没换会话也没出现回执。\n"
-            f"  pane 尾部：\n{tail}\n"
-            f"  兜底：`xteam swap {role}`（重建 pane，任何 kind 都行）")
+        return False, (f"重置没生效：{reset} 的投递结果={result}，"
+                      f"但既没换会话也没出现回执。\n"
+                      f"  pane 尾部：\n{tail}\n"
+                      f"  兜底：`xteam swap {role}`（重建 pane，任何 kind 都行）")
 
     # 3) 身份与现状重新投回。章程在不在话里，看**这个 pane 当初是怎么起的**：
     #    带过身份文件（系统提示词里有身份，/new 清不掉）就不重复抄一遍；
@@ -2167,11 +2186,39 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         with_charter=not have_identity)
     sent = herdr.send_initial_prompt(pane, intro, wait_s=15)
     was = f"，重置前 context {pct}%" if pct is not None else ""
-    print(f"[{now()}] 已重开 {role}（新会话{was}，判据：{evidence}），"
-          f"现状已投回：{sent}")
+    summary = f"已重开 {role}（新会话{was}，判据：{evidence}），现状已投回：{sent}"
+    if verbose:
+        print(f"[{now()}] {summary}")
     log_timeline(root, role,
                  f"原地重开：{reset} → 新会话{was}（判据：{evidence}），"
                  f"身份与现状已重投")
+    return True, summary
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    """原地重开一个角色：先要 recap → 会话重置 → 身份与现状重新投回。
+
+    与 swap 的分工（两者丢的都只是**对话**，协作状态在文件里，丢不掉）：
+      · swap 换的是**进程**（kind / model 都能换，两阶段重建 pane）——任何 kind 都行；
+      · reopen 不换进程，只把**会话**清干净 —— 快、轻、tab/pane/进程都不动，
+        所以只有支持「原地开新会话」的 kind 能做（见 RESET_COMMAND）。
+
+    什么时候用：巡检在 context ≥ 75% 时提醒你；或人自己在 pane 里 /new 完，
+    想让 xteam 把现场接回来（那种情况加 --no-recap：已经没上下文可写了）。
+    """
+    root = Path(args.project).resolve()
+    role = args.role
+    ok, msg = do_reopen(
+        root=root,
+        role=role,
+        workspace=args.workspace,
+        force=args.force,
+        no_recap=args.no_recap,
+        recap_wait=args.recap_wait,
+        verbose=True,
+    )
+    if not ok:
+        die(msg)
     return 0
 
 
@@ -2423,6 +2470,7 @@ def cmd_review_tree(args: argparse.Namespace) -> int:
     print(f"快照树：{path}（HEAD={head}）")
     if base:
         print(f"  在里面判：cd {path} && git diff {base}..{head}")
+    print(f"  冷读审查：独立运行验收判据命令，不依赖开发过程对话，只认实测输出与退出码")
     print(f"  判完清掉：xteam --project {root} review-tree {args.slug} --rm")
     return 0
 
@@ -2450,8 +2498,16 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         except Exception:                        # noqa: BLE001
             box = "unknown"
         since = tracker.state_since(role)
+        tail_lines = []
+        if pane:
+            try:
+                raw_text = herdr.read_pane(pane, lines=5, source="visible")
+                tail_lines = [re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", ln).strip()
+                              for ln in raw_text.splitlines() if ln.strip()][-2:]
+            except Exception:                    # noqa: BLE001
+                tail_lines = []
         rows.append({"role": role, "status": status, "owes": owes, "where": where,
-                     "box": box, "pane": pane,
+                     "box": box, "pane": pane, "tail": tail_lines,
                      "held": fmt_duration(int(time.time()) - int(since)) if since else "-"})
 
     blocked_on_prompt = []
@@ -3047,10 +3103,8 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
             # 假 working：声称在干活但 seq 不推进。原判据在这里直接跳过，
             # 导致 PM 卡 9 分钟无人知晓。现在按停滞时长告警。
             if idle >= STUCK_WORKING_SECS and tracker.alert_level(role) < 1:
-                msg = (f"【巡检】你已连续 {fmt_duration(idle)} 处于 working 状态，"
-                       f"但没有任何状态推进（state_change_seq 不变）——"
-                       f"你可能卡住了。若在等人类请 stamp --waiting；"
-                       f"否则请说明卡在哪一步。")
+                msg = (f"【巡检】你已连续 {fmt_duration(idle)} 处于 working 状态且未推进状态。"
+                       f"若正在执行请继续；若遇阻塞请写 blocked.json。无需长篇回复。")
                 result = herdr.doorbell(pane, msg, wait_s=5)
                 log_event(logf, f"STUCK {role} working-no-progress "
                                 f"{fmt_duration(idle)} -> {result}")
@@ -3091,9 +3145,12 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
             tracker.set_alerted(role, 0)
         if tracker.alert_level(role) == 0:
             msg = (
-                f"【巡检】你已 idle {idle}s，而协议显示你欠着：{owes}（{task}）。"
-                f"{OBLIGATIONS.get(owes,'')}"
+                f"【巡检】请推进待办：{owes}（{task}）。按协议直接执行即可，无需回复确认。"
             )
+            if role == "tl" and owes == "review":
+                msg += f"\n【冷读审查】对照 request.md 验收标准与 git diff 跑实测命令（可 xteam review-tree {task} 钉快照），不依赖开发过程对话。"
+            elif role == "pm" and owes == "gate":
+                msg += f"\n【冷读审查】对照 spec.md 验收判据跑实测命令（可 xteam review-tree {task} 钉快照），实测通过方可判 PASS。"
             # 门禁前先说清影响面：改共享契约项目（api 之类）会让下游失效，
             # PM 判 PASS 前得知道要通知谁，而不是等前端默默坏掉。
             msg += _downstream_note(root, task)
@@ -3128,8 +3185,7 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
                    f"ALERT {role} idle={idle}s", 1)
         elif idle >= IDLE_ESCALATE_SECS:
             msg = (
-                f"【巡检升级】idle {idle}s 且仍欠 {owes}（{task}）——可能卡死。"
-                f"回一句状态，或报告你卡在哪一步。"
+                f"【巡检升级】你仍欠着：{owes}（{task}）。若未卡死请直接执行交付；若受阻请写 blocked.json，无需多余回复。"
             )
             _nudge(herdr, tracker, logf, role, task, owes, pane, msg,
                    f"ESCALATE {role} idle={idle}s", 2)
@@ -3139,6 +3195,7 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
     except OSError:
         pass
     _maybe_request_recap(root, herdr, role_map, tracker, logf)
+    _maybe_rotate_sessions(root, herdr, role_map, tracker, logf)
     _maybe_advise_reopen(root, herdr, role_map, tracker, logf)
     log_event(logf, "SAMPLE " + "  ".join(samples))
 
@@ -3223,6 +3280,70 @@ def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path)
         result = herdr.doorbell(pane, msg, wait_s=5)
         log_event(logf, f"RECAP-ASK {role} reason={why} -> {result}")
         tracker.set_recap_asked(role, why.split()[1] if why.startswith("切片") else "")
+
+
+def _maybe_rotate_sessions(root: Path, herdr, role_map: dict, tracker,
+                           logf: Path) -> None:
+    """切片闭合且 recap 落地后，对支持原地重置的角色执行切片级会话轮换。
+
+    吸取 Kander 经验：
+    - 斩断长上下文雪球：切片做完（closed.md 产生）后，旧切片庞大的编译错误、
+      测试日志、过程调试对话在当前会话里已无保留价值，不仅严重消耗 token，
+      还可能干扰下一片。
+    - 状态已外部化：代码已 commit/snap、进度在 QUEUE.md、交接在 <role>-recap.md、
+      章程在 identity/<role>.md，原地重开后新会话直接读取外部工件，恢复纯净。
+    - 安全门禁：
+      1. 角色当前必须是 idle（绝不打断 working 或 blocked）；
+      2. 角色 agent kind 必须支持 reset_command（如 omp/pi 的 /new）；
+      3. recap 已落地（或已请求且已过去缓冲时间）；
+      4. 每个切片只轮换一次（rotated_all 记账防抖）。
+    """
+    proto = Protocol(root)
+    specs = load_roles(root)
+    target_roles = ("dev",)
+    for role in target_roles:
+        agent = role_map.get(role)
+        if not agent:
+            continue
+        status = agent.get("agent_status", "")
+        if status in ("working", "blocked"):
+            continue
+        spec = specs.get(role)
+        if not spec:
+            continue
+        reset = reset_command(spec.kind)
+        if not reset:
+            continue
+
+        for t in proto.all_tasks():
+            if not (t / "closed.md").exists():
+                continue
+            if role not in roles_touched_task(t):
+                continue
+            if t.name in tracker.rotated_all(role):
+                continue
+            # 必须等待 recap 已经请求过或 recap 文件已存在
+            mem_file = proto.dir / "memory" / f"{role}-recap.md"
+            if not mem_file.exists() and t.name not in tracker.recap_asked_all(role):
+                continue
+            # 若刚好这一轮刚催 recap 且文件还没写入，留出时间
+            if not mem_file.exists() and tracker.recap_asked_ago(role) < 15:
+                continue
+
+            ok, msg = do_reopen(root, role, workspace="", force=False,
+                                no_recap=True, herdr=herdr, verbose=False)
+            if ok:
+                tracker.set_rotated(role, t.name)
+                log_event(logf, f"AUTO-ROTATE {role} task={t.name} -> {msg}")
+                log_timeline(root, role, f"切片 {t.name} 闭合触发会话轮换：{msg}")
+                notify(f"xteam: {role} 切片级会话轮换完成",
+                       f"切片 {t.name} 闭合，已自动清空会话上下文并接回现场")
+                print(f"[{now()}] ✓ AUTO-ROTATE: {role} 会话轮换完成（切片 {t.name}），上下文已斩断归零",
+                      file=sys.stderr)
+            else:
+                log_event(logf, f"AUTO-ROTATE-FAIL {role} task={t.name} -> {msg}")
+            break
+
 
 
 # 注入别人 recap 时的最大字符数。够看清「做到哪、下一步是什么」就行。
@@ -4024,15 +4145,33 @@ def cmd_down(args: argparse.Namespace) -> int:
         return 0
     ws_id = ws["workspace_id"]
     session = _read_json(Protocol(root).dir / "session.json")
+    target_tabs: dict[str, str] = dict(session.get("tabs") or {})
+    # 动态兜底：底层 role_map 是事实标准。若 session.json 遗漏/漂移/老版本，以活着的 agent 所在 tab 为准
+    try:
+        for role, agent in herdr.role_map(ws_id).items():
+            tab = agent.get("tab_id")
+            if tab:
+                target_tabs[role] = tab
+    except Exception:  # noqa: BLE001
+        pass
+    for role in BOOT_ORDER:
+        if role not in target_tabs or not target_tabs[role]:
+            tab = _find_role_tab(herdr, ws_id, role)
+            if tab:
+                target_tabs[role] = tab
+
     # **只关角色 tab，不关 workspace。** workspace 是长寿命容器：反复
     # up/down 会在屏幕上堆一堆同名 workspace，而它们指向同一个项目 ——
     # 既浪费终端空间，又让人搞不清「我到底在跟哪个说话」。agent 在跑才关 tab。
     closed: list[str] = []
-    for role, tab in (session.get("tabs") or {}).items():
+    closed_tabs: set[str] = set()
+    for role, tab in target_tabs.items():
         if not tab or not _alive_pane_exists(herdr, ws_id, tab):
             continue
         try:
-            herdr.close_tab(tab)
+            if tab not in closed_tabs:
+                herdr.close_tab(tab)
+                closed_tabs.add(tab)
             closed.append(role)
         except Exception as exc:                # noqa: BLE001
             print(f"[{now()}] ⚠ 关 {role} 的 tab 失败：{exc}", file=sys.stderr)

@@ -160,6 +160,7 @@ xteam stamp pm "等你拍板结算口径" --waiting --wait-for "结算单含未�
 ### 4. 兼任评审（gate 判 PASS / FAIL）
 
 TL 完成工作 review 并写下 `ready.json` 后，门禁判据归你：
+**冷读独立门禁**：门禁基于需求规范（spec.md）与快照 diff 独立评判，不读取或依赖开发阶段冗长的调试沟通。
 
 **先钉快照再判**：`xteam review-tree <slug>` 会打印这一片快照树的目录 —— 门禁在
 里面跑。主树这时可能已经在跑下一片，**只有快照树里的结果算数**（判完
