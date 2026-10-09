@@ -4285,6 +4285,21 @@ def test_interactive_board_console() -> None:
             content = repo_doc(f"roles/{role}.md").read_text(encoding="utf-8")
             check(f"{role}.md 含上下文自压缩硬规则", "上下文自压缩与自驱快照" in content, True)
             check(f"{role}.md 含快照路径", f"{role}-snapshot.md" in content, True)
+
+        # 8. 同名 workspace 并存时优先命中活跃有角色的 workspace
+        class FakeMultiHerdr:
+            def workspaces(self):
+                return [
+                    {"workspace_id": "w1", "label": "demo"},
+                    {"workspace_id": "w2", "label": "demo"},
+                ]
+            def role_map(self, ws_id):
+                if ws_id == "w2":
+                    return {"pm": {"name": "pm-demo"}}
+                return {}
+        h_multi = FakeMultiHerdr()
+        ws_found = Herdr.find_workspace(h_multi, "demo")
+        check("同名时优先选有角色的 workspace", ws_found.get("workspace_id") if ws_found else None, "w2")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -740,9 +740,22 @@ class Herdr:
         return self._run("agent", "list").get("agents", [])
 
     def find_workspace(self, label: str) -> dict | None:
-        for ws in self.workspaces():
-            if ws.get("label") == label:
-                return ws
+        matches = [ws for ws in self.workspaces() if ws.get("label") == label]
+        if matches:
+            if len(matches) == 1:
+                return matches[0]
+            # 多个同名 workspace 并存时：优先选择当前有角色在跑的那一个（避免命中无 agent 的废弃残影）
+            best = None
+            best_score = -1
+            for ws in matches:
+                try:
+                    score = len(self.role_map(ws.get("workspace_id", "")))
+                except Exception:
+                    score = 0
+                if score > best_score:
+                    best_score = score
+                    best = ws
+            return best or matches[0]
         for ws in self.workspaces():
             if ws.get("workspace_id", "").lower().startswith(label.lower()):
                 return ws
