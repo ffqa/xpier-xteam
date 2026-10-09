@@ -376,12 +376,13 @@ def _ansi(text: str, code: str, on: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if on else text
 
 
-def render_board(state: dict, color: bool = False) -> str:
+def render_board(state: dict, color: bool = False, console: dict | None = None) -> str:
     """把看板状态渲染成一屏文本。**纯函数**：采集在 bin/xteam（要 herdr）。
 
     看板只回答三件事：谁在干什么、**链路为什么不动**、最近发生了什么。
     它**不新增任何状态** —— 事实仍然只在 `.xteam/` 与 pane 现状里，看板只是
     把同一份事实渲染成一眼能看完的一屏（`status` 是快照，这个是常驻视图）。
+    可选参数 console 用于在常驻交互看板底部展示命令输入与状态提示。
     """
     out = [_ansi(str(state.get("title") or "xteam board"), "1", color), ""]
     roles = state.get("roles") or []
@@ -444,6 +445,22 @@ def render_board(state: dict, color: bool = False) -> str:
                     out.append(f"         {bullet} {line[:95]}")
             else:
                 out.append("         └─ （暂无活动输出）")
+
+    if console:
+        out.append("")
+        out.append(_ansi("── 指令控制台 (Tab 切换目标 · Enter 发送 · :q 退出 · :help) ──────", "36", color))
+        status_text = console.get("status") or "就绪"
+        kind = console.get("status_kind", "info")
+        color_code = {"success": "32", "warn": "33", "error": "31", "info": "36"}.get(kind, "90")
+        out.append("  " + _ansi(f"[状态] {status_text}", color_code, color))
+
+        target = console.get("target") or "pm"
+        input_text = console.get("input") or ""
+        cursor_block = _ansi("█", "7", color) if console.get("cursor", True) else ""
+        prompt_tag = _ansi(f"  [发给 {target}] ❯ ", "1;32" if color else "", color)
+        input_display = _ansi(input_text, "1", color) if color else input_text
+        out.append(f"{prompt_tag}{input_display}{cursor_block}")
+
     return "\n".join(out)
 
 
@@ -2150,6 +2167,10 @@ def recap_path(root: Path, role: str) -> Path:
     return root / XTEAM_DIRNAME / "memory" / f"{role}-recap.md"
 
 
+def snapshot_path(root: Path, role: str) -> Path:
+    return root / XTEAM_DIRNAME / "memory" / f"{role}-snapshot.md"
+
+
 # recap 的**读取**上限。实测有人写过 20 万字的 recap，交接 prompt 也跟着变成
 # 20 万字 —— up/swap 时白烧 token，甚至直接撑爆上下文。别人的 recap 注入时有
 # 限长，自己的却没有，这是漏的一环。
@@ -2161,16 +2182,24 @@ RECAP_STORE_CHARS = 8000
 
 
 def latest_recap(root: Path, role: str) -> str:
-    """读该角色最近一次 recap 的正文；没有就返回空串。
+    """读该角色最近一次 recap 或自驱快照的正文；没有就返回空串。
 
     **读取时也限长** —— 文件可能是本次截断规则之前写的，也可能被手工改过，
-    不能假设磁盘上的东西一定是短的。
+    不能假设磁盘上的东西一定是短的。若存在自驱 snapshot.md 且更新，优先采纳。
     """
-    p = recap_path(root, role)
-    if not p.exists():
+    p_recap = recap_path(root, role)
+    p_snap = snapshot_path(root, role)
+    target = None
+    if p_snap.exists() and p_recap.exists():
+        target = p_snap if p_snap.stat().st_mtime >= p_recap.stat().st_mtime else p_recap
+    elif p_snap.exists():
+        target = p_snap
+    elif p_recap.exists():
+        target = p_recap
+    else:
         return ""
     try:
-        return p.read_text(encoding="utf-8")[-RECAP_STORE_CHARS:]
+        return target.read_text(encoding="utf-8")[-RECAP_STORE_CHARS:]
     except OSError:
         return ""
 

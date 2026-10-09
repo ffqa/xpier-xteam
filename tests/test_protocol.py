@@ -4194,6 +4194,101 @@ def test_auto_rotate_and_cold_review() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_interactive_board_console() -> None:
+    print("\n[98] 交互式 TUI 看板控制台（0-Token 直投、Tab 切换与视图渲染）")
+    state = {
+        "title": "xteam board",
+        "roles": [{"role": "pm", "status": "working", "owes": "next-slice"}],
+    }
+
+    # 1. 纯静态模式向后兼容（console 为 None）
+    frame_static = render_board(state, color=False, console=None)
+    check("静态渲染无控制台分隔符", "── 指令控制台" in frame_static, False)
+
+    # 2. 交互控制台视图渲染
+    ctx_pm = {
+        "target": "pm",
+        "input": "请按方案A继续推进",
+        "status": "就绪 (Tab 切换角色 · Enter 发送 · :help)",
+        "status_kind": "info",
+    }
+    frame_pm = render_board(state, color=False, console=ctx_pm)
+    check("控制台分隔符存在", "── 指令控制台" in frame_pm, True)
+    check("状态提示行存在", "[状态] 就绪" in frame_pm, True)
+    check("目标为 pm 的提示符与输入内容", "[发给 pm] ❯ 请按方案A继续推进█" in frame_pm, True)
+
+    # 3. Tab 切换目标角色至 tl
+    ctx_tl = {
+        "target": "tl",
+        "input": ":r",
+        "status": "已切换至 tl",
+        "status_kind": "info",
+    }
+    frame_tl = render_board(state, color=False, console=ctx_tl)
+    check("目标切换为 tl 后的提示符", "[发给 tl] ❯ :r█" in frame_tl, True)
+
+    # 4. 彩色模式渲染
+    frame_color = render_board(state, color=True, console=ctx_pm)
+    check("彩色控制台包含 ANSI 颜色码", "\033[" in frame_color, True)
+
+    # 5. _board_dispatch 投递分发逻辑预检
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+
+        class FakeBoardHerdr:
+            def __init__(self):
+                self.delivered = []
+            def doorbell(self, pane, msg, wait_s=2, kind=""):
+                self.delivered.append((pane, msg))
+                return "status=idle"
+
+        herdr = FakeBoardHerdr()
+        role_map = {"pm": {"pane_id": "%10", "agent": "omp"}}
+
+        # 不在 role_map 中的角色报错拦截
+        ok, why = _cli._board_dispatch(root, proto, herdr, role_map, "ghost", "测试")
+        check("不存在角色被拦截", ok, False)
+        check("明确告知不存在", "ghost" in why, True)
+
+        # 缺少 pane 拦截
+        ok2, why2 = _cli._board_dispatch(root, proto, herdr, {"pm": {"agent": "omp"}}, "pm", "测试")
+        check("缺少 pane 拦截", ok2, False)
+
+        # 正常直投
+        orig_confirm = _cli._confirm_delivery
+        _cli._confirm_delivery = lambda h, p: (True, "working", False)
+        try:
+            ok3, why3 = _cli._board_dispatch(root, proto, herdr, role_map, "pm", "同意方案A")
+            check("正常直投成功", ok3, True)
+            check("状态转 working", "working" in why3, True)
+            check("doorbell 实际收到包含人类指令的消息", any("【人类指令】同意方案A" in m for _, m in herdr.delivered), True)
+            check("watch 日志有记录", (proto.dir / "watch" / "doorbell.log").exists(), True)
+        finally:
+            _cli._confirm_delivery = orig_confirm
+
+        # 6. 自驱快照路径与优先读取
+        mem_dir = proto.dir / "memory"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        recap_f = mem_dir / "dev-recap.md"
+        snap_f = mem_dir / "dev-snapshot.md"
+        recap_f.write_text("旧 recap 摘要", encoding="utf-8")
+        time.sleep(0.05)
+        snap_f.write_text("最新自驱快照内容", encoding="utf-8")
+        from xteam_lib import latest_recap, snapshot_path
+        check("snapshot_path 路径吻合", snapshot_path(root, "dev"), snap_f)
+        check("latest_recap 优先读取更新的自驱快照", latest_recap(root, "dev"), "最新自驱快照内容")
+
+        # 7. 三角色章程包含自驱快照规范硬约束
+        for role in ("pm", "tl", "dev"):
+            content = repo_doc(f"roles/{role}.md").read_text(encoding="utf-8")
+            check(f"{role}.md 含上下文自压缩硬规则", "上下文自压缩与自驱快照" in content, True)
+            check(f"{role}.md 含快照路径", f"{role}-snapshot.md" in content, True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4295,6 +4390,7 @@ def main() -> int:
         test_render_board_and_choice_detector,
         test_down_fallback_and_tabs_tracking,
         test_auto_rotate_and_cold_review,
+        test_interactive_board_console,
     ):
         fn()
     print()

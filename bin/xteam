@@ -58,6 +58,7 @@ from xteam_lib import (  # noqa: E402
     latest_recap,
     RECAP_CONTEXT_COOLDOWN,
     SAY_RECHECK_S,
+    context_hint,
     roles_touched_task,
     list_models,
     search_models,
@@ -67,6 +68,7 @@ from xteam_lib import (  # noqa: E402
     parse_context_pct,
     XTEAM_DIRNAME,
     recap_path,
+    snapshot_path,
     fmt_epoch,
     HERDR_KINDS,
     VERIFIED_TUI_MODEL,
@@ -2556,13 +2558,42 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
     }
 
 
-def cmd_board(args: argparse.Namespace) -> int:
-    """一屏看板：谁在干什么、**链路为什么不动**、最近发生了什么。默认自动刷新。
+def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
+                    role_map: dict, target_role: str, message: str) -> tuple[bool, str]:
+    """看板指令直投：0 Token 向指定 pane 发送人类指示门铃。"""
+    if target_role not in role_map:
+        avail = ", ".join(sorted(role_map.keys())) or "无"
+        return False, f"角色 {target_role!r} 未在运行（当前可用：{avail}）"
+    agent = role_map[target_role]
+    pane = agent.get("pane_id")
+    if not pane:
+        return False, f"角色 {target_role!r} 没有关联 pane"
+    try:
+        kind = load_roles(root)[target_role].kind
+    except Exception:
+        kind = DEFAULT_ROLES.get(target_role, ("", ""))[0]
+    hint = context_hint(target_role, kind)
+    full_msg = hint + f"【人类指令】{message}"
+    try:
+        status = herdr.doorbell(pane, full_msg, wait_s=2, kind=kind)
+    except Exception as e:
+        return False, f"投递异常: {e}"
+    log_event(proto.dir / "watch" / "doorbell.log", f"-> {target_role} (board-direct): {message[:80]}")
+    if status.startswith("skipped-draft"):
+        return False, "输入框有草稿（投不进去）"
+    if "submit=stuck" in status:
+        return False, "已投但卡在输入框（需人工在该 pane 按回车）"
+    if status.startswith("prompt-failed"):
+        return False, "投递失败（pane 不可达或停在审批 UI）"
+    delivered, cur, _ = _confirm_delivery(herdr, pane)
+    if delivered:
+        return True, "已送达 working"
+    return True, f"已投递 ({cur})"
 
-    和 `status` 的关系：同一份事实（`.xteam/` + pane 现状），`status` 是一次快照，
-    这个是一直挂着的视图。起因是实测撞到「链路卡了近两小时，而面板上什么都看不
-    出来」—— 门铃投不进去、agent 停在选择框上，这两件都不在角色表里。
-    **它只读**：不投递、不改状态、不新增事实来源。
+
+def cmd_board(args: argparse.Namespace) -> int:
+    """一屏看板：谁在干什么、链路为什么不动、最近发生了什么。
+    支持交互式 TUI 指令控制台（0 Token 直投 PM/TL/DEV、Tab 切换角色、:q 退出）。
     """
     root = Path(args.project).resolve()
     proto = Protocol(root)
@@ -2578,21 +2609,219 @@ def cmd_board(args: argparse.Namespace) -> int:
             f" —— 重新开跑：xteam --project {root} up . --watch")
     tracker = IdleTracker(proto.dir / "watch" / "idle.state")
     color = sys.stdout.isatty() and not args.plain
-    try:
-        while True:
-            frame = render_board(
-                _board_state(root, proto, herdr, label, role_map, tracker),
-                color=color)
-            if args.once:
-                print(frame)
-                return 0
-            sys.stdout.write("\033[H\033[J" + frame
-                             + f"\n\n  {args.interval:g}s 刷新 · Ctrl-C 退出\n")
-            sys.stdout.flush()
-            time.sleep(args.interval)
-    except KeyboardInterrupt:
-        print()
+
+    # 脚本、管道或显式 --once：降级为只读静态打印
+    if args.once or not sys.stdin.isatty():
+        state = _board_state(root, proto, herdr, label, role_map, tracker)
+        frame = render_board(state, color=color)
+        print(frame)
         return 0
+
+    # 交互式 TUI 模式
+    import select
+    import termios
+    import tty
+
+    available_roles = [r for r in BOOT_ORDER if r in role_map]
+    if not available_roles:
+        available_roles = sorted(role_map.keys())
+    target_idx = 0
+    if "pm" in available_roles:
+        target_idx = available_roles.index("pm")
+
+    input_buf = ""
+    history: list[str] = []
+    history_idx = -1
+    status_text = "就绪 (Tab 切换角色 · Enter 发送 · :help 帮助)"
+    status_kind = "info"
+    last_refresh = 0.0
+    last_key = 0.0
+    cached_state = None
+
+    old_attrs = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        while True:
+            now_t = time.time()
+            target_role = available_roles[target_idx % len(available_roles)] if available_roles else "pm"
+
+            # 定期或按需刷新看板数据
+            if cached_state is None or (now_t - last_refresh >= args.interval and now_t - last_key > 0.6):
+                try:
+                    cur_ws = herdr.find_workspace(label)
+                    if cur_ws:
+                        cur_map = herdr.role_map(cur_ws["workspace_id"])
+                        if cur_map:
+                            role_map = cur_map
+                            available_roles = [r for r in BOOT_ORDER if r in role_map] or sorted(role_map.keys())
+                except Exception:
+                    pass
+                cached_state = _board_state(root, proto, herdr, label, role_map, tracker)
+                last_refresh = now_t
+
+            console_ctx = {
+                "target": target_role,
+                "input": input_buf,
+                "status": status_text,
+                "status_kind": status_kind,
+                "cursor": True,
+            }
+            frame = render_board(cached_state, color=color, console=console_ctx)
+            # 无闪烁重绘
+            sys.stdout.write("\033[H\033[J" + frame + "\n")
+            sys.stdout.flush()
+
+            # 等待键盘输入（最多 0.05 秒）
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if not rlist:
+                continue
+
+            try:
+                raw_bytes = os.read(sys.stdin.fileno(), 1024)
+            except OSError:
+                break
+            if not raw_bytes:
+                continue
+
+            last_key = time.time()
+
+            # Ctrl+C 或 Ctrl+D 退出
+            if b"\x03" in raw_bytes or b"\x04" in raw_bytes:
+                break
+
+            # ANSI 转义键（方向键）
+            if raw_bytes.startswith(b"\x1b"):
+                if raw_bytes == b"\x1b[A":  # Up
+                    if history:
+                        if history_idx == -1:
+                            history_idx = len(history) - 1
+                        elif history_idx > 0:
+                            history_idx -= 1
+                        input_buf = history[history_idx]
+                elif raw_bytes == b"\x1b[B":  # Down
+                    if history and history_idx != -1:
+                        if history_idx < len(history) - 1:
+                            history_idx += 1
+                            input_buf = history[history_idx]
+                        else:
+                            history_idx = -1
+                            input_buf = ""
+                continue
+
+            text = raw_bytes.decode("utf-8", errors="replace")
+
+            # 控制键处理
+            if text == "\t":  # Tab 切换角色
+                if available_roles:
+                    target_idx = (target_idx + 1) % len(available_roles)
+                continue
+            elif text in ("\x7f", "\x08"):  # 退格
+                if input_buf:
+                    input_buf = input_buf[:-1]
+                continue
+            elif text == "\x15":  # Ctrl+U
+                input_buf = ""
+                continue
+            elif text == "\x0c":  # Ctrl+L
+                cached_state = None
+                continue
+            elif text in ("\r", "\n"):  # 回车执行
+                cmd = input_buf.strip()
+                input_buf = ""
+                history_idx = -1
+                if not cmd:
+                    continue
+                history.append(cmd)
+
+                # 指令解析
+                if cmd in (":q", ":quit", ":exit"):
+                    break
+                elif cmd in (":r", ":refresh"):
+                    status_text = "看板已立即刷新"
+                    status_kind = "info"
+                    cached_state = None
+                    continue
+                elif cmd in (":help", ":?"):
+                    status_text = "快捷命令: :pm/:tl/:dev <msg> | :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色)"
+                    status_kind = "info"
+                    continue
+                elif cmd.startswith((":rotate", ":reopen", ":new")):
+                    parts = cmd.split(maxsplit=1)
+                    sub_role = parts[1].strip() if len(parts) > 1 else target_role
+                    status_text = f"正在为 {sub_role} 执行会话轮换..."
+                    status_kind = "warn"
+                    console_ctx["status"] = status_text
+                    console_ctx["status_kind"] = status_kind
+                    frame = render_board(cached_state, color=color, console=console_ctx)
+                    sys.stdout.write("\033[H\033[J" + frame + "\n")
+                    sys.stdout.flush()
+
+                    try:
+                        ok, msg = do_reopen(root, sub_role, workspace=label, force=True)
+                        if ok:
+                            status_text = f"✓ 已轮换 {sub_role} 会话: {msg}"
+                            status_kind = "success"
+                        else:
+                            status_text = f"⚠ 轮换 {sub_role} 失败: {msg}"
+                            status_kind = "error"
+                    except Exception as e:
+                        status_text = f"⚠ 轮换异常: {e}"
+                        status_kind = "error"
+                    cached_state = None
+                    continue
+
+                dest_role = target_role
+                actual_msg = cmd
+                if cmd.startswith(":pm "):
+                    dest_role, actual_msg = "pm", cmd[4:].strip()
+                elif cmd.startswith(":tl "):
+                    dest_role, actual_msg = "tl", cmd[4:].strip()
+                elif cmd.startswith(":dev "):
+                    dest_role, actual_msg = "dev", cmd[5:].strip()
+                elif cmd.startswith(":to "):
+                    parts = cmd.split(maxsplit=2)
+                    if len(parts) >= 3:
+                        dest_role, actual_msg = parts[1].strip(), parts[2].strip()
+
+                if not actual_msg:
+                    continue
+
+                status_text = f"正在投递指令至 {dest_role}..."
+                status_kind = "info"
+                console_ctx["status"] = status_text
+                console_ctx["status_kind"] = status_kind
+                frame = render_board(cached_state, color=color, console=console_ctx)
+                sys.stdout.write("\033[H\033[J" + frame + "\n")
+                sys.stdout.flush()
+
+                t_str = now().split()[1] if " " in now() else now()
+                success, reason = _board_dispatch(root, proto, herdr, role_map, dest_role, actual_msg)
+                msg_clip = actual_msg[:25] + ("…" if len(actual_msg) > 25 else "")
+                if success:
+                    status_text = f"✓ [{t_str}] 已发送给 {dest_role}: {msg_clip!r} ({reason})"
+                    status_kind = "success"
+                else:
+                    status_text = f"⚠ [{t_str}] 发送给 {dest_role} 受阻: {reason}"
+                    status_kind = "warn"
+
+                cached_state = None
+                continue
+
+            # 普通文本键入
+            printable = "".join(ch for ch in text if ch >= " " or ch == "\t")
+            if printable:
+                input_buf += printable
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+    return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
