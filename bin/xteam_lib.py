@@ -456,12 +456,166 @@ def render_board(state: dict, color: bool = False, console: dict | None = None) 
 
         target = console.get("target") or "pm"
         input_text = console.get("input") or ""
-        cursor_block = _ansi("█", "7", color) if console.get("cursor", True) else ""
+        cursor_pos = console.get("cursor_pos", len(input_text))
+        cursor_pos = max(0, min(len(input_text), cursor_pos))
         prompt_tag = _ansi(f"  [发给 {target}] ❯ ", "1;32" if color else "", color)
-        input_display = _ansi(input_text, "1", color) if color else input_text
-        out.append(f"{prompt_tag}{input_display}{cursor_block}")
+
+        if console.get("cursor", True):
+            if cursor_pos >= len(input_text):
+                input_display = _ansi(input_text, "1", color) if color else input_text
+                cursor_block = _ansi("█", "7", color) if color else "█"
+                out.append(f"{prompt_tag}{input_display}{cursor_block}")
+            else:
+                before = input_text[:cursor_pos]
+                at = input_text[cursor_pos]
+                after = input_text[cursor_pos + 1:]
+                if color:
+                    disp = _ansi(before, "1", True) + _ansi(at, "7", True) + _ansi(after, "1", True)
+                else:
+                    disp = f"{before}{at}{after}"
+                out.append(f"{prompt_tag}{disp}")
+        else:
+            input_display = _ansi(input_text, "1", color) if color else input_text
+            out.append(f"{prompt_tag}{input_display}")
 
     return "\n".join(out)
+
+
+def process_board_keystrokes(
+    text: str,
+    input_buf: str,
+    cursor_pos: int,
+    history: list[str],
+    history_idx: int = -1,
+    available_roles: list[str] | None = None,
+    target_idx: int = 0,
+) -> tuple[str, int, int, int, list[dict]]:
+    """逐字消费输入流，处理光标移动、退格、行编辑快捷键、历史记录与指令提交。
+
+    返回: (new_input_buf, new_cursor_pos, new_history_idx, new_target_idx, actions)
+    保证 0 乱码穿透，杜绝多字节粘包或输入法缓冲中包含的退格控制符(\\x7f/\\x08)遗漏。
+    """
+    if not text:
+        return input_buf, cursor_pos, history_idx, target_idx, []
+
+    actions: list[dict] = []
+    roles = available_roles or []
+    cursor_pos = max(0, min(len(input_buf), cursor_pos))
+    i = 0
+
+    while i < len(text):
+        # 1. ANSI 转义序列解析（方向键、Delete、Home、End）
+        if text[i] == "\x1b":
+            rem = text[i:]
+            if rem.startswith("\x1b[A"):  # Up 方向键
+                if history:
+                    if history_idx == -1:
+                        history_idx = len(history) - 1
+                    elif history_idx > 0:
+                        history_idx -= 1
+                    input_buf = history[history_idx]
+                    cursor_pos = len(input_buf)
+                i += 3
+                continue
+            elif rem.startswith("\x1b[B"):  # Down 方向键
+                if history and history_idx != -1:
+                    if history_idx < len(history) - 1:
+                        history_idx += 1
+                        input_buf = history[history_idx]
+                        cursor_pos = len(input_buf)
+                    else:
+                        history_idx = -1
+                        input_buf = ""
+                        cursor_pos = 0
+                i += 3
+                continue
+            elif rem.startswith("\x1b[D"):  # Left 方向键
+                cursor_pos = max(0, cursor_pos - 1)
+                i += 3
+                continue
+            elif rem.startswith("\x1b[C"):  # Right 方向键
+                cursor_pos = min(len(input_buf), cursor_pos + 1)
+                i += 3
+                continue
+            elif rem.startswith("\x1b[3~"):  # Delete 键
+                if cursor_pos < len(input_buf):
+                    input_buf = input_buf[:cursor_pos] + input_buf[cursor_pos + 1:]
+                i += 4
+                continue
+            elif rem.startswith(("\x1b[H", "\x1b[1~", "\x1bOH")):  # Home 键
+                cursor_pos = 0
+                i += 3 if (rem.startswith("\x1b[H") or rem.startswith("\x1bOH")) else 4
+                continue
+            elif rem.startswith(("\x1b[F", "\x1b[4~", "\x1bOF")):  # End 键
+                cursor_pos = len(input_buf)
+                i += 3 if (rem.startswith("\x1b[F") or rem.startswith("\x1bOF")) else 4
+                continue
+            else:
+                m = re.match(r"^\x1b(?:\[[0-9;]*[a-zA-Z~]|O[a-zA-Z])", rem)
+                if m:
+                    i += len(m.group(0))
+                else:
+                    i += 1
+                continue
+
+        ch = text[i]
+        i += 1
+
+        # 2. 控制键与退格处理（流式精准消费每一个退格符）
+        if ch == "\t":  # Tab 键切换目标角色
+            if roles:
+                target_idx = (target_idx + 1) % len(roles)
+            continue
+        elif ch in ("\x7f", "\x08"):  # Backspace 退格键
+            if cursor_pos > 0:
+                input_buf = input_buf[:cursor_pos - 1] + input_buf[cursor_pos:]
+                cursor_pos -= 1
+            continue
+        elif ch == "\x01":  # Ctrl+A 行首
+            cursor_pos = 0
+            continue
+        elif ch == "\x05":  # Ctrl+E 行尾
+            cursor_pos = len(input_buf)
+            continue
+        elif ch == "\x15":  # Ctrl+U 清空光标前内容
+            input_buf = input_buf[cursor_pos:]
+            cursor_pos = 0
+            continue
+        elif ch == "\x0b":  # Ctrl+K 清空光标后内容
+            input_buf = input_buf[:cursor_pos]
+            continue
+        elif ch == "\x0c":  # Ctrl+L 刷新看板
+            actions.append({"action": "refresh"})
+            continue
+        elif ch in ("\r", "\n"):  # 回车执行
+            cmd = input_buf.strip()
+            input_buf = ""
+            cursor_pos = 0
+            history_idx = -1
+            if not cmd:
+                continue
+            history.append(cmd)
+            if cmd in (":q", ":quit", ":exit"):
+                actions.append({"action": "quit"})
+            elif cmd in (":r", ":refresh"):
+                actions.append({"action": "refresh"})
+            elif cmd in (":help", ":?"):
+                actions.append({"action": "help"})
+            elif cmd.startswith((":rotate", ":reopen", ":new")):
+                parts = cmd.split(maxsplit=1)
+                sub_role = parts[1].strip() if len(parts) > 1 else ""
+                actions.append({"action": "rotate", "role": sub_role})
+            else:
+                actions.append({"action": "submit", "cmd": cmd})
+            continue
+
+        # 3. 普通文本键入（安全过滤，确保绝不将控制字符混入输入内容）
+        if ch >= " " and ch != "\x7f":
+            input_buf = input_buf[:cursor_pos] + ch + input_buf[cursor_pos:]
+            cursor_pos += 1
+
+    return input_buf, cursor_pos, history_idx, target_idx, actions
+
 
 
 TUI_NOISE_PATTERNS = (

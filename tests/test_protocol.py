@@ -4300,6 +4300,93 @@ def test_interactive_board_console() -> None:
         h_multi = FakeMultiHerdr()
         ws_found = Herdr.find_workspace(h_multi, "demo")
         check("同名时优先选有角色的 workspace", ws_found.get("workspace_id") if ws_found else None, "w2")
+
+        # 9. 键盘流式逐字消费、退格防穿透与行内光标编辑（纯 Python 标准驱动）
+        from xteam_lib import process_board_keystrokes
+
+        # 9.1 测试多字节粘包与 IME 退格流（用户报的 ym\x7f\x7fym\x7f\x7f\x7f 真实问题）
+        ime_raw = "ym\x7f\x7fym\x7f\x7f\x7f调用外部审核来审核 一下当前项目"
+        b_out, c_out, h_idx, t_idx, acts = process_board_keystrokes(
+            ime_raw, "", 0, [], -1, ["pm", "tl", "dev"], 0
+        )
+        check("多字节退格无控制符穿透", b_out, "调用外部审核来审核 一下当前项目")
+        check("光标对齐字符串末尾", c_out, len("调用外部审核来审核 一下当前项目"))
+        check("流未包含回车时无动作", acts, [])
+
+        # 9.2 行内光标移动与中间插入/删除
+        # 当前为 "abc"，光标在末尾 (3)
+        # 左移一次 -> 光标 2
+        b, c, _, _, _ = process_board_keystrokes("\x1b[D", "abc", 3, [])
+        check("左方向键移动光标", c, 2)
+        # 在位置 2 插入 'X' -> "abXc"，光标到 3
+        b, c, _, _, _ = process_board_keystrokes("X", b, c, [])
+        check("光标处插入字符", b, "abXc")
+        check("光标随插入后移", c, 3)
+        # 退格删除刚刚插入的 'X' -> "abc"，光标到 2
+        b, c, _, _, _ = process_board_keystrokes("\x7f", b, c, [])
+        check("行内退格精准删除光标前字符", b, "abc")
+        check("光标回退", c, 2)
+        # Delete 键删除光标处的 'c' -> "ab"，光标停在 2
+        b, c, _, _, _ = process_board_keystrokes("\x1b[3~", b, c, [])
+        check("Delete 键删除光标处字符", b, "ab")
+        check("Delete 键不改变光标位置", c, 2)
+
+        # 9.3 Home/End/Ctrl+A/Ctrl+E/Ctrl+U/Ctrl+K
+        b, c, _, _, _ = process_board_keystrokes("\x1b[H", "hello", 5, [])
+        check("Home 键移至行首", c, 0)
+        b, c, _, _, _ = process_board_keystrokes("\x1b[F", "hello", 0, [])
+        check("End 键移至行尾", c, 5)
+        b, c, _, _, _ = process_board_keystrokes("\x01", "hello", 5, [])
+        check("Ctrl+A 移至行首", c, 0)
+        b, c, _, _, _ = process_board_keystrokes("\x05", "hello", 0, [])
+        check("Ctrl+E 移至行尾", c, 5)
+        b, c, _, _, _ = process_board_keystrokes("\x15", "hello world", 6, [])
+        check("Ctrl+U 删除光标前文本", b, "world")
+        check("Ctrl+U 重置光标为 0", c, 0)
+        b, c, _, _, _ = process_board_keystrokes("\x0b", "hello world", 5, [])
+        check("Ctrl+K 删除光标后文本", b, "hello")
+
+        # 9.4 Tab 轮询切换角色
+        roles = ["pm", "tl", "dev"]
+        _, _, _, t_idx, _ = process_board_keystrokes("\t", "", 0, [], -1, roles, 0)
+        check("Tab 切至 tl", t_idx, 1)
+        _, _, _, t_idx, _ = process_board_keystrokes("\t", "", 0, [], -1, roles, t_idx)
+        check("Tab 切至 dev", t_idx, 2)
+        _, _, _, t_idx, _ = process_board_keystrokes("\t", "", 0, [], -1, roles, t_idx)
+        check("Tab 循环回 pm", t_idx, 0)
+
+        # 9.5 历史记录向上/向下回溯
+        hist = ["task1", "task2"]
+        b, c, h_idx, _, _ = process_board_keystrokes("\x1b[A", "", 0, hist, -1)
+        check("Up 键提取最近历史", b, "task2")
+        b, c, h_idx, _, _ = process_board_keystrokes("\x1b[A", b, c, hist, h_idx)
+        check("Up 键提取更早历史", b, "task1")
+        b, c, h_idx, _, _ = process_board_keystrokes("\x1b[B", b, c, hist, h_idx)
+        check("Down 键回退至较新历史", b, "task2")
+        b, c, h_idx, _, _ = process_board_keystrokes("\x1b[B", b, c, hist, h_idx)
+        check("Down 键退出历史模式返回空串", b, "")
+        check("退出历史模式索引复位", h_idx, -1)
+
+        # 9.6 回车提交与命令解析
+        hist2 = []
+        b, c, _, _, acts = process_board_keystrokes("推进下一切片\r", "", 0, hist2)
+        check("回车提交动作生成", acts, [{"action": "submit", "cmd": "推进下一切片"}])
+        check("回车清空输入框", b, "")
+        check("历史记录追加提交指令", hist2, ["推进下一切片"])
+
+        _, _, _, _, acts_q = process_board_keystrokes(":q\n", "", 0, [])
+        check(":q 识别为退出动作", acts_q, [{"action": "quit"}])
+
+        _, _, _, _, acts_r = process_board_keystrokes(":r\r", "", 0, [])
+        check(":r 识别为刷新动作", acts_r, [{"action": "refresh"}])
+
+        _, _, _, _, acts_rot = process_board_keystrokes(":rotate dev\n", "", 0, [])
+        check(":rotate 识别为轮换动作并提取角色", acts_rot, [{"action": "rotate", "role": "dev"}])
+
+        # 9.7 render_board 行内光标切片渲染验证
+        ctx_cursor_mid = {"target": "pm", "input": "hello", "cursor_pos": 2, "cursor": True}
+        rendered_mid = render_board(state, color=False, console=ctx_cursor_mid)
+        check("行内光标正确拼接无乱码", "hello" in rendered_mid, True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -40,6 +40,7 @@ from xteam_lib import (  # noqa: E402
     PHASES,
     Protocol,
     render_board,
+    process_board_keystrokes,
     clean_pane_preview,
     detect_choice_prompt,
     ROLES,
@@ -2630,6 +2631,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         target_idx = available_roles.index("pm")
 
     input_buf = ""
+    cursor_pos = 0
     history: list[str] = []
     history_idx = -1
     status_text = "就绪 (Tab 切换角色 · Enter 发送 · :help 帮助)"
@@ -2662,6 +2664,7 @@ def cmd_board(args: argparse.Namespace) -> int:
             console_ctx = {
                 "target": target_role,
                 "input": input_buf,
+                "cursor_pos": cursor_pos,
                 "status": status_text,
                 "status_kind": status_kind,
                 "cursor": True,
@@ -2689,65 +2692,35 @@ def cmd_board(args: argparse.Namespace) -> int:
             if b"\x03" in raw_bytes or b"\x04" in raw_bytes:
                 break
 
-            # ANSI 转义键（方向键）
-            if raw_bytes.startswith(b"\x1b"):
-                if raw_bytes == b"\x1b[A":  # Up
-                    if history:
-                        if history_idx == -1:
-                            history_idx = len(history) - 1
-                        elif history_idx > 0:
-                            history_idx -= 1
-                        input_buf = history[history_idx]
-                elif raw_bytes == b"\x1b[B":  # Down
-                    if history and history_idx != -1:
-                        if history_idx < len(history) - 1:
-                            history_idx += 1
-                            input_buf = history[history_idx]
-                        else:
-                            history_idx = -1
-                            input_buf = ""
-                continue
-
             text = raw_bytes.decode("utf-8", errors="replace")
+            input_buf, cursor_pos, history_idx, target_idx, actions = process_board_keystrokes(
+                text,
+                input_buf,
+                cursor_pos,
+                history,
+                history_idx,
+                available_roles,
+                target_idx,
+            )
+            target_role = available_roles[target_idx] if available_roles else "pm"
+            if not actions:
+                continue
 
-            # 控制键处理
-            if text == "\t":  # Tab 切换角色
-                if available_roles:
-                    target_idx = (target_idx + 1) % len(available_roles)
-                continue
-            elif text in ("\x7f", "\x08"):  # 退格
-                if input_buf:
-                    input_buf = input_buf[:-1]
-                continue
-            elif text == "\x15":  # Ctrl+U
-                input_buf = ""
-                continue
-            elif text == "\x0c":  # Ctrl+L
-                cached_state = None
-                continue
-            elif text in ("\r", "\n"):  # 回车执行
-                cmd = input_buf.strip()
-                input_buf = ""
-                history_idx = -1
-                if not cmd:
-                    continue
-                history.append(cmd)
-
-                # 指令解析
-                if cmd in (":q", ":quit", ":exit"):
+            should_break = False
+            for act in actions:
+                kind = act.get("action")
+                if kind == "quit":
+                    should_break = True
                     break
-                elif cmd in (":r", ":refresh"):
+                elif kind == "refresh":
                     status_text = "看板已立即刷新"
                     status_kind = "info"
                     cached_state = None
-                    continue
-                elif cmd in (":help", ":?"):
+                elif kind == "help":
                     status_text = "快捷命令: :pm/:tl/:dev <msg> | :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色)"
                     status_kind = "info"
-                    continue
-                elif cmd.startswith((":rotate", ":reopen", ":new")):
-                    parts = cmd.split(maxsplit=1)
-                    sub_role = parts[1].strip() if len(parts) > 1 else target_role
+                elif kind == "rotate":
+                    sub_role = act.get("role") or target_role
                     status_text = f"正在为 {sub_role} 执行会话轮换..."
                     status_kind = "warn"
                     console_ctx["status"] = status_text
@@ -2768,49 +2741,46 @@ def cmd_board(args: argparse.Namespace) -> int:
                         status_text = f"⚠ 轮换异常: {e}"
                         status_kind = "error"
                     cached_state = None
-                    continue
+                elif kind == "submit":
+                    cmd = act.get("cmd", "")
+                    dest_role = target_role
+                    actual_msg = cmd
+                    if cmd.startswith(":pm "):
+                        dest_role, actual_msg = "pm", cmd[4:].strip()
+                    elif cmd.startswith(":tl "):
+                        dest_role, actual_msg = "tl", cmd[4:].strip()
+                    elif cmd.startswith(":dev "):
+                        dest_role, actual_msg = "dev", cmd[5:].strip()
+                    elif cmd.startswith(":to "):
+                        parts = cmd.split(maxsplit=2)
+                        if len(parts) >= 3:
+                            dest_role, actual_msg = parts[1].strip(), parts[2].strip()
 
-                dest_role = target_role
-                actual_msg = cmd
-                if cmd.startswith(":pm "):
-                    dest_role, actual_msg = "pm", cmd[4:].strip()
-                elif cmd.startswith(":tl "):
-                    dest_role, actual_msg = "tl", cmd[4:].strip()
-                elif cmd.startswith(":dev "):
-                    dest_role, actual_msg = "dev", cmd[5:].strip()
-                elif cmd.startswith(":to "):
-                    parts = cmd.split(maxsplit=2)
-                    if len(parts) >= 3:
-                        dest_role, actual_msg = parts[1].strip(), parts[2].strip()
+                    if not actual_msg:
+                        continue
 
-                if not actual_msg:
-                    continue
+                    status_text = f"正在投递指令至 {dest_role}..."
+                    status_kind = "info"
+                    console_ctx["status"] = status_text
+                    console_ctx["status_kind"] = status_kind
+                    frame = render_board(cached_state, color=color, console=console_ctx)
+                    sys.stdout.write("\033[H\033[J" + frame + "\n")
+                    sys.stdout.flush()
 
-                status_text = f"正在投递指令至 {dest_role}..."
-                status_kind = "info"
-                console_ctx["status"] = status_text
-                console_ctx["status_kind"] = status_kind
-                frame = render_board(cached_state, color=color, console=console_ctx)
-                sys.stdout.write("\033[H\033[J" + frame + "\n")
-                sys.stdout.flush()
+                    t_str = now().split()[1] if " " in now() else now()
+                    success, reason = _board_dispatch(root, proto, herdr, role_map, dest_role, actual_msg)
+                    msg_clip = actual_msg[:25] + ("…" if len(actual_msg) > 25 else "")
+                    if success:
+                        status_text = f"✓ [{t_str}] 已发送给 {dest_role}: {msg_clip!r} ({reason})"
+                        status_kind = "success"
+                    else:
+                        status_text = f"⚠ [{t_str}] 发送给 {dest_role} 受阻: {reason}"
+                        status_kind = "warn"
 
-                t_str = now().split()[1] if " " in now() else now()
-                success, reason = _board_dispatch(root, proto, herdr, role_map, dest_role, actual_msg)
-                msg_clip = actual_msg[:25] + ("…" if len(actual_msg) > 25 else "")
-                if success:
-                    status_text = f"✓ [{t_str}] 已发送给 {dest_role}: {msg_clip!r} ({reason})"
-                    status_kind = "success"
-                else:
-                    status_text = f"⚠ [{t_str}] 发送给 {dest_role} 受阻: {reason}"
-                    status_kind = "warn"
+                    cached_state = None
 
-                cached_state = None
-                continue
-
-            # 普通文本键入
-            printable = "".join(ch for ch in text if ch >= " " or ch == "\t")
-            if printable:
-                input_buf += printable
+            if should_break:
+                break
     except KeyboardInterrupt:
         pass
     finally:
