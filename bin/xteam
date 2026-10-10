@@ -39,15 +39,11 @@ from xteam_lib import (  # noqa: E402
     OBLIGATIONS,
     PHASES,
     Protocol,
-    render_board,
+    render_role_board,
     render_kanban_board,
     process_board_keystrokes,
-    kanban_columns,
-    kanban_visible_cards,
-    clamp_kanban_selection,
-    process_board_nav_keys,
-    read_kanban_card_detail,
-    clean_pane_preview,
+    move_archive_index,
+    process_archive_keys,
     detect_choice_prompt,
     ROLES,
     RoleSpec,
@@ -2508,16 +2504,9 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         except Exception:                        # noqa: BLE001
             box = "unknown"
         since = tracker.state_since(role)
-        tail_lines = []
-        if pane:
-            try:
-                raw_text = herdr.read_pane(pane, lines=35, source="visible")
-                tail_lines = clean_pane_preview(raw_text, max_lines=3)
-            except Exception:                    # noqa: BLE001
-                tail_lines = []
         title_summary = str(agent.get("terminal_title_stripped") or agent.get("terminal_title") or "").strip()
         rows.append({"role": role, "status": status, "owes": owes, "where": where,
-                     "box": box, "pane": pane, "tail": tail_lines,
+                     "box": box, "pane": pane,
                      "agent_kind": str(agent.get("agent") or ""),
                      "activity_title": title_summary,
                      "held": fmt_duration(int(time.time()) - int(since)) if since else "-"})
@@ -2558,7 +2547,7 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
             events.append(re.sub(r"^(\d{4})-(\d\d-\d\d)T(\d\d:\d\d:\d\d)Z ",
                                  r"\2 \3 ", ln)[:110])
 
-    # 收集闭合切片（供 Done 泳道）
+    # 收集闭合切片（供 spec 档案 / Done 泳道）
     closed_slices = []
     try:
         for t in proto.closed_tasks():
@@ -2580,6 +2569,8 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
                 "name": t.name,
                 "time": c_time or "closed",
                 "verdict": str(v_data.get("verdict") or "PASS"),
+                # 一行标题：档案列表光有切片名看不出这是哪一版需求
+                "title": _spec_first_line(t / "spec.md"),
             })
     except Exception:
         closed_slices = []
@@ -2598,6 +2589,71 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         "roles": rows, "alerts": alerts, "slices": slices, "events": events,
         "queue": queue_items, "closed": closed_slices,
     }
+
+
+def _spec_first_line(path: Path, width: int = 48) -> str:
+    """spec 的第一句有内容的行（跳过 H1 —— 多半是切片名，和列表里重复）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s[:width]
+    return ""
+
+
+def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
+    """翻开一片闭合切片的 spec 全文。返回 (标题, 行)。
+
+    闭合切片不走 `.xteam/closed/` —— 协议里闭合判据就是 `tasks/<片>/closed.md`
+    存在（`_is_closed`），所以整份目录连同 spec.md 一起留在 tasks/ 下。
+    读不到 spec.md 时退回目录里有的一切，并如实说 spec 不在。
+    """
+    spec = task_dir / "spec.md"
+    if spec.is_file():
+        try:
+            lines = spec.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            return f"{name} · spec.md 读不了", [f"（{exc}）"]
+        return f"spec · {name}", lines
+    others = sorted(p.name for p in task_dir.iterdir()) if task_dir.is_dir() else []
+    return f"{name} · 没有 spec.md", (
+        ["（这一片没有留下 spec.md）", ""] + [f"目录里只有：{n}" for n in others] or ["（目录也是空的）"])
+
+
+def _board_run_qa(root: Path, slice_name: str, workspace: str | None) -> tuple[bool, str]:
+    """看板里的 `:qa <切片>`：跑外部冷读并把结论门铃给 PM。
+
+    和 `cmd_qa` 的 run 分支共用同一条路（`run_external_review` + `review_digest` +
+    门铃 PM），不另造一条 —— 两条路必然有一条先烂。
+    返回 (ok, 状态行要显示的一句话)。
+    """
+    task = _qa_task(root, slice_name)
+    if task is None or not task.exists():
+        return False, f"找不到切片 {slice_name!r}（.xteam/tasks/ 下没有它）"
+    cfg = QaConfig(root).load()
+    ok, note = run_external_review(root, task, cfg, cfg["prompt"])
+    if not ok:
+        log_timeline(root, "qa", f"{task.name} 第三方评审失败：{note[:200]}")
+        return False, note
+    digest = review_digest(task)
+    log_timeline(root, "qa", f"{task.name} 第三方评审完成（{len(digest)} 字）")
+    try:
+        label, _ = resolve_ws_label(root, workspace)
+        herdr = Herdr(scope=label)
+        ws = herdr.find_workspace(label)
+        proto = Protocol(root)
+        pane = (_read_json(proto.dir / "session.json").get("panes") or {}).get("pm")
+        if ws and pane:
+            herdr.doorbell(pane, f"【第三方评审】{task.name} 交上来了。"
+                                 f"这是 {cfg['agent']} 的独立冷读意见"
+                                 f"（不是你判定的依据，是给你多一个视角）：\n\n"
+                                 f"{digest}\n\n全文：{review_path(task)}")
+    except Exception:                              # 门铃失败不该推翻评审结果
+        pass
+    return True, f"{cfg['agent']} 冷读完（{len(digest)} 字，已门铃 PM）"
 
 
 def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
@@ -2634,8 +2690,11 @@ def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
 
 
 def cmd_board(args: argparse.Namespace) -> int:
-    """一屏看板：谁在干什么、链路为什么不动、最近发生了什么。
-    支持交互式 TUI 指令控制台（0 Token 直投 PM/TL/DEV、Tab 切换角色、:q 退出）。
+    """一屏看板：三角色**真实状态** + spec 档案，链路为什么不动置顶。
+
+    默认角色视图；`--kanban` 切 5 泳道瀑布视图（窄终端自动降级回角色视图）。
+    交互控制台：Tab 切角色 · Enter 发送 · Esc 进 spec 档案（j/k 选片 · Enter 翻阅全文）·
+    `:qa <切片>` 唤起外部冷读 · `:reviewer <话>` 派活给独立 reviewer · `:q` 退出。
     """
     root = Path(args.project).resolve()
     proto = Protocol(root)
@@ -2652,16 +2711,16 @@ def cmd_board(args: argparse.Namespace) -> int:
     tracker = IdleTracker(proto.dir / "watch" / "idle.state")
     color = sys.stdout.isatty() and not args.plain
 
-    # 脚本、管道或显式 --once：降级为只读静态打印（默认列表，传 --kanban 则输出看板）
+    # 脚本、管道或显式 --once：只读静态打印（默认角色视图，--kanban 输出瀑布）
     if args.once or not sys.stdin.isatty():
         state = _board_state(root, proto, herdr, label, role_map, tracker)
-        fn = render_kanban_board if getattr(args, "kanban", False) else render_board
+        fn = render_kanban_board if getattr(args, "kanban", False) else render_role_board
         frame = fn(state, color=color)
         print(frame)
         return 0
 
-    # 交互式 TUI 模式：默认采用专业 5 列 Kanban 泳道看板，--list 降级为列表
-    renderer = render_board if getattr(args, "list", False) else render_kanban_board
+    # 交互式 TUI 模式：默认角色视图（真实状态 + spec 档案），--kanban 切瀑布视图
+    renderer = render_kanban_board if getattr(args, "kanban", False) else render_role_board
 
     # 交互式 TUI 模式
     import select
@@ -2679,15 +2738,22 @@ def cmd_board(args: argparse.Namespace) -> int:
     cursor_pos = 0
     history: list[str] = []
     history_idx = -1
-    status_text = "就绪 (Tab 切换角色 · Enter 发送 · Esc 导航 · :help 帮助)"
+    status_text = "就绪 (Tab 切换角色 · Enter 发送 · Esc 翻 spec 档案 · :help 帮助)"
     status_kind = "info"
     last_refresh = 0.0
     last_key = 0.0
     cached_state = None
-    nav_mode = False
-    lane_idx = 0
-    card_idx = 0
-    detail_lines: list[str] = []
+    nav_mode = False        # True = 档案态（j/k 选片 · Enter 翻阅）
+    archive_idx = 0
+    view: dict | None = None        # 非空 = spec 全文翻阅层（j/k 滚 · Esc 关）
+
+    def _archive_total() -> int:
+        return len((cached_state or {}).get("closed") or [])
+
+    def _clamp_archive() -> None:
+        nonlocal archive_idx
+        total = _archive_total()
+        archive_idx = 0 if total <= 0 else max(0, min(archive_idx, total - 1))
 
     old_attrs = termios.tcgetattr(sys.stdin)
     try:
@@ -2710,8 +2776,7 @@ def cmd_board(args: argparse.Namespace) -> int:
                 cached_state = _board_state(root, proto, herdr, label, role_map, tracker)
                 last_refresh = now_t
 
-            cols = kanban_columns(cached_state) if cached_state else []
-            lane_idx, card_idx = clamp_kanban_selection(cols, lane_idx, card_idx)
+            _clamp_archive()
 
             console_ctx = {
                 "target": target_role,
@@ -2721,8 +2786,8 @@ def cmd_board(args: argparse.Namespace) -> int:
                 "status_kind": status_kind,
                 "cursor": True,
                 "nav": nav_mode,
-                "selection": {"lane": lane_idx, "card": card_idx} if nav_mode else None,
-                "detail": detail_lines or None,
+                "archive_idx": archive_idx,
+                "view": view,
             }
             frame = renderer(cached_state, color=color, console=console_ctx)
             # 无闪烁重绘
@@ -2748,21 +2813,48 @@ def cmd_board(args: argparse.Namespace) -> int:
                 break
 
             text = raw_bytes.decode("utf-8", errors="replace")
+
+            # ---- spec 全文翻阅层：它盖住一切，j/k 滚页、Esc 关闭 ----
+            if view is not None:
+                last_line = max(0, len(view.get("lines") or []) - 1)
+                off = max(0, min(int(view.get("offset") or 0), last_line))
+                if text in ("\x1b", "\x1b\x1b") or text in ("i", "q"):
+                    view = None
+                    status_text = "已合上 spec（Esc 再进档案）"
+                    status_kind = "info"
+                    continue
+                if text in ("j", "\x1b[B"):
+                    view["offset"] = min(off + 1, last_line)
+                    continue
+                if text in ("k", "\x1b[A"):
+                    view["offset"] = max(0, off - 1)
+                    continue
+                if text == "\x06":               # Ctrl+F 下半页
+                    view["offset"] = min(off + 10, last_line)
+                    continue
+                if text == "\x02":               # Ctrl+B 上半页
+                    view["offset"] = max(0, off - 10)
+                    continue
+                if text == "g":
+                    view["offset"] = 0
+                    continue
+                if text == "G":
+                    view["offset"] = last_line
+                    continue
+                continue        # 其余键在翻阅层一律丢弃
+
             if text == "\x1b" or text == "\x1b\x1b":
-                # 裸 Esc：进出看板导航态（成对/单个都认，有的终端会把 Esc 发成双份）
+                # 裸 Esc：进出 spec 档案态（成对/单个都认，有的终端会把 Esc 发成双份）
                 nav_mode = not nav_mode
-                if not nav_mode:
-                    detail_lines = []
-                    status_text = "已退出导航态（Esc 再进）"
-                    status_kind = "info"
-                else:
-                    status_text = "导航态：h/l 换泳道 · j/k 选卡 · Enter 看详情 · i 返回"
-                    status_kind = "info"
+                status_text = ("档案态：j/k 选片 · Enter 翻阅 spec 全文 · i 返回输入"
+                               if nav_mode else "已退出档案态（Esc 再进）")
+                status_kind = "info"
                 continue
 
             if nav_mode:
-                lane_idx, card_idx, acts, nav_rest = process_board_nav_keys(
-                    text, lane_idx, card_idx, cols
+                total = _archive_total()
+                archive_idx, acts, nav_rest = process_archive_keys(
+                    text, archive_idx, total
                 )
                 if not acts:
                     continue
@@ -2770,24 +2862,19 @@ def cmd_board(args: argparse.Namespace) -> int:
                     kind = act.get("action")
                     if kind == "to_input":
                         nav_mode = False
-                        detail_lines = []
-                        status_text = "已退出导航态（Esc 再进）"
+                        status_text = "已退出档案态（Esc 再进）"
                         status_kind = "info"
-                    elif kind == "open_card":
-                        try:
-                            lane_title, _cc, cards = cols[int(act["lane"])]
-                            visible = kanban_visible_cards(cards)
-                            card = visible[int(act["card"])] if visible else {}
-                            detail_lines = read_kanban_card_detail(
-                                proto.dir, lane_title, card)
-                            status_text = f"详情：{lane_title} · {card.get('name', '')}"
-                            status_kind = "info"
-                        except Exception as e:  # noqa: BLE001
-                            detail_lines = [f"读详情失败: {e}"]
-                            status_text = "详情读取失败"
-                            status_kind = "error"
+                    elif kind == "open_spec":
+                        entry = ((cached_state or {}).get("closed") or [])[int(act["index"])] \
+                            if total else {}
+                        name = str(entry.get("name") or "")
+                        title, lines = _spec_view_lines(proto.dir / "tasks" / name, name)
+                        view = {"title": title, "lines": lines,
+                                "offset": 0, "height": 18}
+                        status_text = f"翻阅 spec：{name}"
+                        status_kind = "info"
                 if nav_mode or not nav_rest:
-                    # 还在导航态，或切换键后面没有更多字节 —— 重绘一帧就够
+                    # 还在档案态，或切换键后面没有更多字节 —— 重绘一帧就够
                     continue
                 # 一次 read 里「i + 人接着打的字」粘住了：剩余流交回输入态，
                 # 一个键都不许丢（用户看到的字消失比穿透更难查）。
@@ -2817,7 +2904,9 @@ def cmd_board(args: argparse.Namespace) -> int:
                     status_kind = "info"
                     cached_state = None
                 elif kind == "help":
-                    status_text = "快捷命令: :pm/:tl/:dev <msg> | :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色) | Esc(导航态 h/j/k/l 选卡 · Enter 详情)"
+                    status_text = ("快捷命令: :pm/:tl/:dev/:reviewer <msg> | :qa <切片> 外部评审 "
+                                   "| :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色) "
+                                   "| Esc(spec 档案 j/k · Enter 翻阅)")
                     status_kind = "info"
                 elif kind == "rotate":
                     sub_role = act.get("role") or target_role
@@ -2840,6 +2929,47 @@ def cmd_board(args: argparse.Namespace) -> int:
                     except Exception as e:
                         status_text = f"⚠ 轮换异常: {e}"
                         status_kind = "error"
+                    cached_state = None
+                elif kind == "qa":
+                    # 外部评审：和 `xteam qa run` 同一条路（run_external_review +
+                    # 门铃 PM），只是从看板里一把唤起。verdict 仍只有 PM 一个作者。
+                    slice_name = act.get("slice") or ""
+                    if not slice_name:
+                        status_text = "⚠ :qa 要带切片名，例：:qa login-api"
+                        status_kind = "warn"
+                        continue
+                    status_text = f"正在外部评审 {slice_name}..."
+                    status_kind = "info"
+                    console_ctx["status"] = status_text
+                    console_ctx["status_kind"] = status_kind
+                    frame = renderer(cached_state, color=color, console=console_ctx)
+                    sys.stdout.write("\033[H\033[J" + frame + "\n")
+                    sys.stdout.flush()
+                    try:
+                        ok, note = _board_run_qa(root, slice_name, args.workspace)
+                    except Exception as e:  # noqa: BLE001
+                        ok, note = False, f"{e}"
+                    status_text = f"{'✓' if ok else '✗'} 外部评审 {slice_name}: {note[:90]}"
+                    status_kind = "success" if ok else "error"
+                    cached_state = None
+                elif kind == "reviewer":
+                    msg = act.get("msg") or ""
+                    if not msg:
+                        status_text = "⚠ :reviewer 要带一句话，例：:reviewer 看看这片会不会过度设计"
+                        status_kind = "warn"
+                        continue
+                    success, reason = _board_dispatch(root, proto, herdr, role_map,
+                                                      "reviewer", msg)
+                    if success:
+                        status_text = f"✓ 已派给 reviewer: {msg[:30]}"
+                        status_kind = "success"
+                    elif "未在运行" in reason:
+                        status_text = ("reviewer 没在跑 —— 先 `xteam up --reviewer`；"
+                                       "或改用 :qa <切片> 一次性外部冷读")
+                        status_kind = "warn"
+                    else:
+                        status_text = f"⚠ reviewer 没收到: {reason}"
+                        status_kind = "warn"
                     cached_state = None
                 elif kind == "submit":
                     cmd = act.get("cmd", "")
@@ -4682,10 +4812,10 @@ def main() -> int:
     p.add_argument("--rm", action="store_true", help="移除快照树")
     p.set_defaults(func=cmd_review_tree)
 
-    p = sub.add_parser("board", help="一屏看板：谁在干什么、链路为什么不动（自动刷新）")
+    p = sub.add_parser("board", help="一屏看板：三角色真实状态 + spec 档案（自动刷新）")
     p.add_argument("--once", action="store_true", help="只打一屏就退出（脚本/测试用）")
-    p.add_argument("--list", action="store_true", help="使用传统纵向列表视图（默认多列泳道看板）")
-    p.add_argument("--kanban", action="store_true", help="强制使用多列泳道看板（--once 时亦可用）")
+    p.add_argument("--kanban", action="store_true",
+                   help="用 5 泳道瀑布视图（默认是角色视图：真实状态 + spec 档案）")
     p.add_argument("--interval", type=float, default=2.0, metavar="SECS",
                    help="刷新间隔（默认 2 秒）")
     p.add_argument("--plain", action="store_true", help="不上色（管道里默认就不上色）")
@@ -4752,8 +4882,20 @@ def main() -> int:
         return 0
 
     if not getattr(args, "cmd", None):
-        ap.print_help()
-        return 1
+        # 裸敲 `xteam` 就是「现在什么情况」——直接进看板。
+        # 没起过的项目不要装作能看：board 的第一件事是找 workspace，找不到会
+        # die()，那时人看到的是一条报错而不是帮助。所以先探一下 .xteam。
+        probe = Path(args.project or ".").resolve()
+        if (probe / XTEAM_DIRNAME).is_dir():
+            args.cmd = "board"
+            args.func = cmd_board
+            args.once = False
+            args.kanban = False
+            args.interval = 2.0
+            args.plain = False
+        else:
+            ap.print_help()
+            return 1
     # `up` 的位置参数与全局 --project 合并，位置参数优先（更贴近直觉）。
     # 放在这里而不是各命令里：只有一处要记得处理。
     if getattr(args, "dir", None):

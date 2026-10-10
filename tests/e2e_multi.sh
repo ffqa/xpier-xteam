@@ -1806,13 +1806,19 @@ assert_has "MP-33.3 报的是已投递" "已投递"
 [ "$(grep -c '^╰─$' "$BASE/mp33.tail")" = "1" ] \
   && ok "MP-33.3 提交后输入框回到空框" || bad "MP-33.3 输入框还残留" "$(cat "$BASE/mp33.tail")"
 
-# 态 4：一屏看板 —— 必须把「为什么不动」摆出来（这里是草稿挡住门铃）。
+# 态 4：一屏看板 —— 默认是角色视图：真实状态在，链路为什么不动置顶
+# （这里是草稿挡住门铃）。瀑布视图要显式 --kanban 才出。
 printf '╰─ txt #2\n' > "$BASE/mp33.tail"
 run xin33 "$T" board --once
 assert_rc  "MP-33.4 board --once rc=0" 0
-assert_has "MP-33.4 有角色表" "── 角色"
+assert_has "MP-33.4 有角色块" "── 角色（真实状态）"
 assert_has "MP-33.4 报出草稿挡住门铃" "门铃投不进去"
-assert_has "MP-33.4 有切片块" "── 切片"
+assert_has "MP-33.4 有在飞切片块" "── 在飞"
+printf '%s' "$LAST_OUT" | grep -qF 'Backlog' \
+  || ok  "MP-33.4 默认视图不出泳道（瀑布要显式 --kanban）"
+run xin33 "$T" board --once --kanban
+assert_rc  "MP-33.4b --kanban 仍可出瀑布视图" 0
+assert_has "MP-33.4b 瀑布视图有泳道" "Backlog"
 
 # 态 5：agent 停在选择框上 → 面板必须说清是「等你答」，不是「无响应」。
 printf '|   [ ] 应用管理   |\n| Space toggle · Enter next · Esc cancel |\n' \

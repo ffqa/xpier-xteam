@@ -105,15 +105,10 @@ from xteam_lib import (  # noqa: E402
     suggest_kinds,
     subagent_capability,
     PASTE_CHIP_LINES,
-    render_board,
+    render_role_board,
     render_kanban_board,
-    kanban_columns,
-    kanban_visible_cards,
-    KANBAN_MAX_CARDS_PER_COL,
-    clamp_kanban_selection,
-    move_kanban_selection,
-    process_board_nav_keys,
-    read_kanban_card_detail,
+    move_archive_index,
+    process_archive_keys,
     process_board_keystrokes,
     detect_choice_prompt,
 )
@@ -2546,10 +2541,24 @@ def test_version_flag() -> None:
         check(f"{flag} 含资源路径", "资源：" in out, True)
         check(f"{flag} 含布局（装的还是源码）", "布局：" in out, True)
         check(f"{flag} 不是报错", "usage:" not in out, True)
-    # 不带子命令应给帮助而不是静默退出（但 --version 优先）
-    r = subprocess.run([sys.executable, str(binx)], capture_output=True,
-                       text=True, timeout=60)
-    check("不带子命令给帮助", "usage:" in r.stdout, True)
+    # 不带子命令：有 .xteam 的项目里直接进看板（那是「现在什么情况」的答案），
+    # 没有 .xteam 的目录才给帮助 —— 装看的代码去起 board 只会得到一条报错。
+    empty = Path(tempfile.mkdtemp())
+    try:
+        r = subprocess.run([sys.executable, str(binx)], capture_output=True,
+                           text=True, timeout=60, cwd=str(empty))
+        check("非项目目录里裸敲仍给帮助", "usage:" in r.stdout, True)
+        check("非项目目录里裸敲 rc≠0", r.returncode != 0, True)
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+    withproj = Path(tempfile.mkdtemp())
+    try:
+        (withproj / ".xteam").mkdir()
+        r = subprocess.run([sys.executable, str(binx)], capture_output=True,
+                           text=True, timeout=60, cwd=str(withproj))
+        check("项目目录里裸敲进看板而不是打帮助", "usage:" not in r.stdout, True)
+    finally:
+        shutil.rmtree(withproj, ignore_errors=True)
     # VERSION 文件在包里（发布到另一台机器要能对上版本）
     check("VERSION 文件存在", (repo_doc("VERSION")).exists(), True)
     check("版本号不是 '未知'",
@@ -4023,44 +4032,101 @@ def test_doorbell_guards_human_draft_and_retries_enter() -> None:
 
 
 def test_render_board_and_choice_detector() -> None:
-    print("\n[95] 看板渲染 + 选择题识别（纯函数，不碰 herdr）")
+    print("\n[95] 角色看板渲染 + spec 档案 + 选择题识别（纯函数，不碰 herdr）")
     state = {
-        "title": "xteam board  T  'demo'  /tmp/demo  （xteam 0.2.8）",
+        "title": "xteam board  T  'demo'  /tmp/demo  （xteam 0.2.17）",
+        "label": "demo",
         "roles": [
             {"role": "pm", "status": "working", "held": "5m10s",
-             "owes": "next-slice", "where": "console +14", "box": "empty"},
+             "owes": "next-slice", "where": "console +14", "box": "empty",
+             "activity_title": "正在写 next-slice 的 spec"},
             {"role": "tl", "status": "blocked", "held": "3m10s",
              "owes": "none", "where": "", "box": "draft"},
+            {"role": "dev", "status": "doing", "held": "1m",
+             "owes": "implement", "where": "login-api", "box": "prompt"},
         ],
         "alerts": ["⚠ tl 停在选择框上（等你答，不是做完）"],
         "slices": [{"name": "console-ui-commit", "stage": "settling",
                     "note": "未开工  pm:settle"}],
+        "closed": [
+            {"name": "auth-api", "time": "10-09 19:30", "verdict": "PASS",
+             "title": "授权与登录流程"},
+            {"name": "board-nav", "time": "10-10 09:02", "verdict": "FAIL",
+             "title": "看板交互导航"},
+        ],
         "events": ["10-07 23:07:26 BLOCKED-ANSWER tl …"],
     }
-    frame = render_board(state)
-    check("标题在", "xteam board" in frame, True)
-    check("角色行带义务与在哪", "next-slice @ console +14" in frame, True)
-    check("输入框有草稿会标出来", "✍ 输入框有草稿" in frame, True)
-    check("链路块在", "链路（为什么不动）" in frame, True)
-    check("链路块带原因", "停在选择框上" in frame, True)
-    check("切片块带阶段", "[settling]" in frame, True)
-    check("事件块在", "BLOCKED-ANSWER" in frame, True)
-    check("不上色时没有 ANSI", "\033[" in frame, False)
-    check("上色时有 ANSI", "\033[" in render_board(state, color=True), True)
-    check("空状态不炸", render_board({}).splitlines()[0], "xteam board")
-    check("没有角色时说清是空的",
-          "（没有在跑的角色）" in render_board({"roles": []}), True)
 
-    state_with_tail = {
-        "title": "xteam board",
-        "roles": [
-            {"role": "dev", "status": "working", "owes": "implement", "held": "1m",
-             "tail": ["cargo build ... ok", "cargo test ... passed"]},
-        ],
-    }
-    frame_tail = render_board(state_with_tail)
-    check("实时活动块在", "实时活动 (Pane Preview · 0 Token)" in frame_tail, True)
-    check("角色活动包含采样行", "cargo test ... passed" in frame_tail, True)
+    # 1. 默认是角色视图：真实状态 + spec 档案，没有泳道也没有日志采样
+    frame = render_role_board(state)
+    check("顶栏带项目名", "xteam Board [demo]" in frame, True)
+    check("角色块在", "角色（真实状态）" in frame, True)
+    check("三角色各一行状态", all(r in frame for r in ("pm", "tl", "dev")), True)
+    check("状态是 herdr 给的真状态（不是日志）", "working" in frame and "blocked" in frame, True)
+    check("角色在干什么来自活动标题", "正在写 next-slice 的 spec" in frame, True)
+    check("输入框有草稿会标出来", "✍ 输入框有草稿（门铃投不进去）" in frame, True)
+    check("停在选择框上也会标", "停在选择框上（等它答）" in frame, True)
+    check("链路块在", "链路（为什么不动）" in frame, True)
+    check("在飞切片带阶段", "[settling]" in frame, True)
+    check("spec 档案块在", "spec 档案（已闭合" in frame, True)
+    check("档案列出闭合切片与标题", "auth-api" in frame and "授权与登录流程" in frame, True)
+    check("档案带裁决", "PASS" in frame and "FAIL" in frame, True)
+    check("默认不渲染泳道", "Backlog" not in frame, True)
+    check("默认不采样 pane 日志", "实时活动" not in frame and "├─" not in frame, True)
+    check("不上色时没有 ANSI", "\033[" in frame, False)
+    check("上色时有 ANSI", "\033[" in render_role_board(state, color=True), True)
+    check("没有角色时说清是空的",
+          "（没有在跑的角色" in render_role_board({"roles": []}, term_width=90), True)
+    check("空档案有话说", "（还没有闭合的切片）" in render_role_board({}, term_width=90), True)
+
+    # 2. 档案选择：只有被选中的那行带 ▶
+    console = {"target": "pm", "input": "", "cursor_pos": 0, "cursor": True,
+               "nav": True, "archive_idx": 1}
+    frame_sel = render_role_board(state, color=False, console=console, term_width=100)
+    lines_with_mark = [l for l in frame_sel.splitlines() if "▶" in l]
+    check("档案选中行带 ▶", len(lines_with_mark), 1)
+    check("▶ 落在被选中的那片", "board-nav" in lines_with_mark[0], True)
+    check("档案态提示牌换成 [档案]", "[档案] ❯" in frame_sel, True)
+    check("档案态底栏给的是翻页键", "Enter 翻阅 spec" in frame_sel, True)
+    check("输入态底栏给的是发送键", "Enter 发送" in render_role_board(
+        state, console={"target": "pm", "input": "", "cursor_pos": 0}, term_width=100), True)
+
+    # 3. 档案态按键：纯函数，一个可打印字符都不进输入流
+    check("j 选下一片", process_archive_keys("j", 0, 2)[0], 1)
+    check("k 选上一片", process_archive_keys("k", 1, 2)[0], 0)
+    check("j 到头循环", process_archive_keys("j", 1, 2)[0], 0)
+    check("k 到头循环", process_archive_keys("k", 0, 2)[0], 1)
+    check("↓ 与 j 等价",
+          process_archive_keys("\x1b[B", 0, 3)[0], process_archive_keys("j", 0, 3)[0])
+    check("Enter 翻开当前片", process_archive_keys("\r", 1, 2)[1],
+          [{"action": "open_spec", "index": 1}])
+    check("空档案上 Enter 不产生动作", process_archive_keys("\r", 0, 0)[1], [])
+    check("空档案时索引归零", process_archive_keys("j", 5, 0)[0], 0)
+    check("裸 Esc 回输入态", process_archive_keys("\x1b", 0, 2)[1], [{"action": "to_input"}])
+    check("i 回输入态", process_archive_keys("i", 0, 2)[1], [{"action": "to_input"}])
+    check("档案态里打的字既不产生动作也不移动",
+          process_archive_keys("abc 你好", 1, 2), (1, [], ""))
+    check("空输入流不炸", process_archive_keys("", 1, 2), (1, [], ""))
+    check("粘包时剩余流交回输入态", process_archive_keys("i你好", 1, 2),
+          (1, [{"action": "to_input"}], "你好"))
+    check("模式没切就没有剩余流", process_archive_keys("jxyz", 0, 3)[2], "")
+    check("move_archive_index 空表归零", move_archive_index(3, 0, "down"), 0)
+
+    # 4. spec 全文翻阅层：盖住控制台，带行号区间
+    view = {"title": "spec · auth-api", "lines": [f"第 {i} 行" for i in range(1, 41)],
+            "offset": 5, "height": 10}
+    frame_view = render_role_board(state, color=False,
+                                   console={"target": "pm", "input": "", "cursor_pos": 0,
+                                            "cursor": True, "view": view},
+                                   term_width=90)
+    check("翻阅层报得出读到哪一段", "(6-15/40" in frame_view, True)
+    check("翻阅层显示窗口内的行", "第 10 行" in frame_view, True)
+    check("翻阅层不显示窗口外的行", "第 20 行" not in frame_view, True)
+    check("翻阅层盖住输入行", "[发给 pm]" not in frame_view, True)
+
+    # 5. 窄终端 / 空状态
+    narrow = render_role_board(state, term_width=60)
+    check("窄终端照样出角色块", "角色（真实状态）" in narrow, True)
 
     # 实测形状：omp 的多选框（android_dev 里 tl 停的那个）。
     choice_tail = ("|   [ ] 应用管理                        |\n"
@@ -4210,34 +4276,39 @@ def test_interactive_board_console() -> None:
         "roles": [{"role": "pm", "status": "working", "owes": "next-slice"}],
     }
 
-    # 1. 纯静态模式向后兼容（console 为 None）
-    frame_static = render_board(state, color=False, console=None)
-    check("静态渲染无控制台分隔符", "── 指令控制台" in frame_static, False)
+    # 1. 纯静态模式（console 为 None）：只有状态与档案，没有输入行
+    frame_static = render_role_board(state, color=False, console=None, term_width=100)
+    check("静态渲染没有输入行", "[发给" not in frame_static, True)
+    check("静态渲染照样有角色块", "角色（真实状态）" in frame_static, True)
 
     # 2. 交互控制台视图渲染
     ctx_pm = {
         "target": "pm",
         "input": "请按方案A继续推进",
+        "cursor_pos": 9,
         "status": "就绪 (Tab 切换角色 · Enter 发送 · :help)",
         "status_kind": "info",
+        "cursor": True,
     }
-    frame_pm = render_board(state, color=False, console=ctx_pm)
-    check("控制台分隔符存在", "── 指令控制台" in frame_pm, True)
+    frame_pm = render_role_board(state, color=False, console=ctx_pm, term_width=100)
     check("状态提示行存在", "[状态] 就绪" in frame_pm, True)
     check("目标为 pm 的提示符与输入内容", "[发给 pm] ❯ 请按方案A继续推进█" in frame_pm, True)
+    check("底栏给出唤起外部评审的入口", ":qa" in frame_pm, True)
 
     # 3. Tab 切换目标角色至 tl
     ctx_tl = {
         "target": "tl",
         "input": ":r",
+        "cursor_pos": 2,
         "status": "已切换至 tl",
         "status_kind": "info",
+        "cursor": True,
     }
-    frame_tl = render_board(state, color=False, console=ctx_tl)
+    frame_tl = render_role_board(state, color=False, console=ctx_tl, term_width=100)
     check("目标切换为 tl 后的提示符", "[发给 tl] ❯ :r█" in frame_tl, True)
 
     # 4. 彩色模式渲染
-    frame_color = render_board(state, color=True, console=ctx_pm)
+    frame_color = render_role_board(state, color=True, console=ctx_pm, term_width=100)
     check("彩色控制台包含 ANSI 颜色码", "\033[" in frame_color, True)
 
     # 5. _board_dispatch 投递分发逻辑预检
@@ -4392,9 +4463,10 @@ def test_interactive_board_console() -> None:
         _, _, _, _, acts_rot = process_board_keystrokes(":rotate dev\n", "", 0, [])
         check(":rotate 识别为轮换动作并提取角色", acts_rot, [{"action": "rotate", "role": "dev"}])
 
-        # 9.7 render_board 行内光标切片渲染验证
+        # 9.7 render_role_board 行内光标拼接验证
         ctx_cursor_mid = {"target": "pm", "input": "hello", "cursor_pos": 2, "cursor": True}
-        rendered_mid = render_board(state, color=False, console=ctx_cursor_mid)
+        rendered_mid = render_role_board(state, color=False, console=ctx_cursor_mid,
+                                         term_width=100)
         check("行内光标正确拼接无乱码", "hello" in rendered_mid, True)
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -4455,7 +4527,8 @@ def test_kanban_board_renderer() -> None:
 
     # 4. 极窄屏终端（< 70 列）自动降级为纵向列表视图
     frame_narrow = render_kanban_board(state, color=False, term_width=65)
-    check("窄屏模式降级为传统列表视图", "── 角色 ──" in frame_narrow or "── 切片 ──" in frame_narrow, True)
+    check("窄屏模式降级为角色视图（5 列并排必然折行）",
+          "角色（真实状态）" in frame_narrow and "Backlog" not in frame_narrow, True)
 
     # 5. 交互控制台集成渲染
     console_ctx = {
@@ -4474,151 +4547,6 @@ def test_kanban_board_renderer() -> None:
     # 6. 彩色渲染模式包含 ANSI 代码
     frame_color = render_kanban_board(state, color=True, console=console_ctx, term_width=120)
     check("彩色看板包含 ANSI 转义序列", "\033[" in frame_color, True)
-
-
-def test_kanban_board_navigation() -> None:
-    print("\n[100] 看板交互导航（Esc 导航态 · Vim 键位选卡 · 0-Token 卡片详情）")
-    state = {
-        "title": "xteam board", "label": "android_dev", "roles": [],
-        "alerts": [],
-        "queue": [
-            {"slice": "slice-4", "order": 1, "note": "修复中文退格与按键穿透"},
-            {"slice": "slice-5", "order": 2, "note": "支持终端多列自适应"},
-        ],
-        "slices": [
-            {"name": "slice-1", "stage": "spec", "note": "未开工"},
-            {"name": "slice-2", "stage": "implement", "note": "在飞  dev:implement"},
-            {"name": "slice-3", "stage": "verify", "note": "**待 gate**  tl:verdict"},
-        ],
-        "closed": [{"name": "slice-0", "time": "10-09 19:30", "verdict": "PASS"}],
-    }
-    cols = kanban_columns(state)
-    check("泳道顺序不变（Backlog → Done）",
-          [t for t, _c, _cards in cols],
-          ["Backlog", "Todo", "Working", "Review", "Done"])
-    check("每列可见卡片数 = min(卡片数, 上限)",
-          [len(kanban_visible_cards(cards)) for _t, _cc, cards in cols],
-          [2, 1, 1, 1, 1])
-
-    # 1. 空泳道必须被跳过 / 越界索引必须被夹回来
-    # 造一列真空：Backlog 1 · Todo 0 · Working 1 · Review 0 · Done 1
-    gap_state = {
-        "title": "t", "label": "l", "roles": [], "alerts": [],
-        "queue": [{"slice": "slice-9", "order": 1, "note": "还没规划"}],
-        "slices": [{"name": "slice-2", "stage": "implement", "note": "在飞"}],
-        "closed": [{"name": "slice-0", "time": "10-09", "verdict": "PASS"}],
-    }
-    gap_cols = kanban_columns(gap_state)
-    check("gap 棋盘的每列卡片数", [len(cards) for _t, _cc, cards in gap_cols], [1, 0, 1, 0, 1])
-    check("右移跳过空泳道", move_kanban_selection(gap_cols, 0, 0, "right"), (2, 0))
-    check("左移也跳过空泳道", move_kanban_selection(gap_cols, 4, 0, "left"), (2, 0))
-    check("漂移到空泳道时落到第一个有卡的泳道", clamp_kanban_selection(gap_cols, 1, 0), (0, 0))
-    check("全空棋盘不炸", clamp_kanban_selection([], 3, 3), (0, 0))
-    check("未知方向不动选择", move_kanban_selection(gap_cols, 2, 0, "sideways"), (2, 0))
-    check("右移到头循环回第一列", move_kanban_selection(gap_cols, 4, 0, "right"), (0, 0))
-    check("左移到头循环回最后一列", move_kanban_selection(gap_cols, 0, 0, "left"), (4, 0))
-    check("换列尽量保持原来的行位", move_kanban_selection(gap_cols, 4, 0, "left"), (2, 0))
-    check("卡片索引越界时夹回最后一张", clamp_kanban_selection(cols, 2, 99), (2, 0))
-
-    # 2. 列内 j/k 循环（单列就是一个小缓冲区）
-    many = {
-        "title": "t", "label": "l", "roles": [], "alerts": [], "queue": [],
-        "slices": [{"name": f"w{i}", "stage": "implement", "note": "在飞"}
-                   for i in range(9)],
-        "closed": [],
-    }
-    many_cols = kanban_columns(many)
-    check("单列卡片超上限时只暴露可见的那几张",
-          [len(kanban_visible_cards(cards)) for _t, _cc, cards in many_cols],
-          [0, 0, KANBAN_MAX_CARDS_PER_COL, 0, 0])
-    check("首张按 k 上移循环到最后一张",
-          move_kanban_selection(many_cols, 2, 0, "up"), (2, 5))
-    check("末张按 j 下移循环回第一张",
-          move_kanban_selection(many_cols, 2, 5, "down"), (2, 0))
-    check("第 7 张卡选不中（页面上只有 6 张）",
-          clamp_kanban_selection(many_cols, 2, 6), (2, 5))
-
-    # 3. 导航态按键消费：等价键、Esc、Enter、以及「不碰输入流」
-    check("l 与 → 等价",
-          process_board_nav_keys("l", 0, 0, gap_cols)[:2],
-          process_board_nav_keys("\x1b[C", 0, 0, gap_cols)[:2])
-    check("k 与 ↑ 等价",
-          process_board_nav_keys("k", 2, 0, cols)[:2],
-          process_board_nav_keys("\x1b[A", 2, 0, cols)[:2])
-    lane, card, acts, rest = process_board_nav_keys("l\r", 0, 0, gap_cols)
-    check("Enter 生成 open_card 且指向一张可见的卡", acts, [{"action": "open_card", "lane": 2, "card": 0}])
-    check("open_card 索引就是当前选择", (lane, card), (2, 0))
-    check("没切模式时没有剩余流", rest, "")
-    check("空泳道上 Enter 不产生动作",
-          process_board_nav_keys("\r", 1, 0, gap_cols)[2], [])
-    check("裸 Esc 退回输入态", process_board_nav_keys("\x1b", 2, 3, cols)[2], [{"action": "to_input"}])
-    check("i / q 也退回输入态", process_board_nav_keys("iq", 1, 0, cols)[2],
-          [{"action": "to_input"}])
-    check("导航态里打的字既不产生动作也不移动选择",
-          process_board_nav_keys("abc 你好", 1, 0, cols),
-          (1, 0, [], ""))
-    check("空输入流不炸", process_board_nav_keys("", 2, 2, cols), (2, 2, [], ""))
-    check("未选中卡片时 Enter 不产生动作",
-          process_board_nav_keys("\r", 0, 0, [("Backlog", "90", [])])[2], [])
-    # 一次 read 把「i」和人接着打的字粘在一起时，字必须交回输入态，不许丢
-    check("i 后粘住的字被交回输入态", process_board_nav_keys("i你好", 1, 0, cols),
-          (1, 0, [{"action": "to_input"}], "你好"))
-    check("裸 Esc 后粘住的字也被交回", process_board_nav_keys("\x1babc", 1, 0, cols),
-          (1, 0, [{"action": "to_input"}], "abc"))
-    check("模式没切就没有剩余流（h/l 后面的字照旧被吃）",
-          process_board_nav_keys("lxyz", 0, 0, gap_cols)[3], "")
-
-    # 4. 渲染：选中高亮只在选中处，导航态走自己的底栏
-    console_plain = {"target": "dev", "input": "看下 slice-2", "cursor_pos": 0, "cursor": True}
-    frame_plain = render_kanban_board(state, color=False, console=console_plain, term_width=120)
-    check("没有选择时没有任何选中标记", "▶" in frame_plain, False)
-    check("输入态底栏给的是发送键说明", "Esc 导航" in frame_plain, True)
-
-    console_nav = {"target": "dev", "input": "", "cursor_pos": 0, "cursor": True,
-                   "nav": True, "selection": {"lane": 2, "card": 0},
-                   "detail": ["spec.md ▸ 实现登录接口", "delivered.json ▸ 改 2 个文件"]}
-    frame_nav = render_kanban_board(state, color=False, console=console_nav, term_width=120)
-    check("选中卡片带 ▶ 标记", "▶" in frame_nav, True)
-    check("导航态提示牌换成 [导航]", "[导航] ❯" in frame_nav, True)
-    check("导航态底栏给的是导航键说明", "h/l 泳道" in frame_nav and "j/k 卡片" in frame_nav, True)
-    check("详情盒把本地文件内容带上", "spec.md ▸ 实现登录接口" in frame_nav, True)
-    check("详情盒有边框", "卡片详情" in frame_nav and "╰" in frame_nav, True)
-    frame_nav_color = render_kanban_board(state, color=True, console=console_nav, term_width=120)
-    check("聚焦列用高亮边框色", "\x1b[1;36m" in frame_nav_color, True)
-    check("选中卡片整行反白", "\x1b[7m" in frame_nav_color, True)
-
-    # 5. 详情读取：真文件、缺文件、Done 的 slug 在 meta 上
-    root = Path(tempfile.mkdtemp())
-    try:
-        xdir = root / ".xteam"
-        tdir = xdir / "tasks" / "slice-2"
-        tdir.mkdir(parents=True)
-        (tdir / "spec.md").write_text("# 标题\n\n实现登录接口\n", encoding="utf-8")
-        (tdir / "request.md").write_text("需求：登录\n", encoding="utf-8")
-        (tdir / "delivered.json").write_text(
-            json.dumps({"changed": ["a.py", "b.py"], "head": "abc123"}), encoding="utf-8")
-        lines = read_kanban_card_detail(xdir, "Working", {"name": "slice-2"})
-        check("详情第一行来自 spec.md", lines[0], "spec.md ▸ 实现登录接口")
-        check("delivered.json 报改动文件数", any("改 2 个文件" in l for l in lines), True)
-        check("详情行数受上限约束", len(lines) <= 6, True)
-        check("切片不见时说明去哪找",
-              read_kanban_card_detail(xdir, "Working", {"name": "ghost"}),
-              ["Working 泳道里找不到 tasks/ghost/（已归档或已改名）"])
-        cdir = xdir / "closed" / "slice-0"
-        cdir.mkdir(parents=True)
-        (cdir / "closed.md").write_text("已闭合：全部通过\n", encoding="utf-8")
-        check("Done 泳道按 meta 找目录",
-              any("closed.md" in l for l in
-                  read_kanban_card_detail(xdir, "Done",
-                                          {"name": "10-09 19:30 PASS", "meta": "slice-0"})), True)
-        (xdir / "QUEUE.md").write_text("1. slice-4 —— 修复中文退格\n", encoding="utf-8")
-        check("Backlog 详情引用 QUEUE.md 原文",
-              any("slice-4" in l for l in read_kanban_card_detail(xdir, "Backlog", {"name": "slice-4"})), True)
-        check("未立项的需求直说没有 tasks/ 目录",
-              any("还没有 tasks/" in l for l in
-                  read_kanban_card_detail(xdir, "Backlog", {"name": "slice-9"})), True)
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def main() -> int:
@@ -4724,7 +4652,6 @@ def main() -> int:
         test_auto_rotate_and_cold_review,
         test_interactive_board_console,
         test_kanban_board_renderer,
-        test_kanban_board_navigation,
     ):
         fn()
     print()
