@@ -20,11 +20,10 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (Button, Footer, Header, Input, Label,
                              ListItem, ListView, Static, TextArea)
-from rich.panel import Panel
 from rich.text import Text
 
 try:                                     # 单测里直接 import 本模块时给个友好失败
-    from xteam_lib import _box_state_text, _spec_view_lines
+    from xteam_lib import _box_state_text, _spec_view_lines, wrap_display
 except ImportError:                      # pragma: no cover - 装在 lib/ 布局下
     from .xteam_lib import _box_state_text, _spec_view_lines  # type: ignore
 
@@ -98,33 +97,42 @@ class BoardApp(App):
     Screen { layout: vertical; }
     #top { height: 3; }
     #body { height: 1fr; }
-    #left { width: 34; border: round $primary; padding: 0 1; }
+    /* 宽度分配：中间是主角（三角色），左右是辅助。右侧档案行短，不需要 46 列。 */
+    #left { width: 28; border: round $primary; padding: 0 1; }
     #left Label { margin: 0 0 1 0; }
     #note { height: 1fr; border: none; }
-    #left_buttons { height: 3; }
-    #left_buttons Button { width: 1fr; }
+    #left_actions { height: auto; }
+    #left_actions Button { width: 1fr; height: 3; border: none;
+                           margin: 0 0 1 0; background: $boost; }
+    #left_actions Button:hover { background: $primary; }
     #cmd { margin: 1 0 0 0; }
-    #middle { width: 1fr; border: round $accent; padding: 0 1; }
-    .role_card { height: auto; border: round $panel; padding: 0 1; margin: 0 0 1 0; }
-    .role_card.target { border: heavy yellow; background: $boost; }
-    #right { width: 46; border: round $secondary; padding: 0 1; }
+    /* 中间不套外框：卡片自己就是盒子。双层边框把每张卡都挤小一圈。 */
+    #middle { width: 1fr; min-width: 52; padding: 0 1; }
+    .role_card { height: auto; border: round $panel; padding: 0 1; margin: 0 0 1 0;
+                 border-title-align: left; border-title-color: $text; }
+    /* 目标卡：重边框 + 反色，切角色时一眼能看到是谁 */
+    .role_card.target { border: heavy yellow; background: $boost;
+                        border-title-color: $text; }
+    #right { width: 34; border: round $secondary; padding: 0 1; }
     #archive { height: 1fr; }
     #status { height: auto; min-height: 3; border: round $warning; padding: 0 1; }
     #alerts { height: auto; color: $warning; }
+    #statusline { height: auto; }
     #spec_dialog { align: center middle; width: 80%; height: 80%;
                   border: thick $accent; background: $surface; padding: 1 2; }
     #spec_scroll { height: 1fr; border: none; }
     #spec_hint { color: $text-muted; }
     """
 
+    # 只放「任何时候都该是这个意思」的键。
+    # · tab 必须 priority：textual 默认把 Tab 给 focus_next，不抢等于没绑；
+    # · q 不放这：焦点在卡片上时按 q 就退板子太容易误触，退出走 Ctrl+Q / Ctrl+C；
+    # · j/k/enter 也不放这：它们归 ArchiveList（见下），放 App 级会被聚焦中的
+    #   输入框吃掉 —— 人在笔记里打个 j 就变成翻档案。
     BINDINGS = [
         Binding("tab", "cycle_target", "切角色", priority=True),
-        Binding("q", "quit_board", "退出"),
-        Binding("r", "refresh_now", "刷新"),
-        Binding("j,down", "archive_down", "档案下一片"),
-        Binding("k,up", "archive_up", "档案上一片"),
-        Binding("enter", "open_spec", "翻开 spec"),
-        Binding("a", "quick_qa", "外部评审"),
+        Binding("ctrl+q", "quit_board", "退出"),
+        Binding("ctrl+r", "refresh_now", "刷新"),
     ]
 
     def __init__(self, root=None, proto=None, herdr=None, label="",
@@ -153,24 +161,27 @@ class BoardApp(App):
         self.alerts_text = None          # 状态区链路文案（可断言）
         self._card_texts: dict = {}      # 每张卡当前画的文本（可断言）
         self._archive_lines: list = []   # 档案当前的行（可断言）
+        self._archive_sig: tuple = ()    # 档案内容指纹：没变就不重画（防闪）
+        self.status_text_lines: list = []  # 状态行折行后的文本（可断言）
 
     # ---- 组装 ----
     def compose(self) -> ComposeResult:
         yield Header(id="top")
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                yield Label("笔记 / 安排 —— 在这里想事情，写完推给当前角色")
+                yield Label("笔记 / 安排 —— 想事情、排任务")
                 yield TextArea(id="note")
-                with Horizontal(id="left_buttons"):
+                # 竖排整宽：28 列里横排两个按钮，每个都被挤成按钮里塞半句话
+                with Vertical(id="left_actions"):
                     yield Button("推给当前角色", id="push", variant="primary")
-                    yield Button("存为 note", id="note_save", variant="default")
+                    yield Button("存为 note", id="note_save")
                 yield Input(id="cmd",
-                            placeholder=":qa <切片> · :rotate <角色> · q 退出")
+                            placeholder=":qa <切片> · :rotate <角色> · Ctrl+Q 退出")
             with VerticalScroll(id="middle"):
                 pass
             with Vertical(id="right"):
-                yield Label("spec 档案（已闭合 · Enter 翻开全文）")
-                yield ListView(id="archive")
+                yield Label("spec 档案（Enter 翻开全文）")
+                yield ArchiveList(id="archive")
         with Vertical(id="status"):
             yield Label("", id="alerts")
             yield Label("", id="statusline")
@@ -216,14 +227,21 @@ class BoardApp(App):
             chips.append(f"{mark}{r.get('role','')} {st}"
                          f"{(' ' + str(r.get('held'))) if r.get('held') and r['held'] != '-' else ''}")
         hud = " · ".join(chips) if chips else "（没有在跑的角色）"
+        # 角色一行概览放顶栏副标题 —— 这是「一眼看到谁在干什么」的地方，
+        # 之前算出来了却没往上放，纯属白算。
+        self.sub_title = hud
         alerts = self.state.get("alerts") or []
-        self.alerts_text = (Text("链路：" + " ；".join(str(a) for a in alerts),
-                                style="bold yellow") if alerts
-                            else Text("链路通畅，没有阻塞", style="dim"))
+        body = "链路：" + " ；".join(str(a) for a in alerts) if alerts else "链路通畅，没有阻塞"
+        # 长句折行，不截断 —— 告警被切掉的半句往往正是要看的半句
+        width = max(20, (self.size.width or 100) - 6)
+        self.alerts_text = Text("\n".join(wrap_display(body, width)),
+                                style="bold yellow" if alerts else "dim")
+        status = f"[{self.status_kind}] {self.status_text}"
+        self.status_text_lines = wrap_display(status, width)
         try:
             self.query_one("#alerts", Label).update(self.alerts_text)
             self.query_one("#statusline", Label).update(
-                Text(f"[{self.status_kind}] {self.status_text}",
+                Text("\n".join(self.status_text_lines),
                      style={"success": "green", "error": "red",
                             "warn": "yellow"}.get(self.status_kind, "cyan")))
         except Exception:
@@ -266,24 +284,49 @@ class BoardApp(App):
                 t.append(f"  {r['held']}")
             t.append("\n")
             doing = str(r.get("activity_title") or "").strip()
-            t.append(doing if doing else "（没有活动标题）", style="italic")
-            t.append("\n欠 ")
+            if doing:
+                t.append(doing, style="italic")
+                t.append("\n")
+            t.append("欠 ")
             owes = str(r.get("owes") or "none")
             t.append(owes, style="cyan")
             if r.get("where"):
                 t.append(f" @ {r['where']}")
+            # 「输入框状态未知」是噪音，不打印 —— 卡片上每一行都要有用
             box = _box_state_text(str(r.get("box") or ""))
-            if box:
+            if box and box != "输入框状态未知":
                 t.append(f"\n{box}", style="yellow")
+            # 一层盒子：边框由 CSS 画（`.role_card`），角色名走 border_title。
+            # 之前是 CSS 边框 + Panel 边框各一层 —— 双层边框把每张卡都显小一圈。
             self._card_texts[name] = t
-            card.update(Panel(t, title=name, border_style="yellow" if is_target else "white"))
+            card.border_title = name
+            card.update(t)
 
     # ---- 右侧：spec 档案 ----
+    def _archive_signature(self) -> tuple:
+        """档案内容的指纹。用来判断「要不要重画」—— 不判断的话每次状态刷新
+        （默认 2 秒一次）都把整个 ListView clear() 再 append() 一遍，右侧就在人眼前
+        一直闪。内容没变就一行都不该动。"""
+        return tuple((str(c.get("time", "")), str(c.get("verdict", "")),
+                      str(c.get("name", "")), str(c.get("title", "")))
+                     for c in self.archive)
+
     def _refresh_archive(self) -> None:
         try:
             lv = self.query_one("#archive", ListView)
         except Exception:
             return                      # 界面还没装完（首次采集就跑进来了）
+        sig = self._archive_signature()
+        if sig == self._archive_sig and len(lv.children) == len(self.archive):
+            # 内容没变：只把选中标记挪到位（高亮由 ListView 自己画，不 rebuild）
+            if self.archive:
+                try:
+                    if lv.index != self.archive_idx:
+                        lv.index = self.archive_idx
+                except Exception:
+                    pass
+            return
+        self._archive_sig = sig
         lv.clear()
         self._archive_lines = []
         for i, c in enumerate(self.archive):
@@ -313,24 +356,11 @@ class BoardApp(App):
     def action_refresh_now(self) -> None:
         self._collect()
 
-    def action_archive_down(self) -> None:
-        if self.archive:
-            self.archive_idx = (self.archive_idx + 1) % len(self.archive)
-            self._refresh_archive()
-
-    def action_archive_up(self) -> None:
-        if self.archive:
-            self.archive_idx = (self.archive_idx - 1) % len(self.archive)
-            self._refresh_archive()
-
     def action_open_spec(self) -> None:
         if not self.archive:
             return
         entry = self.archive[self.archive_idx]
         self._open_spec(str(entry.get("name") or ""))
-
-    def action_quick_qa(self) -> None:
-        self.query_one("#cmd", Input).value = ":qa "
 
     def action_quit_board(self) -> None:
         self.exit()

@@ -634,6 +634,29 @@ def _fit_cell(text: str, max_w: int) -> str:
     return acc + "…"
 
 
+def wrap_display(text: str, width: int) -> list[str]:
+    """按**显示列宽**折行（中英文混排不会把字切断）。
+
+    Label / Static 这类单行控件装不下长句时会**截断**而不是换行 —— 链路告警一句
+    能有半行多，被切掉的那半句恰恰是要看的那半句。所以折行自己来，用同一套
+    东亚宽度口径，避免和盒子的对齐各算一套。
+    """
+    if width <= 0:
+        return [text]
+    out: list[str] = []
+    for para in str(text).splitlines() or [""]:
+        cur, cur_w = "", 0
+        for ch in para:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if cur_w + cw > width and cur:
+                out.append(cur)
+                cur, cur_w = "", 0
+            cur += ch
+            cur_w += cw
+        out.append(cur)
+    return out
+
+
 def _pad_cell(text: str, target_w: int, align: str = "left") -> str:
     """按显示列宽对齐文本至 target_w 列。"""
     cur = _cell_len(text)

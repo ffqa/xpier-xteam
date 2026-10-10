@@ -4636,9 +4636,14 @@ def test_fullscreen_board_tui() -> None:
                 lv = app.query_one("#archive", ListView)
                 lv.focus()
                 await pilot.pause()
+                check("顶栏副标题带三角色真状态", "pm" in str(app.sub_title)
+                      and "tl" in str(app.sub_title), True)
                 await pilot.press("k")
                 await pilot.pause()
-                check("k 在档案里选到前一片", app.archive_idx, 1)
+                check("k 到顶就是不动（ListView 原生行为，不来回绕）", app.archive_idx, 0)
+                await pilot.press("j")
+                await pilot.pause()
+                check("j 选下一片", app.archive_idx, 1)
                 await pilot.press("enter")
                 await pilot.pause()
                 check("Enter 翻开选中的那片", len(app.screen_stack) > 1, True)
@@ -4648,14 +4653,18 @@ def test_fullscreen_board_tui() -> None:
                       "这一片没有留下 spec.md" in _plain(body), True)
                 await pilot.press("escape")
                 await pilot.pause()
-                await pilot.press("j")
+                await pilot.press("k")           # 回到第一片（auth-api，fixture 有 spec）
                 await pilot.pause()
+                check("k 回到第一片", app.archive_idx, 0)
                 await pilot.press("enter")
                 await pilot.pause()
                 top = app.screen_stack[-1]
                 body = getattr(top.query_one("#spec_body", Static), "_Static__content", None)
                 check("有 spec 的片翻开就是正文",
                       "auth-api 的规范第一行" in _plain(body), True)
+                check("长告警折行而不是被截断",
+                      any("告诉你" in l or "去它的 pane" in l for l in app.status_text_lines)
+                      or "停在选择框上" in _plain(app.alerts_text), True)
                 await pilot.press("escape")
                 await pilot.pause()
                 # 左边写笔记 → 推给当前角色（tl）
