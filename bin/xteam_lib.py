@@ -673,16 +673,16 @@ def render_kanban_board(
             term_width = os.get_terminal_size().columns
         except Exception:
             term_width = 120
-    term_width = max(80, term_width)
+    term_width = max(60, term_width)
 
-    # 窄屏终端（< 85 列）自动优雅降级为纵向列表流
-    if term_width < 85:
+    # 极窄屏终端（< 70 列）自动优雅降级为纵向列表流
+    if term_width < 70:
         return render_board(state, color=color, console=console)
 
     cols_data = _extract_kanban_columns(state)
     num_cols = len(cols_data)
     col_gap = 1
-    col_w = max(16, (term_width - (num_cols - 1) * col_gap) // num_cols)
+    col_w = max(14, (term_width - (num_cols - 1) * col_gap) // num_cols)
 
     out = []
 

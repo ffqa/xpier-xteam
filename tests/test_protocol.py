@@ -4445,8 +4445,8 @@ def test_kanban_board_renderer() -> None:
     frame_empty = render_kanban_board(empty_state, color=False, term_width=120)
     check("空看板包含 No tasks 占位", "No tasks" in frame_empty, True)
 
-    # 4. 窄屏终端（< 85 列）自动降级为纵向列表视图
-    frame_narrow = render_kanban_board(state, color=False, term_width=80)
+    # 4. 极窄屏终端（< 70 列）自动降级为纵向列表视图
+    frame_narrow = render_kanban_board(state, color=False, term_width=65)
     check("窄屏模式降级为传统列表视图", "── 角色 ──" in frame_narrow or "── 切片 ──" in frame_narrow, True)
 
     # 5. 交互控制台集成渲染
