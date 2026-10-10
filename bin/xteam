@@ -42,6 +42,11 @@ from xteam_lib import (  # noqa: E402
     render_board,
     render_kanban_board,
     process_board_keystrokes,
+    kanban_columns,
+    kanban_visible_cards,
+    clamp_kanban_selection,
+    process_board_nav_keys,
+    read_kanban_card_detail,
     clean_pane_preview,
     detect_choice_prompt,
     ROLES,
@@ -2674,11 +2679,15 @@ def cmd_board(args: argparse.Namespace) -> int:
     cursor_pos = 0
     history: list[str] = []
     history_idx = -1
-    status_text = "就绪 (Tab 切换角色 · Enter 发送 · :help 帮助)"
+    status_text = "就绪 (Tab 切换角色 · Enter 发送 · Esc 导航 · :help 帮助)"
     status_kind = "info"
     last_refresh = 0.0
     last_key = 0.0
     cached_state = None
+    nav_mode = False
+    lane_idx = 0
+    card_idx = 0
+    detail_lines: list[str] = []
 
     old_attrs = termios.tcgetattr(sys.stdin)
     try:
@@ -2701,6 +2710,9 @@ def cmd_board(args: argparse.Namespace) -> int:
                 cached_state = _board_state(root, proto, herdr, label, role_map, tracker)
                 last_refresh = now_t
 
+            cols = kanban_columns(cached_state) if cached_state else []
+            lane_idx, card_idx = clamp_kanban_selection(cols, lane_idx, card_idx)
+
             console_ctx = {
                 "target": target_role,
                 "input": input_buf,
@@ -2708,6 +2720,9 @@ def cmd_board(args: argparse.Namespace) -> int:
                 "status": status_text,
                 "status_kind": status_kind,
                 "cursor": True,
+                "nav": nav_mode,
+                "selection": {"lane": lane_idx, "card": card_idx} if nav_mode else None,
+                "detail": detail_lines or None,
             }
             frame = renderer(cached_state, color=color, console=console_ctx)
             # 无闪烁重绘
@@ -2733,6 +2748,51 @@ def cmd_board(args: argparse.Namespace) -> int:
                 break
 
             text = raw_bytes.decode("utf-8", errors="replace")
+            if text == "\x1b" or text == "\x1b\x1b":
+                # 裸 Esc：进出看板导航态（成对/单个都认，有的终端会把 Esc 发成双份）
+                nav_mode = not nav_mode
+                if not nav_mode:
+                    detail_lines = []
+                    status_text = "已退出导航态（Esc 再进）"
+                    status_kind = "info"
+                else:
+                    status_text = "导航态：h/l 换泳道 · j/k 选卡 · Enter 看详情 · i 返回"
+                    status_kind = "info"
+                continue
+
+            if nav_mode:
+                lane_idx, card_idx, acts, nav_rest = process_board_nav_keys(
+                    text, lane_idx, card_idx, cols
+                )
+                if not acts:
+                    continue
+                for act in acts:
+                    kind = act.get("action")
+                    if kind == "to_input":
+                        nav_mode = False
+                        detail_lines = []
+                        status_text = "已退出导航态（Esc 再进）"
+                        status_kind = "info"
+                    elif kind == "open_card":
+                        try:
+                            lane_title, _cc, cards = cols[int(act["lane"])]
+                            visible = kanban_visible_cards(cards)
+                            card = visible[int(act["card"])] if visible else {}
+                            detail_lines = read_kanban_card_detail(
+                                proto.dir, lane_title, card)
+                            status_text = f"详情：{lane_title} · {card.get('name', '')}"
+                            status_kind = "info"
+                        except Exception as e:  # noqa: BLE001
+                            detail_lines = [f"读详情失败: {e}"]
+                            status_text = "详情读取失败"
+                            status_kind = "error"
+                if nav_mode or not nav_rest:
+                    # 还在导航态，或切换键后面没有更多字节 —— 重绘一帧就够
+                    continue
+                # 一次 read 里「i + 人接着打的字」粘住了：剩余流交回输入态，
+                # 一个键都不许丢（用户看到的字消失比穿透更难查）。
+                text = nav_rest
+
             input_buf, cursor_pos, history_idx, target_idx, actions = process_board_keystrokes(
                 text,
                 input_buf,
@@ -2757,7 +2817,7 @@ def cmd_board(args: argparse.Namespace) -> int:
                     status_kind = "info"
                     cached_state = None
                 elif kind == "help":
-                    status_text = "快捷命令: :pm/:tl/:dev <msg> | :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色)"
+                    status_text = "快捷命令: :pm/:tl/:dev <msg> | :rotate <role> | :r(立即刷新) | :q(退出) | Tab(切角色) | Esc(导航态 h/j/k/l 选卡 · Enter 详情)"
                     status_kind = "info"
                 elif kind == "rotate":
                     sub_role = act.get("role") or target_role

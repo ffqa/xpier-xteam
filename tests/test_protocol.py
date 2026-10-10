@@ -107,6 +107,14 @@ from xteam_lib import (  # noqa: E402
     PASTE_CHIP_LINES,
     render_board,
     render_kanban_board,
+    kanban_columns,
+    kanban_visible_cards,
+    KANBAN_MAX_CARDS_PER_COL,
+    clamp_kanban_selection,
+    move_kanban_selection,
+    process_board_nav_keys,
+    read_kanban_card_detail,
+    process_board_keystrokes,
     detect_choice_prompt,
 )
 
@@ -4468,6 +4476,151 @@ def test_kanban_board_renderer() -> None:
     check("彩色看板包含 ANSI 转义序列", "\033[" in frame_color, True)
 
 
+def test_kanban_board_navigation() -> None:
+    print("\n[100] 看板交互导航（Esc 导航态 · Vim 键位选卡 · 0-Token 卡片详情）")
+    state = {
+        "title": "xteam board", "label": "android_dev", "roles": [],
+        "alerts": [],
+        "queue": [
+            {"slice": "slice-4", "order": 1, "note": "修复中文退格与按键穿透"},
+            {"slice": "slice-5", "order": 2, "note": "支持终端多列自适应"},
+        ],
+        "slices": [
+            {"name": "slice-1", "stage": "spec", "note": "未开工"},
+            {"name": "slice-2", "stage": "implement", "note": "在飞  dev:implement"},
+            {"name": "slice-3", "stage": "verify", "note": "**待 gate**  tl:verdict"},
+        ],
+        "closed": [{"name": "slice-0", "time": "10-09 19:30", "verdict": "PASS"}],
+    }
+    cols = kanban_columns(state)
+    check("泳道顺序不变（Backlog → Done）",
+          [t for t, _c, _cards in cols],
+          ["Backlog", "Todo", "Working", "Review", "Done"])
+    check("每列可见卡片数 = min(卡片数, 上限)",
+          [len(kanban_visible_cards(cards)) for _t, _cc, cards in cols],
+          [2, 1, 1, 1, 1])
+
+    # 1. 空泳道必须被跳过 / 越界索引必须被夹回来
+    # 造一列真空：Backlog 1 · Todo 0 · Working 1 · Review 0 · Done 1
+    gap_state = {
+        "title": "t", "label": "l", "roles": [], "alerts": [],
+        "queue": [{"slice": "slice-9", "order": 1, "note": "还没规划"}],
+        "slices": [{"name": "slice-2", "stage": "implement", "note": "在飞"}],
+        "closed": [{"name": "slice-0", "time": "10-09", "verdict": "PASS"}],
+    }
+    gap_cols = kanban_columns(gap_state)
+    check("gap 棋盘的每列卡片数", [len(cards) for _t, _cc, cards in gap_cols], [1, 0, 1, 0, 1])
+    check("右移跳过空泳道", move_kanban_selection(gap_cols, 0, 0, "right"), (2, 0))
+    check("左移也跳过空泳道", move_kanban_selection(gap_cols, 4, 0, "left"), (2, 0))
+    check("漂移到空泳道时落到第一个有卡的泳道", clamp_kanban_selection(gap_cols, 1, 0), (0, 0))
+    check("全空棋盘不炸", clamp_kanban_selection([], 3, 3), (0, 0))
+    check("未知方向不动选择", move_kanban_selection(gap_cols, 2, 0, "sideways"), (2, 0))
+    check("右移到头循环回第一列", move_kanban_selection(gap_cols, 4, 0, "right"), (0, 0))
+    check("左移到头循环回最后一列", move_kanban_selection(gap_cols, 0, 0, "left"), (4, 0))
+    check("换列尽量保持原来的行位", move_kanban_selection(gap_cols, 4, 0, "left"), (2, 0))
+    check("卡片索引越界时夹回最后一张", clamp_kanban_selection(cols, 2, 99), (2, 0))
+
+    # 2. 列内 j/k 循环（单列就是一个小缓冲区）
+    many = {
+        "title": "t", "label": "l", "roles": [], "alerts": [], "queue": [],
+        "slices": [{"name": f"w{i}", "stage": "implement", "note": "在飞"}
+                   for i in range(9)],
+        "closed": [],
+    }
+    many_cols = kanban_columns(many)
+    check("单列卡片超上限时只暴露可见的那几张",
+          [len(kanban_visible_cards(cards)) for _t, _cc, cards in many_cols],
+          [0, 0, KANBAN_MAX_CARDS_PER_COL, 0, 0])
+    check("首张按 k 上移循环到最后一张",
+          move_kanban_selection(many_cols, 2, 0, "up"), (2, 5))
+    check("末张按 j 下移循环回第一张",
+          move_kanban_selection(many_cols, 2, 5, "down"), (2, 0))
+    check("第 7 张卡选不中（页面上只有 6 张）",
+          clamp_kanban_selection(many_cols, 2, 6), (2, 5))
+
+    # 3. 导航态按键消费：等价键、Esc、Enter、以及「不碰输入流」
+    check("l 与 → 等价",
+          process_board_nav_keys("l", 0, 0, gap_cols)[:2],
+          process_board_nav_keys("\x1b[C", 0, 0, gap_cols)[:2])
+    check("k 与 ↑ 等价",
+          process_board_nav_keys("k", 2, 0, cols)[:2],
+          process_board_nav_keys("\x1b[A", 2, 0, cols)[:2])
+    lane, card, acts, rest = process_board_nav_keys("l\r", 0, 0, gap_cols)
+    check("Enter 生成 open_card 且指向一张可见的卡", acts, [{"action": "open_card", "lane": 2, "card": 0}])
+    check("open_card 索引就是当前选择", (lane, card), (2, 0))
+    check("没切模式时没有剩余流", rest, "")
+    check("空泳道上 Enter 不产生动作",
+          process_board_nav_keys("\r", 1, 0, gap_cols)[2], [])
+    check("裸 Esc 退回输入态", process_board_nav_keys("\x1b", 2, 3, cols)[2], [{"action": "to_input"}])
+    check("i / q 也退回输入态", process_board_nav_keys("iq", 1, 0, cols)[2],
+          [{"action": "to_input"}])
+    check("导航态里打的字既不产生动作也不移动选择",
+          process_board_nav_keys("abc 你好", 1, 0, cols),
+          (1, 0, [], ""))
+    check("空输入流不炸", process_board_nav_keys("", 2, 2, cols), (2, 2, [], ""))
+    check("未选中卡片时 Enter 不产生动作",
+          process_board_nav_keys("\r", 0, 0, [("Backlog", "90", [])])[2], [])
+    # 一次 read 把「i」和人接着打的字粘在一起时，字必须交回输入态，不许丢
+    check("i 后粘住的字被交回输入态", process_board_nav_keys("i你好", 1, 0, cols),
+          (1, 0, [{"action": "to_input"}], "你好"))
+    check("裸 Esc 后粘住的字也被交回", process_board_nav_keys("\x1babc", 1, 0, cols),
+          (1, 0, [{"action": "to_input"}], "abc"))
+    check("模式没切就没有剩余流（h/l 后面的字照旧被吃）",
+          process_board_nav_keys("lxyz", 0, 0, gap_cols)[3], "")
+
+    # 4. 渲染：选中高亮只在选中处，导航态走自己的底栏
+    console_plain = {"target": "dev", "input": "看下 slice-2", "cursor_pos": 0, "cursor": True}
+    frame_plain = render_kanban_board(state, color=False, console=console_plain, term_width=120)
+    check("没有选择时没有任何选中标记", "▶" in frame_plain, False)
+    check("输入态底栏给的是发送键说明", "Esc 导航" in frame_plain, True)
+
+    console_nav = {"target": "dev", "input": "", "cursor_pos": 0, "cursor": True,
+                   "nav": True, "selection": {"lane": 2, "card": 0},
+                   "detail": ["spec.md ▸ 实现登录接口", "delivered.json ▸ 改 2 个文件"]}
+    frame_nav = render_kanban_board(state, color=False, console=console_nav, term_width=120)
+    check("选中卡片带 ▶ 标记", "▶" in frame_nav, True)
+    check("导航态提示牌换成 [导航]", "[导航] ❯" in frame_nav, True)
+    check("导航态底栏给的是导航键说明", "h/l 泳道" in frame_nav and "j/k 卡片" in frame_nav, True)
+    check("详情盒把本地文件内容带上", "spec.md ▸ 实现登录接口" in frame_nav, True)
+    check("详情盒有边框", "卡片详情" in frame_nav and "╰" in frame_nav, True)
+    frame_nav_color = render_kanban_board(state, color=True, console=console_nav, term_width=120)
+    check("聚焦列用高亮边框色", "\x1b[1;36m" in frame_nav_color, True)
+    check("选中卡片整行反白", "\x1b[7m" in frame_nav_color, True)
+
+    # 5. 详情读取：真文件、缺文件、Done 的 slug 在 meta 上
+    root = Path(tempfile.mkdtemp())
+    try:
+        xdir = root / ".xteam"
+        tdir = xdir / "tasks" / "slice-2"
+        tdir.mkdir(parents=True)
+        (tdir / "spec.md").write_text("# 标题\n\n实现登录接口\n", encoding="utf-8")
+        (tdir / "request.md").write_text("需求：登录\n", encoding="utf-8")
+        (tdir / "delivered.json").write_text(
+            json.dumps({"changed": ["a.py", "b.py"], "head": "abc123"}), encoding="utf-8")
+        lines = read_kanban_card_detail(xdir, "Working", {"name": "slice-2"})
+        check("详情第一行来自 spec.md", lines[0], "spec.md ▸ 实现登录接口")
+        check("delivered.json 报改动文件数", any("改 2 个文件" in l for l in lines), True)
+        check("详情行数受上限约束", len(lines) <= 6, True)
+        check("切片不见时说明去哪找",
+              read_kanban_card_detail(xdir, "Working", {"name": "ghost"}),
+              ["Working 泳道里找不到 tasks/ghost/（已归档或已改名）"])
+        cdir = xdir / "closed" / "slice-0"
+        cdir.mkdir(parents=True)
+        (cdir / "closed.md").write_text("已闭合：全部通过\n", encoding="utf-8")
+        check("Done 泳道按 meta 找目录",
+              any("closed.md" in l for l in
+                  read_kanban_card_detail(xdir, "Done",
+                                          {"name": "10-09 19:30 PASS", "meta": "slice-0"})), True)
+        (xdir / "QUEUE.md").write_text("1. slice-4 —— 修复中文退格\n", encoding="utf-8")
+        check("Backlog 详情引用 QUEUE.md 原文",
+              any("slice-4" in l for l in read_kanban_card_detail(xdir, "Backlog", {"name": "slice-4"})), True)
+        check("未立项的需求直说没有 tasks/ 目录",
+              any("还没有 tasks/" in l for l in
+                  read_kanban_card_detail(xdir, "Backlog", {"name": "slice-9"})), True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4571,6 +4724,7 @@ def main() -> int:
         test_auto_rotate_and_cold_review,
         test_interactive_board_console,
         test_kanban_board_renderer,
+        test_kanban_board_navigation,
     ):
         fn()
     print()

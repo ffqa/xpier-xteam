@@ -524,7 +524,7 @@ def _pad_cell(text: str, target_w: int, align: str = "left") -> str:
     return text + " " * diff
 
 
-def _extract_kanban_columns(state: dict) -> list[tuple[str, str, list[dict]]]:
+def kanban_columns(state: dict) -> list[tuple[str, str, list[dict]]]:
     """将看板状态事实解析为 5 泳道数据：(列标, 强调色代码, 卡片列表)"""
     queue = state.get("queue") or []
     slices = state.get("slices") or []
@@ -592,12 +592,259 @@ def _extract_kanban_columns(state: dict) -> list[tuple[str, str, list[dict]]]:
     ]
 
 
+KANBAN_MAX_CARDS_PER_COL = 6
+"""单列最多渲染（也就最多可选中）的卡片数。
+
+导航与渲染必须共用这一个上限：否则能选中第 9 张卡，而屏幕上只有 6 张 ——
+Enter 打开的会是眼睛看不见的东西。
+"""
+
+
+def kanban_visible_cards(cards: list[dict]) -> list[dict]:
+    """一列里真正显示出来（也就真的能选中）的卡片。"""
+    return list(cards[:KANBAN_MAX_CARDS_PER_COL])
+
+
+def _kanban_visible_counts(cols_data: list[tuple[str, str, list[dict]]]) -> list[int]:
+    return [len(kanban_visible_cards(cards)) for _t, _c, cards in cols_data]
+
+
+def clamp_kanban_selection(
+    cols_data: list[tuple[str, str, list[dict]]], lane_idx: int, card_idx: int
+) -> tuple[int, int]:
+    """把 (泳道, 卡片) 夹到当前真实显示的卡片上。
+
+    看板每次刷新都重算泳道：原来的泳道可能空了、卡片可能少下去。不夹的话
+    Enter 会打在一个越界索引上，或者高亮一张已经不存在的卡。
+    当前泳道空了就落到第一张有卡的泳道；全空棋盘返回 (0, 0)。
+    """
+    counts = _kanban_visible_counts(cols_data)
+    if not counts or not any(counts):
+        return 0, 0
+    if lane_idx < 0 or lane_idx >= len(counts) or counts[lane_idx] == 0:
+        lane_idx = next(i for i, c in enumerate(counts) if c > 0)
+    return lane_idx, max(0, min(card_idx, counts[lane_idx] - 1))
+
+
+def move_kanban_selection(
+    cols_data: list[tuple[str, str, list[dict]]], lane_idx: int, card_idx: int, direction: str
+) -> tuple[int, int]:
+    """h/l（←/→）跨泳道，j/k（↑/↓）泳道内。
+
+    跨泳道只在**有卡**的列之间走（空列里没有可看的东西），到头循环；
+    换列时尽量保持原来的行位，视线不用每次都从头数。
+    泳道内 j/k 到头也循环 —— 单列就是一个小缓冲区，和 vim 一样。
+    """
+    lane_idx, card_idx = clamp_kanban_selection(cols_data, lane_idx, card_idx)
+    counts = _kanban_visible_counts(cols_data)
+    if not counts or not any(counts):
+        return 0, 0
+
+    if direction in ("left", "right"):
+        step = -1 if direction == "left" else 1
+        idx = lane_idx
+        for _ in range(len(counts)):
+            idx = (idx + step) % len(counts)
+            if counts[idx] > 0:
+                return idx, min(card_idx, counts[idx] - 1)
+        return lane_idx, card_idx
+
+    if direction in ("up", "down"):
+        delta = -1 if direction == "up" else 1
+        return lane_idx, (card_idx + delta) % counts[lane_idx]
+
+    return lane_idx, card_idx
+
+
+def process_board_nav_keys(
+    text: str,
+    lane_idx: int,
+    card_idx: int,
+    cols_data: list[tuple[str, str, list[dict]]],
+) -> tuple[int, int, list[dict], str]:
+    """导航态的按键消费：h/l 换泳道、j/k 选卡、Enter 看详情、i/Esc 回输入态。
+
+    **一个键都不进输入缓冲区** —— 导航态里打的每个可打印字符都被吃掉。
+    v0.2.13 刚修掉「控制符漏进正文」，这里不能反向引入「正文漏成指令」。
+
+    返回: (新泳道索引, 新卡片索引, actions, rest)
+    · actions: {"action": "open_card", "lane", "card"} / {"action": "to_input"}
+    · rest: 触发「回输入态」那个键**之后**还没消费的尾巴。
+
+    为什么要回吐 rest：一次 os.read 可能把 `i` 和人接着打的字一起拿到
+    （`i你好`）。若把整串咽掉，用户会眼睁睁看着自己打的字消失 —— 这种
+    「按了却没反应」比穿透更难查。所以模式一切换就把剩余流交回输入态。
+    """
+    if not text:
+        return lane_idx, card_idx, [], ""
+
+    actions: list[dict] = []
+    rest = ""
+    i = 0
+    while i < len(text):
+        if text[i] == "\x1b":
+            rem = text[i:]
+            if rem.startswith("\x1b[D"):
+                lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "left")
+                i += 3
+                continue
+            if rem.startswith("\x1b[C"):
+                lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "right")
+                i += 3
+                continue
+            if rem.startswith("\x1b[A"):
+                lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "up")
+                i += 3
+                continue
+            if rem.startswith("\x1b[B"):
+                lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "down")
+                i += 3
+                continue
+            m = re.match(r"^\x1b(?:\[[0-9;]*[a-zA-Z~]|O[a-zA-Z])", rem)
+            if m:
+                i += len(m.group(0))      # 认识的序列（Home/End/Delete/功能键）：吞掉
+            else:
+                actions.append({"action": "to_input"})   # 裸 Esc：退回输入态
+                rest = text[i + 1:]
+                break
+            continue
+
+        ch = text[i]
+        i += 1
+        if ch == "h":
+            lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "left")
+        elif ch == "l":
+            lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "right")
+        elif ch == "k":
+            lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "up")
+        elif ch == "j":
+            lane_idx, card_idx = move_kanban_selection(cols_data, lane_idx, card_idx, "down")
+        elif ch in ("\r", "\n"):
+            # 只开**当前正看着的**那张卡：焦点漂到空列上时（刷新后卡片消失）
+            # 宁可按下去没反应，也不要打开另一张用户没选的卡。
+            counts = _kanban_visible_counts(cols_data)
+            if 0 <= lane_idx < len(counts) and counts[lane_idx] > 0:
+                card = max(0, min(card_idx, counts[lane_idx] - 1))
+                actions.append({"action": "open_card", "lane": lane_idx, "card": card})
+        elif ch in ("i", "q"):
+            actions.append({"action": "to_input"})
+            rest = text[i:]
+            break
+        # 其余按键（含一切可打印字符）在导航态一律丢弃
+    return lane_idx, card_idx, actions, rest
+
+
+def _summarize_detail_file(name: str, text: str, width: int = 150) -> str:
+    """把一个协议文件压成一行：JSON 报结构，Markdown 报第一句有内容的行。"""
+    if name.endswith(".json"):
+        try:
+            data = json.loads(text)
+        except Exception:
+            return "（JSON 解析不了）"
+        if isinstance(data, dict):
+            if isinstance(data.get("changed"), list):
+                head = str(data.get("head") or "")[:12]
+                return f"改 {len(data['changed'])} 个文件" + (f" · head {head}" if head else "")
+            if data.get("verdict") is not None:
+                why = str(data.get("reason") or data.get("note") or "")
+                return str(data["verdict"]) + (f" · {why}" if why else "")
+            keys = "、".join(list(data.keys())[:4])
+            return f"字段: {keys}" if keys else "（空对象）"
+        if isinstance(data, list):
+            return f"{len(data)} 项"
+        return "（不是对象）"
+    candidates: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            candidates.append(s)
+    for s in candidates:
+        if not s.startswith("#"):        # H1 多半是切片名，和卡片标题重复
+            return s.lstrip("#").strip()[:width]
+    if candidates:
+        return candidates[0].lstrip("#").strip()[:width]
+    return "（空文件）"
+
+
+def read_kanban_card_detail(
+    xdir: Path, lane: str, card: dict, max_lines: int = 6
+) -> list[str]:
+    """0-Token 读卡片背后的本地文件，产出详情行。
+
+    只读；文件不在就说不在，绝不抛（看板是诊断台，它自己崩了比没详情更糟）。
+    返回的每一行都不带 ANSI，宽度由渲染层统一裁。
+    """
+    slug = ((card.get("meta") if lane == "Done" else card.get("name")) or "").strip()
+    if not slug:
+        return ["（这张卡没有可定位的切片名）"]
+
+    if lane == "Backlog":
+        out: list[str] = []
+        qpath = xdir / "QUEUE.md"
+        if qpath.exists():
+            try:
+                for raw in qpath.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if slug in raw:
+                        out.append(f"QUEUE.md ▸ {raw.strip()}")
+                        break
+            except OSError:
+                pass
+        if (xdir / "tasks" / slug).is_dir():
+            out.append(f"tasks/{slug}/ 已建（还在需求池排队）")
+        else:
+            out.append("还没有 tasks/ 目录（PM 未立项）")
+        return out[:max_lines]
+
+    base = xdir / ("closed" if lane == "Done" else "tasks")
+    tdir = base / slug
+    if not tdir.is_dir():
+        return [f"{lane} 泳道里找不到 {base.name}/{slug}/（已归档或已改名）"]
+
+    out = []
+    # 按生命周期排：先「要做什么」（spec/request），再「碰了什么」（touches）、
+    # 「交出了什么」（delivered/verdict/closed）—— 头几行就能回答这是哪一片。
+    for name in ("spec.md", "request.md", "touches.json",
+                 "delivered.json", "verdict.json", "closed.md"):
+        f = tdir / name
+        if not f.is_file():
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            out.append(f"{name} ▸ 读不了（权限？）")
+            continue
+        out.append(f"{name} ▸ {_summarize_detail_file(name, text)}")
+        if len(out) >= max_lines:
+            break
+    return out[:max_lines] or [f"{base.name}/{slug}/ 里没有协议文件"]
+
+
+def _render_detail_box(
+    lines: list[str], width: int, color: bool = True, title: str = "详情"
+) -> list[str]:
+    """卡片详情盒：内容行由 read_kanban_card_detail 提供（纯文本），这里只负责盒子。"""
+    inner_w = max(4, width - 2)
+    border = _ansi("│", "36", color)
+    head = f" {title} "
+    top = (_ansi("╭", "36", color) + _ansi(head, "1;36", color)
+           + _ansi("─" * max(0, inner_w - _cell_len(head)), "36", color)
+           + _ansi("╮", "36", color))
+    out = [top]
+    for ln in lines[:8]:
+        row = _pad_cell(f"  {ln}", inner_w)
+        out.append(f"{border}{row}{border}")
+    out.append(_ansi("╰" + "─" * inner_w + "╯", "36", color))
+    return out
+
+
 def _render_kanban_column(
     title: str,
     color_code: str,
     cards: list[dict],
     width: int,
     color: bool = True,
+    focused: bool = False,
+    selected_idx: int | None = None,
 ) -> list[str]:
     inner_w = width - 2
     card_inner_w = inner_w - 4
@@ -611,6 +858,8 @@ def _render_kanban_column(
     header_clean = f" {title} {len(cards)} "
     rem_dashes = max(0, inner_w - _cell_len(header_clean))
     border_col = "32" if "Working" in title else ("33" if "Review" in title else "90")
+    if focused:
+        border_col = "1;36"
     top_left = _ansi("╭", border_col, color)
     top_right = _ansi("╮", border_col, color)
     dashes = _ansi("─" * rem_dashes, border_col, color)
@@ -624,14 +873,20 @@ def _render_kanban_column(
         lines.append(f"{empty_b}{' ' * inner_w}{empty_b}")
     else:
         # 每个卡片渲染为小盒子
-        for card in cards[:6]:  # 单列最多显示 6 张卡片
+        for idx, card in enumerate(kanban_visible_cards(cards)):
+            is_sel = selected_idx is not None and idx == selected_idx
             c_top = _ansi(f"╭{'─' * (card_inner_w + 2)}╮", "90", color)
             lines.append(f"{_ansi('│', border_col, color)} {c_top} {_ansi('│', border_col, color)}")
 
             accent = "▌" if "Working" in title else ("✓" if "Done" in title else "│")
             accent_col = "32" if "Working" in title else ("33" if "Review" in title else "36")
             name_text = f"{_ansi(accent, accent_col, color)} {card.get('name', '')}"
+            if is_sel:
+                name_text = "▶ " + name_text
             name_line = _pad_cell(name_text, card_inner_w + 2)
+            if is_sel:
+                # 整行反白（含补的空格）—— 半行反白会让盒子看起来裂开
+                name_line = _ansi(name_line, "7", color)
             meta_line = _pad_cell(_ansi(f"  {card.get('meta', '')}", "90", color), card_inner_w + 2)
 
             b_card = _ansi("│", "90", color)
@@ -646,8 +901,8 @@ def _render_kanban_column(
             c_bot = _ansi(f"╰{'─' * (card_inner_w + 2)}╯", "90", color)
             lines.append(f"{_ansi('│', border_col, color)} {c_bot} {_ansi('│', border_col, color)}")
 
-        if len(cards) > 6:
-            more_text = _pad_cell(_ansi(f"▾ +{len(cards) - 6} more", "90", color), inner_w, "center")
+        if len(cards) > KANBAN_MAX_CARDS_PER_COL:
+            more_text = _pad_cell(_ansi(f"▾ +{len(cards) - KANBAN_MAX_CARDS_PER_COL} more", "90", color), inner_w, "center")
             lines.append(f"{_ansi('│', border_col, color)}{more_text}{_ansi('│', border_col, color)}")
 
     # 底栏：╰────────────────────────╯
@@ -679,7 +934,7 @@ def render_kanban_board(
     if term_width < 70:
         return render_board(state, color=color, console=console)
 
-    cols_data = _extract_kanban_columns(state)
+    cols_data = kanban_columns(state)
     num_cols = len(cols_data)
     col_gap = 1
     col_w = max(14, (term_width - (num_cols - 1) * col_gap) // num_cols)
@@ -722,9 +977,14 @@ def render_kanban_board(
     out.append("")
 
     # 3. 5 泳道渲染
+    sel = (console or {}).get("selection") or None
+    lane_idx = int(sel["lane"]) if sel else -1
+    card_idx = int(sel["card"]) if sel else -1
     rendered_cols = [
-        _render_kanban_column(title, c_code, cards, col_w, color=color)
-        for title, c_code, cards in cols_data
+        _render_kanban_column(title, c_code, cards, col_w, color=color,
+                              focused=(i == lane_idx),
+                              selected_idx=(card_idx if i == lane_idx else None))
+        for i, (title, c_code, cards) in enumerate(cols_data)
     ]
     max_h = max(len(c) for c in rendered_cols)
     # 对齐高度
@@ -746,6 +1006,11 @@ def render_kanban_board(
     # 4. 底部指令控制台
     if console:
         out.append("")
+        detail = console.get("detail")
+        if detail:
+            out.extend(_render_detail_box(detail, term_width, color=color,
+                                          title="卡片详情（只读 · 0 Token）"))
+            out.append("")
         status_text = console.get("status") or "就绪"
         kind = console.get("status_kind", "info")
         color_code = {"success": "32", "warn": "33", "error": "31", "info": "36"}.get(kind, "90")
@@ -755,9 +1020,14 @@ def render_kanban_board(
         input_text = console.get("input") or ""
         cursor_pos = console.get("cursor_pos", len(input_text))
         cursor_pos = max(0, min(len(input_text), cursor_pos))
-        prompt_tag = _ansi(f"  [发给 {target}] ❯ ", "1;32" if color else "", color)
+        nav_mode = bool(console.get("nav"))
+        prompt_tag = _ansi(f"  [{'导航' if nav_mode else f'发给 {target}'}] ❯ ",
+                           "1;33" if nav_mode else "1;32", color)
 
-        if console.get("cursor", True):
+        if nav_mode:
+            # 导航态不可编辑：输入行压暗，钥匙已经交给 h/j/k/l
+            out.append(f"{prompt_tag}{_ansi(input_text, '90', color)}")
+        elif console.get("cursor", True):
             if cursor_pos >= len(input_text):
                 input_display = _ansi(input_text, "1", color) if color else input_text
                 cursor_block = _ansi("█", "7", color) if color else "█"
@@ -778,7 +1048,10 @@ def render_kanban_board(
         # 底栏快捷键提示
         total_slices = sum(len(cards) for _, _, cards in cols_data)
         foot_info = f" XTEAM · {label} | 5 cols | {total_slices} cards "
-        foot_cmds = " c chat | Tab 切换角色 | Enter 发送 | :q 退出 | :help "
+        if nav_mode:
+            foot_cmds = " h/l 泳道 · j/k 卡片 · Enter 详情 · i 返回输入 · :q 退出 "
+        else:
+            foot_cmds = " c chat | Tab 切换角色 | Enter 发送 | Esc 导航 | :q 退出 | :help "
         f_mid = max(2, term_width - _cell_len(foot_info) - _cell_len(foot_cmds))
         footer_line = (
             _ansi(foot_info, "1;30;46" if color else "", color)
