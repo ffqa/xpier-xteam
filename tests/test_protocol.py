@@ -106,6 +106,7 @@ from xteam_lib import (  # noqa: E402
     subagent_capability,
     PASTE_CHIP_LINES,
     render_board,
+    render_kanban_board,
     detect_choice_prompt,
 )
 
@@ -4391,6 +4392,82 @@ def test_interactive_board_console() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_kanban_board_renderer() -> None:
+    print("\n[99] 专业 5 列 Kanban 泳道看板渲染引擎（Backlog · Todo · Working · Review · Done）")
+    import unicodedata
+
+    state = {
+        "title": "xteam board  2026-10-09 21:00:00  'android_dev'  /tmp/dev",
+        "label": "android_dev",
+        "roles": [
+            {"role": "pm", "status": "working", "held": "12m", "owes": "none"},
+            {"role": "tl", "status": "idle", "held": "-", "owes": "none"},
+            {"role": "dev", "status": "working", "held": "25m", "owes": "implement"},
+        ],
+        "alerts": ["tl 停在选择框上（等待输入）"],
+        "queue": [
+            {"slice": "slice-4", "order": 1, "note": "修复中文退格与按键穿透"},
+            {"slice": "slice-5", "order": 2, "note": "支持终端多列自适应"},
+        ],
+        "slices": [
+            {"name": "slice-1", "stage": "spec", "note": "未开工"},
+            {"name": "slice-2", "stage": "implement", "note": "在飞  dev:implement"},
+            {"name": "slice-3", "stage": "verify", "note": "**待 gate**  tl:verdict"},
+        ],
+        "closed": [
+            {"name": "slice-0", "time": "10-09 19:30", "verdict": "PASS"},
+        ],
+    }
+
+    # 1. 宽屏（120 列）完整 5 泳道渲染
+    frame_120 = render_kanban_board(state, color=False, term_width=120)
+    check("5 大泳道标题全部在场", all(col in frame_120 for col in ("Backlog", "Todo", "Working", "Review", "Done")), True)
+    check("队列项正确进入 Backlog", "slice-4" in frame_120, True)
+    check("spec 切片正确进入 Todo", "slice-1" in frame_120, True)
+    check("implement 切片正确进入 Working", "slice-2" in frame_120, True)
+    check("待 gate 切片正确进入 Review", "slice-3" in frame_120, True)
+    check("已闭合切片正确进入 Done", "slice-0" in frame_120, True)
+    check("角色 HUD 正确展示", "pm:" in frame_120 and "dev:" in frame_120, True)
+    check("链路阻塞告警条展示", "⚠ tl 停在选择框上" in frame_120, True)
+
+    # 2. 中英文混排物理列宽对齐断言（Pixel-perfect 对齐，每一行切分出的泳道盒子宽度相等）
+    box_lines = [ln for ln in frame_120.splitlines() if ln.startswith("╭") or ln.startswith("│") or ln.startswith("╰")]
+    check("泳道盒子行数大于 5", len(box_lines) >= 5, True)
+    # 取第一行（顶栏行），提取 5 个独立泳道盒子 ╭...╮
+    top_line = box_lines[0]
+    sub_boxes = re.findall(r"╭.*?╮", top_line)
+    check("顶栏包含 5 个独立泳道盒子", len(sub_boxes), 5)
+    first_w = len(sub_boxes[0])
+    check("各泳道顶栏宽度严格相等", all(len(sb) == first_w for sb in sub_boxes), True)
+
+    # 3. 空状态测试（全部无卡片时，应显示 No tasks）
+    empty_state = {"roles": [], "slices": [], "queue": [], "closed": []}
+    frame_empty = render_kanban_board(empty_state, color=False, term_width=120)
+    check("空看板包含 No tasks 占位", "No tasks" in frame_empty, True)
+
+    # 4. 窄屏终端（< 85 列）自动降级为纵向列表视图
+    frame_narrow = render_kanban_board(state, color=False, term_width=80)
+    check("窄屏模式降级为传统列表视图", "── 角色 ──" in frame_narrow or "── 切片 ──" in frame_narrow, True)
+
+    # 5. 交互控制台集成渲染
+    console_ctx = {
+        "target": "dev",
+        "input": "查看代码 diff",
+        "cursor_pos": 4,
+        "status": "就绪",
+        "cursor": True,
+    }
+    frame_console = render_kanban_board(state, color=False, console=console_ctx, term_width=120)
+    check("包含指令输入目标", "[发给 dev] ❯ " in frame_console, True)
+    check("包含输入内容", "查看代码 diff" in frame_console, True)
+    check("底栏状态提示存在", "XTEAM ·" in frame_console and "5 cols" in frame_console, True)
+    check("快捷键提示在场", "c chat" in frame_console and "Tab" in frame_console, True)
+
+    # 6. 彩色渲染模式包含 ANSI 代码
+    frame_color = render_kanban_board(state, color=True, console=console_ctx, term_width=120)
+    check("彩色看板包含 ANSI 转义序列", "\033[" in frame_color, True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4493,6 +4570,7 @@ def main() -> int:
         test_down_fallback_and_tabs_tracking,
         test_auto_rotate_and_cold_review,
         test_interactive_board_console,
+        test_kanban_board_renderer,
     ):
         fn()
     print()

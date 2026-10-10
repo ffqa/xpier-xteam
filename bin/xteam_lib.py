@@ -32,6 +32,7 @@ import statistics
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -479,6 +480,315 @@ def render_board(state: dict, color: bool = False, console: dict | None = None) 
             out.append(f"{prompt_tag}{input_display}")
 
     return "\n".join(out)
+
+
+def _cell_len(text: str) -> int:
+    """计算文本在终端中的物理显示列宽（去除 ANSI 颜色码后，全角字符计 2，半角字符计 1）。"""
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+    w = 0
+    for ch in plain:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _fit_cell(text: str, max_w: int) -> str:
+    """安全截断文本至最大显示列宽，超长追加省略号。保证不切断多字节字符。"""
+    plain = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
+    if _cell_len(plain) <= max_w:
+        return text
+    target = max(1, max_w - 1)
+    acc = ""
+    w = 0
+    for ch in plain:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if w + cw > target:
+            break
+        acc += ch
+        w += cw
+    return acc + "…"
+
+
+def _pad_cell(text: str, target_w: int, align: str = "left") -> str:
+    """按显示列宽对齐文本至 target_w 列。"""
+    cur = _cell_len(text)
+    if cur > target_w:
+        text = _fit_cell(text, target_w)
+        cur = _cell_len(text)
+    diff = max(0, target_w - cur)
+    if align == "center":
+        left = diff // 2
+        right = diff - left
+        return " " * left + text + " " * right
+    elif align == "right":
+        return " " * diff + text
+    return text + " " * diff
+
+
+def _extract_kanban_columns(state: dict) -> list[tuple[str, str, list[dict]]]:
+    """将看板状态事实解析为 5 泳道数据：(列标, 强调色代码, 卡片列表)"""
+    queue = state.get("queue") or []
+    slices = state.get("slices") or []
+    closed = state.get("closed") or []
+
+    existing_slice_names = {s.get("name") for s in slices}
+    closed_names = {c.get("name") for c in closed}
+
+    # 1. Backlog (待规划需求池)
+    backlog_cards = []
+    for q in queue:
+        s_name = q.get("slice", "")
+        if s_name not in existing_slice_names and s_name not in closed_names:
+            backlog_cards.append({
+                "name": s_name,
+                "meta": f"#{q.get('order', 1)} 待规划",
+                "desc": q.get("note", "").strip(),
+            })
+
+    # 2. Todo (待分解 / 待开工规范)
+    todo_cards = []
+    # 3. Working (开发中活跃切片)
+    working_cards = []
+    # 4. Review (验收 / Chase / 待 Gate)
+    review_cards = []
+
+    for s in slices:
+        name = s.get("name", "")
+        stage = str(s.get("stage", ""))
+        note = s.get("note", "")
+        if "待 gate" in note or stage in ("verify", "gate", "chase"):
+            review_cards.append({
+                "name": name,
+                "meta": "tl 验收中",
+                "desc": note or "待裁决",
+            })
+        elif stage in ("implement", "doing") or "在飞" in note:
+            working_cards.append({
+                "name": name,
+                "meta": "dev 实现中",
+                "desc": note or "编码攻坚中",
+            })
+        else:
+            todo_cards.append({
+                "name": name,
+                "meta": f"tl [{stage or 'spec'}]",
+                "desc": note or "待分解开工",
+            })
+
+    # 5. Done (已闭合历史)
+    done_cards = []
+    for c in closed[-15:]:  # 最近 15 个闭合切片
+        done_cards.append({
+            "name": f"{c.get('time', '')} {c.get('verdict', 'PASS')}".strip(),
+            "meta": c.get("name", ""),
+            "desc": "",
+        })
+
+    return [
+        ("Backlog", "90", backlog_cards),
+        ("Todo", "36", todo_cards),
+        ("Working", "1;32", working_cards),
+        ("Review", "1;33", review_cards),
+        ("Done", "32", done_cards),
+    ]
+
+
+def _render_kanban_column(
+    title: str,
+    color_code: str,
+    cards: list[dict],
+    width: int,
+    color: bool = True,
+) -> list[str]:
+    inner_w = width - 2
+    card_inner_w = inner_w - 4
+    lines = []
+
+    # 顶栏：╭ Backlog 2 ────────────╮
+    t_disp = f" {title}"
+    count_str = f" {len(cards)} "
+    title_colored = _ansi(t_disp, color_code if color else "", color)
+    count_colored = _ansi(count_str, "7" if color else "", color)
+    header_clean = f" {title} {len(cards)} "
+    rem_dashes = max(0, inner_w - _cell_len(header_clean))
+    border_col = "32" if "Working" in title else ("33" if "Review" in title else "90")
+    top_left = _ansi("╭", border_col, color)
+    top_right = _ansi("╮", border_col, color)
+    dashes = _ansi("─" * rem_dashes, border_col, color)
+    lines.append(f"{top_left}{title_colored}{count_colored}{dashes}{top_right}")
+
+    if not cards:
+        empty_b = _ansi("│", border_col, color)
+        lines.append(f"{empty_b}{' ' * inner_w}{empty_b}")
+        no_task = _pad_cell(_ansi("No tasks", "90", color), inner_w, "center")
+        lines.append(f"{empty_b}{no_task}{empty_b}")
+        lines.append(f"{empty_b}{' ' * inner_w}{empty_b}")
+    else:
+        # 每个卡片渲染为小盒子
+        for card in cards[:6]:  # 单列最多显示 6 张卡片
+            c_top = _ansi(f"╭{'─' * (card_inner_w + 2)}╮", "90", color)
+            lines.append(f"{_ansi('│', border_col, color)} {c_top} {_ansi('│', border_col, color)}")
+
+            accent = "▌" if "Working" in title else ("✓" if "Done" in title else "│")
+            accent_col = "32" if "Working" in title else ("33" if "Review" in title else "36")
+            name_text = f"{_ansi(accent, accent_col, color)} {card.get('name', '')}"
+            name_line = _pad_cell(name_text, card_inner_w + 2)
+            meta_line = _pad_cell(_ansi(f"  {card.get('meta', '')}", "90", color), card_inner_w + 2)
+
+            b_card = _ansi("│", "90", color)
+            lines.append(f"{_ansi('│', border_col, color)} {b_card}{name_line}{b_card} {_ansi('│', border_col, color)}")
+            lines.append(f"{_ansi('│', border_col, color)} {b_card}{meta_line}{b_card} {_ansi('│', border_col, color)}")
+
+            desc = card.get("desc")
+            if desc:
+                desc_line = _pad_cell(f"  {desc}", card_inner_w + 2)
+                lines.append(f"{_ansi('│', border_col, color)} {b_card}{desc_line}{b_card} {_ansi('│', border_col, color)}")
+
+            c_bot = _ansi(f"╰{'─' * (card_inner_w + 2)}╯", "90", color)
+            lines.append(f"{_ansi('│', border_col, color)} {c_bot} {_ansi('│', border_col, color)}")
+
+        if len(cards) > 6:
+            more_text = _pad_cell(_ansi(f"▾ +{len(cards) - 6} more", "90", color), inner_w, "center")
+            lines.append(f"{_ansi('│', border_col, color)}{more_text}{_ansi('│', border_col, color)}")
+
+    # 底栏：╰────────────────────────╯
+    bot_left = _ansi("╰", border_col, color)
+    bot_right = _ansi("╯", border_col, color)
+    bot_dashes = _ansi("─" * inner_w, border_col, color)
+    lines.append(f"{bot_left}{bot_dashes}{bot_right}")
+    return lines
+
+
+def render_kanban_board(
+    state: dict,
+    color: bool = False,
+    console: dict | None = None,
+    term_width: int | None = None,
+) -> str:
+    """渲染专业 5 列 Kanban 泳道看板（Backlog · Todo · Working · Review · Done）。
+    
+    采用纯标准库终端字符盒子模型，中英文字宽精确对齐，带角色 HUD 与底部 0-Token 交互指令栏。
+    """
+    if term_width is None:
+        try:
+            term_width = os.get_terminal_size().columns
+        except Exception:
+            term_width = 120
+    term_width = max(80, term_width)
+
+    # 窄屏终端（< 85 列）自动优雅降级为纵向列表流
+    if term_width < 85:
+        return render_board(state, color=color, console=console)
+
+    cols_data = _extract_kanban_columns(state)
+    num_cols = len(cols_data)
+    col_gap = 1
+    col_w = max(16, (term_width - (num_cols - 1) * col_gap) // num_cols)
+
+    out = []
+
+    # 1. 顶部 Header & 角色 HUD
+    title_main = "xteam Board"
+    label = state.get("label") or "xteam"
+    roles = state.get("roles") or []
+    role_huds = []
+    for r in roles:
+        r_name = r.get("role", "")
+        status = r.get("status", "idle")
+        st_color = "32" if status == "working" else ("31" if status == "blocked" else "90")
+        held = f" {r.get('held', '')}" if r.get("held") and r.get("held") != "-" else ""
+        role_huds.append(f"{r_name}: {_ansi(status + held, st_color, color)}")
+    hud_str = " · ".join(role_huds) if role_huds else "（无运行角色）"
+    time_str = now().split()[1] if " " in now() else now()
+
+    # 顶栏单行对齐排布
+    left_side = f" {title_main} [{label}] "
+    right_side = f" Updated {time_str} "
+    mid_space = max(2, term_width - _cell_len(left_side) - _cell_len(right_side) - _cell_len(hud_str))
+    top_bar = (
+        _ansi(left_side, "1;37;42" if color else "", color)
+        + " " * (mid_space // 2)
+        + hud_str
+        + " " * (mid_space - mid_space // 2)
+        + _ansi(right_side, "90", color)
+    )
+    out.append(top_bar)
+
+    # 2. 链路告警条（如果有阻塞）
+    alerts = state.get("alerts") or []
+    if alerts:
+        for a in alerts:
+            out.append("  " + _ansi(f"⚠ {a}", "33", color))
+
+    out.append("")
+
+    # 3. 5 泳道渲染
+    rendered_cols = [
+        _render_kanban_column(title, c_code, cards, col_w, color=color)
+        for title, c_code, cards in cols_data
+    ]
+    max_h = max(len(c) for c in rendered_cols)
+    # 对齐高度
+    aligned_cols = []
+    border_col = "90"
+    for c in rendered_cols:
+        inner_w = col_w - 2
+        empty_b = _ansi("│", border_col, color)
+        if len(c) < max_h:
+            filler = [f"{empty_b}{' ' * inner_w}{empty_b}"] * (max_h - len(c))
+            c = c[:-1] + filler + [c[-1]]
+        aligned_cols.append(c)
+
+    # 逐行横向拼装
+    for r in range(max_h):
+        row_str = " ".join(aligned_cols[i][r] for i in range(num_cols))
+        out.append(row_str)
+
+    # 4. 底部指令控制台
+    if console:
+        out.append("")
+        status_text = console.get("status") or "就绪"
+        kind = console.get("status_kind", "info")
+        color_code = {"success": "32", "warn": "33", "error": "31", "info": "36"}.get(kind, "90")
+        out.append("  " + _ansi(f"[状态] {status_text}", color_code, color))
+
+        target = console.get("target") or "pm"
+        input_text = console.get("input") or ""
+        cursor_pos = console.get("cursor_pos", len(input_text))
+        cursor_pos = max(0, min(len(input_text), cursor_pos))
+        prompt_tag = _ansi(f"  [发给 {target}] ❯ ", "1;32" if color else "", color)
+
+        if console.get("cursor", True):
+            if cursor_pos >= len(input_text):
+                input_display = _ansi(input_text, "1", color) if color else input_text
+                cursor_block = _ansi("█", "7", color) if color else "█"
+                out.append(f"{prompt_tag}{input_display}{cursor_block}")
+            else:
+                before = input_text[:cursor_pos]
+                at = input_text[cursor_pos]
+                after = input_text[cursor_pos + 1:]
+                if color:
+                    disp = _ansi(before, "1", True) + _ansi(at, "7", True) + _ansi(after, "1", True)
+                else:
+                    disp = f"{before}{at}{after}"
+                out.append(f"{prompt_tag}{disp}")
+        else:
+            input_display = _ansi(input_text, "1", color) if color else input_text
+            out.append(f"{prompt_tag}{input_display}")
+
+        # 底栏快捷键提示
+        total_slices = sum(len(cards) for _, _, cards in cols_data)
+        foot_info = f" XTEAM · {label} | 5 cols | {total_slices} cards "
+        foot_cmds = " c chat | Tab 切换角色 | Enter 发送 | :q 退出 | :help "
+        f_mid = max(2, term_width - _cell_len(foot_info) - _cell_len(foot_cmds))
+        footer_line = (
+            _ansi(foot_info, "1;30;46" if color else "", color)
+            + " " * f_mid
+            + _ansi(foot_cmds, "90", color)
+        )
+        out.append(footer_line)
+
+    return "\n".join(out)
+
 
 
 def process_board_keystrokes(
@@ -1458,6 +1768,9 @@ class Protocol:
 
     def open_tasks(self) -> list[Path]:
         return [t for t in self.all_tasks() if not _is_closed(t)]
+
+    def closed_tasks(self) -> list[Path]:
+        return [t for t in self.all_tasks() if _is_closed(t)]
 
     def index(self) -> dict:
         """全量状态的单文件快照。

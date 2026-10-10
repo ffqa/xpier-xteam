@@ -40,6 +40,7 @@ from xteam_lib import (  # noqa: E402
     PHASES,
     Protocol,
     render_board,
+    render_kanban_board,
     process_board_keystrokes,
     clean_pane_preview,
     detect_choice_prompt,
@@ -2552,10 +2553,45 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
             events.append(re.sub(r"^(\d{4})-(\d\d-\d\d)T(\d\d:\d\d:\d\d)Z ",
                                  r"\2 \3 ", ln)[:110])
 
+    # 收集闭合切片（供 Done 泳道）
+    closed_slices = []
+    try:
+        for t in proto.closed_tasks():
+            v_data = {}
+            v_file = t / "verdict.json"
+            if v_file.exists():
+                try:
+                    v_data = json.loads(v_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            c_file = t / "closed.md"
+            c_time = ""
+            if c_file.exists():
+                try:
+                    c_time = time.strftime("%m-%d %H:%M", time.localtime(c_file.stat().st_mtime))
+                except Exception:
+                    pass
+            closed_slices.append({
+                "name": t.name,
+                "time": c_time or "closed",
+                "verdict": str(v_data.get("verdict") or "PASS"),
+            })
+    except Exception:
+        closed_slices = []
+
+    # 收集队列待办项（供 Backlog 泳道）
+    queue_items = []
+    try:
+        queue_items = proto.queue_items()
+    except Exception:
+        queue_items = []
+
     return {
         "title": (f"xteam board  {now()}  {label!r}  {root}  "
                   f"（xteam {_installed_version() or '?'}）"),
+        "label": label,
         "roles": rows, "alerts": alerts, "slices": slices, "events": events,
+        "queue": queue_items, "closed": closed_slices,
     }
 
 
@@ -2611,12 +2647,16 @@ def cmd_board(args: argparse.Namespace) -> int:
     tracker = IdleTracker(proto.dir / "watch" / "idle.state")
     color = sys.stdout.isatty() and not args.plain
 
-    # 脚本、管道或显式 --once：降级为只读静态打印
+    # 脚本、管道或显式 --once：降级为只读静态打印（默认列表，传 --kanban 则输出看板）
     if args.once or not sys.stdin.isatty():
         state = _board_state(root, proto, herdr, label, role_map, tracker)
-        frame = render_board(state, color=color)
+        fn = render_kanban_board if getattr(args, "kanban", False) else render_board
+        frame = fn(state, color=color)
         print(frame)
         return 0
+
+    # 交互式 TUI 模式：默认采用专业 5 列 Kanban 泳道看板，--list 降级为列表
+    renderer = render_board if getattr(args, "list", False) else render_kanban_board
 
     # 交互式 TUI 模式
     import select
@@ -2669,7 +2709,7 @@ def cmd_board(args: argparse.Namespace) -> int:
                 "status_kind": status_kind,
                 "cursor": True,
             }
-            frame = render_board(cached_state, color=color, console=console_ctx)
+            frame = renderer(cached_state, color=color, console=console_ctx)
             # 无闪烁重绘
             sys.stdout.write("\033[H\033[J" + frame + "\n")
             sys.stdout.flush()
@@ -2725,7 +2765,7 @@ def cmd_board(args: argparse.Namespace) -> int:
                     status_kind = "warn"
                     console_ctx["status"] = status_text
                     console_ctx["status_kind"] = status_kind
-                    frame = render_board(cached_state, color=color, console=console_ctx)
+                    frame = renderer(cached_state, color=color, console=console_ctx)
                     sys.stdout.write("\033[H\033[J" + frame + "\n")
                     sys.stdout.flush()
 
@@ -2763,7 +2803,7 @@ def cmd_board(args: argparse.Namespace) -> int:
                     status_kind = "info"
                     console_ctx["status"] = status_text
                     console_ctx["status_kind"] = status_kind
-                    frame = render_board(cached_state, color=color, console=console_ctx)
+                    frame = renderer(cached_state, color=color, console=console_ctx)
                     sys.stdout.write("\033[H\033[J" + frame + "\n")
                     sys.stdout.flush()
 
@@ -4584,6 +4624,8 @@ def main() -> int:
 
     p = sub.add_parser("board", help="一屏看板：谁在干什么、链路为什么不动（自动刷新）")
     p.add_argument("--once", action="store_true", help="只打一屏就退出（脚本/测试用）")
+    p.add_argument("--list", action="store_true", help="使用传统纵向列表视图（默认多列泳道看板）")
+    p.add_argument("--kanban", action="store_true", help="强制使用多列泳道看板（--once 时亦可用）")
     p.add_argument("--interval", type=float, default=2.0, metavar="SECS",
                    help="刷新间隔（默认 2 秒）")
     p.add_argument("--plain", action="store_true", help="不上色（管道里默认就不上色）")
