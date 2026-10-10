@@ -23,7 +23,8 @@ from textual.widgets import (Button, Footer, Header, Input, Label,
 from rich.text import Text
 
 try:                                     # 单测里直接 import 本模块时给个友好失败
-    from xteam_lib import _box_state_text, _spec_view_lines, wrap_display
+    from xteam_lib import (_box_state_text, wrap_display, read_doc,
+                           doc_files_in, project_doc_files)
 except ImportError:                      # pragma: no cover - 装在 lib/ 布局下
     from .xteam_lib import _box_state_text, _spec_view_lines  # type: ignore
 
@@ -43,52 +44,86 @@ class ArchiveList(ListView):
     ]
 
 
-class SpecScreen(ModalScreen):
-    """翻开一片 spec 的全文。Esc / q 关。"""
+class DocsScreen(ModalScreen):
+    """文档翻阅层：左边一份目录，右边正文。
+
+    **不只 spec** —— 一片切片的 request（当时怎么说的）、closed（怎么收的）、
+    verdict（谁拍的板）同样是记忆；加上项目级 README / 协议 / 队列 / 报告，
+    以及「存为 note」落下去的 wiki 笔记。j/k 在目录里选，正文跟着换。
+    """
 
     BINDINGS = [
         Binding("escape,q", "dismiss", "关闭"),
-        Binding("j,down", "scroll_down", "下一行"),
-        Binding("k,up", "scroll_up", "上一行"),
+        Binding("j,down", "next_doc", "下一篇"),
+        Binding("k,up", "prev_doc", "上一篇"),
         Binding("pagedown,f", "page_down", "下半页"),
         Binding("pageup,b", "page_up", "上半页"),
         Binding("g", "top", "回到顶部"),
         Binding("G", "bottom", "跳到末尾"),
     ]
 
-    def __init__(self, title: str, body: str) -> None:
+    def __init__(self, title: str, files: list) -> None:
         super().__init__()
         self._title = title
-        self._body = body
+        self._files = list(files)
+        self._idx = 0
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="spec_dialog"):
-            yield Label(self._title, id="spec_title")
-            with VerticalScroll(id="spec_scroll"):
-                yield Static(Text(self._body), id="spec_body")
-            yield Label("Esc 合上 · j/k 滚行 · Ctrl+F/B 翻页 · g/G 顶末",
-                        id="spec_hint")
-
-    def action_scroll_down(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_down()
-
-    def action_scroll_up(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_up()
-
-    def action_page_down(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_page_down()
-
-    def action_page_up(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_page_up()
-
-    def action_top(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_home()
-
-    def action_bottom(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).scroll_end()
+        with Horizontal(id="docs_dialog"):
+            with Vertical(id="docs_left"):
+                yield Label(self._title, id="docs_title")
+                yield ArchiveList(id="docs_list")
+            with Vertical(id="docs_right"):
+                with VerticalScroll(id="docs_body_scroll"):
+                    yield Static(Text(""), id="docs_body")
+                yield Label("j/k 选文档 · 滚行 Ctrl+F/B · g/G 顶末 · Esc 合上",
+                            id="docs_hint")
 
     def on_mount(self) -> None:
-        self.query_one("#spec_scroll", VerticalScroll).focus()
+        lv = self.query_one("#docs_list", ArchiveList)
+        for label, path in self._files:
+            lv.append(ListItem(Label(label)))
+        if self._files:
+            lv.index = 0
+        lv.focus()
+        self._load(0)
+
+    def _load(self, idx: int) -> None:
+        if not self._files:
+            self.query_one("#docs_body", Static).update(Text("（没有可翻的文档）"))
+            return
+        self._idx = max(0, min(idx, len(self._files) - 1))
+        _label, path = self._files[self._idx]
+        title, lines = read_doc(path)
+        width = max(20, (self.size.width or 100) - 44)
+        body = wrap_display("\n".join(lines), width)
+        self.query_one("#docs_body", Static).update(
+            Text(f"── {title} ──\n" + "\n".join(body)))
+
+    def action_next_doc(self) -> None:
+        self._load(self._idx + 1)
+        self.query_one("#docs_list", ArchiveList).index = self._idx
+
+    def action_prev_doc(self) -> None:
+        self._load(self._idx - 1)
+        self.query_one("#docs_list", ArchiveList).index = self._idx
+
+    def action_page_down(self) -> None:
+        self.query_one("#docs_body_scroll", VerticalScroll).scroll_page_down()
+
+    def action_page_up(self) -> None:
+        self.query_one("#docs_body_scroll", VerticalScroll).scroll_page_up()
+
+    def action_top(self) -> None:
+        self.query_one("#docs_body_scroll", VerticalScroll).scroll_home()
+
+    def action_bottom(self) -> None:
+        self.query_one("#docs_body_scroll", VerticalScroll).scroll_end()
+
+    def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.list_view.id == "docs_list":
+            self._load(event.list_view.index)
+
 
 class BoardApp(App):
     """一屏看板：谁在干什么（真状态）、链路为什么不动、spec 档案随手翻。"""
@@ -98,30 +133,41 @@ class BoardApp(App):
     #top { height: 3; }
     #body { height: 1fr; }
     /* 宽度分配：中间是主角（三角色），左右是辅助。右侧档案行短，不需要 46 列。 */
-    #left { width: 28; border: round $primary; padding: 0 1; }
+    #left { width: 30; border: round $primary; padding: 0 1; }
     #left Label { margin: 0 0 1 0; }
     #note { height: 1fr; border: none; }
-    #left_actions { height: auto; }
-    #left_actions Button { width: 1fr; height: 3; border: none;
-                           margin: 0 0 1 0; background: $boost; }
-    #left_actions Button:hover { background: $primary; }
+    /* 推给/存 note 并排，外部评审单独一整行（它是重动作，要点名切片）。
+       min-width: 0 是必须的：Button 默认 min-width 16，两个并排要 32 列，
+       而左栏内里只有 26 —— 不归零的话第二个按钮直接溢出到中栏去。 */
+    #row_actions { height: auto; }
+    #row_actions Button { width: 1fr; min-width: 0; height: 3;
+                          border: none; background: $boost; }
+    #row_actions Button:hover { background: $primary; }
+    #qa { width: 1fr; min-width: 0; height: 3; border: none;
+          background: $warning; color: $text; }
+    #qa:hover { background: $warning-lighten-1; }
     #cmd { margin: 1 0 0 0; }
     /* 中间不套外框：卡片自己就是盒子。双层边框把每张卡都挤小一圈。 */
     #middle { width: 1fr; min-width: 52; padding: 0 1; }
     .role_card { height: auto; border: round $panel; padding: 0 1; margin: 0 0 1 0;
                  border-title-align: left; border-title-color: $text; }
     /* 目标卡：重边框 + 反色，切角色时一眼能看到是谁 */
-    .role_card.target { border: heavy yellow; background: $boost;
+.role_card.target { border: heavy yellow; background: $boost;
                         border-title-color: $text; }
+    .role_card.dead { border: dashed red; background: $error-darken-3; }
     #right { width: 34; border: round $secondary; padding: 0 1; }
     #archive { height: 1fr; }
     #status { height: auto; min-height: 3; border: round $warning; padding: 0 1; }
     #alerts { height: auto; color: $warning; }
     #statusline { height: auto; }
-    #spec_dialog { align: center middle; width: 80%; height: 80%;
-                  border: thick $accent; background: $surface; padding: 1 2; }
-    #spec_scroll { height: 1fr; border: none; }
-    #spec_hint { color: $text-muted; }
+    #docs_dialog { align: center middle; width: 92%; height: 88%;
+                   border: thick $accent; background: $surface; padding: 0 1; }
+    #docs_left { width: 30; border: round $panel; }
+    #docs_title { margin: 0 0 1 0; }
+    #docs_list { height: 1fr; }
+    #docs_right { width: 1fr; border: none; padding: 0 1; }
+    #docs_body_scroll { height: 1fr; border: none; }
+    #docs_hint { color: $text-muted; }
     """
 
     # 只放「任何时候都该是这个意思」的键。
@@ -138,7 +184,7 @@ class BoardApp(App):
     def __init__(self, root=None, proto=None, herdr=None, label="",
                  role_map=None, refresh_secs=2.0, collector=None,
                  dispatcher=None, qa_runner=None, rotator=None,
-                 note_writer=None) -> None:
+                 note_writer=None, bring_up=None) -> None:
         super().__init__()
         self.root = root
         self.proto = proto
@@ -151,6 +197,7 @@ class BoardApp(App):
         self._qa_runner = qa_runner
         self._rotator = rotator
         self._note_writer = note_writer
+        self._bring_up = bring_up
         self.state: dict = {}
         self.roles: list[str] = []
         self.target_idx = 0
@@ -171,10 +218,12 @@ class BoardApp(App):
             with Vertical(id="left"):
                 yield Label("笔记 / 安排 —— 想事情、排任务")
                 yield TextArea(id="note")
-                # 竖排整宽：28 列里横排两个按钮，每个都被挤成按钮里塞半句话
-                with Vertical(id="left_actions"):
-                    yield Button("推给当前角色", id="push", variant="primary")
-                    yield Button("存为 note", id="note_save")
+                # 并排的两个只放短标签（30 列里「推给当前角色」六个字就 12 列，
+                # 两个并排一定被切），外部评审单独一整行
+                with Horizontal(id="row_actions"):
+                    yield Button("推给 pm", id="push", variant="primary")
+                    yield Button("存 note", id="note_save")
+                yield Button("外部评审 :qa", id="qa")
                 yield Input(id="cmd",
                             placeholder=":qa <切片> · :rotate <角色> · Ctrl+Q 退出")
             with VerticalScroll(id="middle"):
@@ -271,7 +320,12 @@ class BoardApp(App):
             except Exception:
                 continue
             is_target = name == target
-            card.set_classes("role_card target" if is_target else "role_card")
+            classes = "role_card target" if is_target else "role_card"
+            # pane 不在了：卡片换个颜色，副标题直接写「点卡片拉起」
+            dead = not str(r.get("pane") or "")
+            if dead:
+                classes += " dead"
+            card.set_classes(classes)
             st = str(r.get("status", "idle"))
             style = {"working": "green", "blocked": "red",
                      "done": "cyan"}.get(st, "white")
@@ -300,6 +354,7 @@ class BoardApp(App):
             # 之前是 CSS 边框 + Panel 边框各一层 —— 双层边框把每张卡都显小一圈。
             self._card_texts[name] = t
             card.border_title = name
+            card.border_subtitle = "pane 挂了 · 点卡片拉起" if dead else ""
             card.update(t)
 
     # ---- 右侧：spec 档案 ----
@@ -360,14 +415,21 @@ class BoardApp(App):
         if not self.archive:
             return
         entry = self.archive[self.archive_idx]
-        self._open_spec(str(entry.get("name") or ""))
+        self._open_slice(str(entry.get("name") or ""))
+
+    def action_open_project_docs(self) -> None:
+        """项目级文档 + wiki 笔记（「存为 note」落下去的地方，要能翻回来）。"""
+        files = [("项目 · " + p.name, p) for p in project_doc_files(self.root)]
+        self.push_screen(DocsScreen("项目文档", files))
 
     def action_quit_board(self) -> None:
         self.exit()
 
-    def _open_spec(self, name: str) -> None:
-        title, lines = _spec_view_lines(self.proto.dir / "tasks" / name, name)
-        self.push_screen(SpecScreen(title, "\n".join(lines)))
+    def _open_slice(self, name: str) -> None:
+        """翻开一片切片的全部文档：spec 在前，其余按序；项目文档跟在后面。"""
+        files = [(p.name, p) for p in doc_files_in(self.proto.dir / "tasks" / name)]
+        files += [("项目 · " + p.name, p) for p in project_doc_files(self.root)]
+        self.push_screen(DocsScreen(f"切片 {name}", files))
 
     def _set_status(self, text: str, kind: str = "info") -> None:
         self.status_text = text
@@ -398,6 +460,12 @@ class BoardApp(App):
             self._push_note()
         elif event.button.id == "note_save":
             self._save_note()
+        elif event.button.id == "qa":
+            # 外部评审要点名切片：把光标放进底部输入框并预填 :qa
+            cmd = self.query_one("#cmd", Input)
+            cmd.value = ":qa "
+            cmd.focus()
+            self._set_status("输入要对它外部评审的切片名，回车开跑", "info")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         cmd = event.value.strip()
@@ -502,18 +570,45 @@ class BoardApp(App):
             card = card.parent
         if card is not None and card.id and card.id.startswith("card_"):
             name = card.id[5:]
-            if name in self.roles:
-                self.target_idx = self.roles.index(name)
-                self._refresh_role_cards()
-                self._refresh_header()
-                self._set_status(f"发送目标 → {name}", "info")
+            if name not in self.roles:
+                return
+            rec = next((r for r in self.state.get("roles") or []
+                        if str(r.get("role")) == name), {})
+            if not str(rec.get("pane") or ""):
+                # pane 挂了：点卡片就是「把它拉回来」，不是切目标 ——
+                # 板子上看得见「谁不在了」和「一键拉回来」是同一件事
+                self._bring_up_role(name)
+                return
+            self.target_idx = self.roles.index(name)
+            self._refresh_role_cards()
+            self._refresh_header()
+            self._set_status(f"发送目标 → {name}", "info")
+
+    def _bring_up_role(self, role: str) -> None:
+        if self._bring_up is None:
+            self._set_status(f"{role} 的 pane 不在了 —— 命令行：xteam up .", "warn")
+            return
+        self._set_status(f"正在拉起 {role}…（起 pane + 投章程，要一会儿）", "info")
+
+        def _do() -> None:
+            try:
+                ok, msg = self._bring_up(role)
+            except Exception as exc:                  # noqa: BLE001
+                ok, msg = False, str(exc)
+            self.call_from_thread(self._set_status,
+                                  f"{'✓' if ok else '⚠'} {msg}",
+                                  "success" if ok else "error")
+
+        self.run_worker(_do, thread=True, exclusive=True, group="bring_up")
 
 
 def run_board(root: Path, proto, herdr, label: str, role_map: dict,
               refresh_secs: float = 2.0, collector=None, dispatcher=None,
-              qa_runner=None, rotator=None, note_writer=None) -> bool:
+              qa_runner=None, rotator=None, note_writer=None,
+              bring_up=None) -> bool:
     """起板子（textual 已由调用方确认可 import）。"""
     BoardApp(root=root, proto=proto, herdr=herdr, label=label, role_map=role_map,
              refresh_secs=refresh_secs, collector=collector, dispatcher=dispatcher,
-             qa_runner=qa_runner, rotator=rotator, note_writer=note_writer).run()
+             qa_runner=qa_runner, rotator=rotator, note_writer=note_writer,
+             bring_up=bring_up).run()
     return True

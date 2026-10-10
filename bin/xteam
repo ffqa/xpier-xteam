@@ -71,6 +71,7 @@ from xteam_lib import (  # noqa: E402
     wiki_append,
     wiki_search,
     wiki_dir,
+    wiki_files,
     parse_context_pct,
     XTEAM_DIRNAME,
     recap_path,
@@ -1077,6 +1078,41 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wiki(args: argparse.Namespace) -> int:
+    """翻 wiki：`xteam wiki` 看最近，`xteam wiki list` 列全部，`show <file>` 读一份。"""
+    root = Path(args.project).resolve()
+    files = wiki_files(root)
+    if not files:
+        print(f"[{now()}] wiki 还没有内容（{wiki_dir(root)} 不存在或为空）")
+        print("  板子上点「存 note」，或：xteam note decisions <标题> <正文>")
+        return 0
+    if args.wiki_action == "list":
+        for f in files:
+            n = sum(1 for l in f.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if l.startswith("## "))
+            stamp = time.strftime("%m-%d %H:%M", time.localtime(f.stat().st_mtime))
+            print(f"  {stamp}  {n:>3} 条  {f.name}")
+        return 0
+    if args.wiki_action == "show":
+        want = (args.target or "").strip()
+        for f in files:
+            if f.name == want or want in f.name:
+                print(f.read_text(encoding="utf-8", errors="replace"))
+                return 0
+        print(f"[{now()}] 没有叫 {want!r} 的 wiki 文件。现有：{'、'.join(f.name for f in files)}")
+        return 1
+    # 默认：最近 N 条的标题 + 头几行
+    recent = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:args.limit]
+    for f in recent:
+        text = f.read_text(encoding="utf-8", errors="replace")
+        heads = [l for l in text.splitlines() if l.startswith("## ")]
+        print(f"── {f.name}（{len(heads)} 条）")
+        for h in heads[-args.limit:]:
+            print(f"  {h}")
+    print(f"\n全文：xteam wiki show <文件名>（共 {len(files)} 个文件）")
+    return 0
+
+
 def cmd_note(args: argparse.Namespace) -> int:
     """往 wiki 追加一条决策/教训/约定。"""
     root = Path(args.project).resolve()
@@ -1654,6 +1690,103 @@ def cmd_swap(args: argparse.Namespace) -> int:
     return 0
 
 
+def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
+                   only: list[str] | None = None, say=print) -> dict:
+    """把缺的角色拉起来。workspace 已存在就复用，不在就建。
+
+    `cmd_up` 和看板的「拉起 <角色>」必须走同一条路：分叉的后果是板子上拉起的
+    pane 与命令行 `up` 起来的行为不一致（身份文件、章程、sync 状态），而这种
+    不一致只在 pane 挂了之后才显形，排查极贵。
+
+    only: 只拉这些角色（看板上点哪个拉哪个）；None = team.json 里有的全拉。
+    返回 {"started": {role: pane_id}, "tabs": {role: tab_id},
+          "agents": {role: 描述}, "identity": {role: identity_path},
+          "ws_id": str, "created": bool}
+    """
+    herdr = Herdr(scope=label)
+    existing = herdr.find_workspace(label)
+    if existing:
+        # **复用 workspace，不要再开一个。** 反复 up 会在屏幕上堆一堆同名
+        # workspace，而它们指向同一个项目 —— 既浪费终端空间，又让人搞不清
+        # 「我到底在跟哪个说话」。workspace 是长寿命容器，pane 才是易失的。
+        ws_id = existing["workspace_id"]
+        say(f"[{now()}] workspace {label!r} 已存在（{ws_id}）—— 复用，不新建")
+    else:
+        ws = herdr.create_workspace(str(root), label)
+        # herdr 的 create 返回体把实体嵌在具名键下（workspace_created.workspace），
+        # 平铺解析会在第一次 up 时直接失败。
+        entity = ws.get("workspace") or ws.get("tab") or ws
+        ws_id = entity.get("workspace_id") or ws.get("workspace_id")
+        if not ws_id:
+            die(f"workspace 创建返回异常（未找到 workspace_id）：{ws}")
+        say(f"[{now()}] workspace {label!r} → {ws_id}")
+
+    live_roles = {r: a for r, a in
+                  herdr.role_map(ws_id).items() if r in BOOT_ORDER}
+    live = {r: a["pane_id"] for r, a in live_roles.items()}
+    want = [r for r in BOOT_ORDER if r in specs] if only is None else list(only)
+    todo = [r for r in want if r not in live]
+    if not todo:
+        say(f"[{now()}] 要拉的角色都已经在跑：{'、'.join(sorted(live)) or '（无）'}")
+        return {"started": dict(live), "tabs": {}, "agents": {}, "identity": {},
+                "ws_id": ws_id, "created": existing is None}
+    say(f"[{now()}] 补起缺失的角色：{'、'.join(todo)}")
+
+    started: dict[str, str] = {}
+    tabs_of: dict[str, str] = {}
+    used: dict[str, str] = {}
+    identity_of: dict[str, str] = {}
+    for role in todo:
+        if role not in specs:
+            say(f"[{now()}] ⚠ 跳过 {role}：team.json 里没有这个角色")
+            continue
+        spec = _with_default_model(specs[role])
+        spec = _with_identity(spec, root, label)
+        say(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
+            flush=True)
+        pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
+        started[role] = pane_id
+        tabs_of[role] = tab_id
+        used[role] = spec.describe() or "CLI 默认模型"
+        identity_of[role] = spec.identity   # 见 cmd_reopen：靠它决定要不要补投章程
+        say(f"[{now()}]   pane={pane_id} tab={tab_id}")
+
+    # 已在跑的老 pane 也要进映射，否则下次 down/up 会把它们的 tab/agent 丢了
+    for role, pane_id in live.items():
+        started.setdefault(role, pane_id)
+        agent_rec = live_roles.get(role) or {}
+        if agent_rec.get("tab_id"):
+            tabs_of.setdefault(role, agent_rec["tab_id"])
+        used.setdefault(role, agent_rec.get("agent") or
+                        (specs[role].describe() if role in specs else "") or
+                        "CLI 默认模型")
+
+    # 角色章程：PM 先收到（它是入口），再 TL，最后 dev。
+    #
+    # **章程后面必须附一段「现状自检」。** 只投章程的话，重启起来的 agent 是孤儿：
+    # 它不知道这个项目进行到哪、自己欠什么、上一个自己做到哪。只有章程，它会
+    # 从零开始问「所以现在要做什么」—— 而答案就在 .xteam/ 里，它没被告知去读。
+    # 单个 pane 崩了再补起时最容易出这个孤儿。
+    for role in ("pm", "tl", "dev"):
+        if role not in started:
+            continue
+        with_charter = None if specs[role].kind in SYSTEM_PROMPT_ARG else True
+        intro = _restart_intro(
+            root, proto, role, specs[role].kind,
+            why=f"你刚被拉起，加入 {label} 项目的三 pane 协作（pm / tl / dev）。",
+            with_charter=with_charter)
+        result = herdr.send_initial_prompt(started[role], intro, wait_s=15)
+        what = ("身份+现状已投（章程在系统提示词里）" if with_charter is None
+                else "章程+现状已投")
+        say(f"[{now()}] {what} {role}：{result}")
+
+    # 记下投进 pane 的是哪一版（章程 + 协议 + 输出规范 + 版本号 + CLI 面），
+    # 之后 status 才能提醒「改了没生效 / 该更新了」
+    _save_sync_state(root)
+    return {"started": started, "tabs": tabs_of, "agents": used,
+            "identity": identity_of, "ws_id": ws_id, "created": existing is None}
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     root = Path(args.project).resolve()
     if not root.is_dir():
@@ -1707,102 +1840,19 @@ def cmd_up(args: argparse.Namespace) -> int:
             die(str(exc))
 
     # ---- 确认无误，开始有副作用的动作 ----
-    herdr = Herdr(scope=label)
-    existing = herdr.find_workspace(label)
-    if existing:
-        # **复用 workspace，不要再开一个。** 反复 up 会在屏幕上堆一堆同名
-        # workspace，而它们指向同一个项目 —— 既浪费终端空间，又让人搞不清
-        # 「我到底在跟哪个说话」。workspace 是长寿命容器，pane 才是易失的。
-        ws_id = existing["workspace_id"]
-        print(f"[{now()}] workspace {label!r} 已存在（{ws_id}）—— 复用，不新建")
-        live_roles = {r: a for r, a in
-                      herdr.role_map(ws_id).items() if r in BOOT_ORDER}
-        live = {r: a["pane_id"] for r, a in live_roles.items()}
-        if live:
-            print(f"[{now()}] 已在跑的角色：{'、'.join(sorted(live))}"
-                  f"（不动它们）")
-            stale = [r for r in started_order(args) if r not in live]
-            if not stale:
-                print(f"[{now()}] 要换掉已有角色用 `xteam swap <角色> <agent>`；"
-                      f"要收摊用 `xteam down`（只关 pane，workspace 留着）")
-                return 0
-            print(f"[{now()}] 补起缺失的角色：{'、'.join(stale)}")
-    else:
-        live_roles = {}
-        live = {}
-        ws = herdr.create_workspace(str(root), label)
-        # herdr 的 create 返回体把实体嵌在具名键下（workspace_created.workspace），
-        # 不是平铺的 workspace_id。平铺解析会在第一次 up 时直接失败。
-        entity = ws.get("workspace") or ws.get("tab") or ws
-        ws_id = entity.get("workspace_id") or ws.get("workspace_id")
-        if not ws_id:
-            die(f"workspace 创建返回异常（未找到 workspace_id）：{ws}")
-        print(f"[{now()}] workspace {label!r} → {ws_id}")
+    # 起角色的全部逻辑在 bring_up_roles()（看板的「拉起 <角色>」共用它）——
+    # 命令行 up 和板子上拉起必须是同一条路，否则 pane 挂了之后两条路的行为会分叉
     print(f"[{now()}] 角色配置已校验：" + "  ".join(
         f"{r}={specs[r].describe()}" for r in started_order(args)))
-
-    started: dict[str, str] = {}
-    tabs_of: dict[str, str] = {}
-    used: dict[str, str] = {}
-    identity_of: dict[str, str] = {}
-    for role in started_order(args):
-        if existing and role in live:
-            started[role] = live[role]      # 复用已有 pane，不重复起
-            agent_rec = live_roles.get(role) or {}
-            if agent_rec.get("tab_id"):
-                tabs_of[role] = agent_rec["tab_id"]
-            elif (proto.dir / "session.json").exists():
-                old_tab = (_read_json(proto.dir / "session.json").get("tabs") or {}).get(role)
-                if old_tab:
-                    tabs_of[role] = old_tab
-            used[role] = agent_rec.get("agent") or specs[role].describe() or "CLI 默认模型"
-            continue
-        spec = _with_default_model(specs[role])
-        spec = _with_identity(spec, root, label)
-        identity_of[role] = spec.identity   # 记下「这个 pane 带身份起的」→ 见 cmd_reopen
-        print(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
-              flush=True)
-        pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
-        started[role] = pane_id
-        tabs_of[role] = tab_id
-        used[role] = spec.describe() or "CLI 默认模型"
-        print(f"[{now()}]   pane={pane_id} tab={tab_id}")
-
-    # 角色章程：PM 先收到（它是入口），再 TL，最后 dev
-    #
-    # **章程后面必须附一段「现状自检」。** 只投章程的话，重启起来的 agent 是孤儿：
-    # 它不知道这个项目进行到哪、自己欠什么、上一个自己做到哪。只有章程，它会
-    # 从零开始问「所以现在要做什么」—— 而答案就在 .xteam/ 里，它没被告知去读。
-    # 单个 pane 崩了再 `up` 补起时最容易出这个孤儿。
-    fresh = set(started) - set(live) if existing else set(started)
-    for role in ("pm", "tl", "dev"):
-        if role not in started:
-            continue
-        # 复用的老 pane 身份不明（可能是升级前起的、系统提示词里没有身份文件），
-        # 那种情况必须把章程带进对话；新起的 pane 才交给 kind 自己决定。
-        reused = role not in fresh
-        intro = _restart_intro(
-            root, proto, role, specs[role].kind,
-            why=f"你刚被拉起，加入 {label} 项目的三 pane 协作（pm / tl / dev）。",
-            with_charter=True if reused else None)
-        result = herdr.send_initial_prompt(started[role], intro, wait_s=15)
-        if reused or specs[role].kind not in SYSTEM_PROMPT_ARG:
-            what = "章程+现状已投"
-        else:
-            what = "身份+现状已投（章程在系统提示词里）"
-        print(f"[{now()}] {what} {role}：{result}")
-
-    # 记下投进 pane 的是哪一版（章程 + 协议 + 输出规范 + 版本号 + CLI 面），
-    # 之后 status 才能提醒「改了没生效 / 该更新了」
-    _save_sync_state(root)
+    boot = bring_up_roles(root, proto, label, specs)
 
     state = {
         "workspace": label,
-        "workspace_id": ws_id,
+        "workspace_id": boot["ws_id"],
         "project": str(root),
-        "panes": started,
-        "tabs": tabs_of,
-        "agents": used,
+        "panes": boot["started"],
+        "tabs": boot["tabs"],
+        "agents": boot["agents"],
         # 哪些角色的 pane 是「带身份文件起的」（系统提示词里有身份）。
         # cmd_reopen 靠它决定要不要把章程再抄进对话 —— 复用的老 pane 记不进来，
         # 那种 pane 会被当成「没有身份」处理（宁多投一遍，也不让它自己猜）。
@@ -2660,6 +2710,25 @@ def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
     return True, f"已投递 ({cur})"
 
 
+def _board_bring_up(root: Path, proto: Protocol, label: str, role: str) -> tuple[bool, str]:
+    """看板的「拉起 <角色>」：pane 挂了时在板子上直接把它拉回来。
+
+    走 bring_up_roles()（和 `xteam up` 同一条路），并打到工作线程里 ——
+    起 pane + 投章程要几十秒，不能卡住界面。
+    """
+    try:
+        specs = load_roles(root)
+        if role not in specs:
+            return False, f"team.json 里没有角色 {role!r}"
+        out = bring_up_roles(root, proto, label, specs, only=[role], say=lambda *_a, **_k: None)
+        panes = out.get("started") or {}
+        if role in panes and panes[role]:
+            return True, f"已拉起 {role}（pane={panes[role]}）"
+        return False, f"{role} 没有起来（可能已在跑）"
+    except Exception as exc:                          # noqa: BLE001
+        return False, str(exc)
+
+
 def cmd_board(args: argparse.Namespace) -> int:
     """全屏看板：顶 title ｜ 左：笔记/输入 ｜ 中：三角色 ｜ 右：spec 档案 ｜ 底：状态。
 
@@ -2697,6 +2766,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         collector=lambda: _board_state(root, proto, herdr, label, role_map, tracker),
         dispatcher=lambda role, msg: _board_dispatch(root, proto, herdr, role_map, role, msg),
         qa_runner=lambda name: _board_run_qa(root, name, args.workspace),
+        bring_up=lambda role: _board_bring_up(root, proto, label, role),
         rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
@@ -4707,6 +4777,13 @@ def main() -> int:
     p.add_argument("query")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("wiki", help="翻 wiki 沉淀（默认看最近的几条 → show 读全文）")
+    p.add_argument("wiki_action", nargs="?", default="tail",
+                   choices=["tail", "list", "show"], help="tail 最近 / list 全部 / show 读一份")
+    p.add_argument("target", nargs="?", default="", help="show 的文件名（可只写片段）")
+    p.add_argument("--limit", type=int, default=5, help="tail 时看几个文件/几条")
+    p.set_defaults(func=cmd_wiki)
 
     p = sub.add_parser("note", help="往 wiki 追加一条决策/教训/约定")
     p.add_argument("kind", choices=["decisions", "lessons", "conventions"])

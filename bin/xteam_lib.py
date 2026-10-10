@@ -4145,6 +4145,67 @@ def _spec_first_line(path: Path, width: int = 48) -> str:
     return ""
 
 
+def doc_files_in(task_dir: Path, max_bytes: int = 200_000) -> list[Path]:
+    """一个切片目录里值得看的文档（按可读性排序）。
+
+    不只是 spec.md —— request.md（当时怎么说的）、closed.md（怎么收的）、
+    verdict.json（谁拍的板）同样是记忆。太大的文件（如截图）跳过。
+    """
+    if not task_dir.is_dir():
+        return []
+    order = ("spec.md", "request.md", "README.md", "plan.md", "touches.json",
+             "delivered.json", "verdict.json", "closed.md")
+    out: list[Path] = []
+    for name in order:
+        p = task_dir / name
+        if p.is_file():
+            try:
+                if p.stat().st_size <= max_bytes:
+                    out.append(p)
+            except OSError:
+                pass
+    # 目录里还有别的 .md，也让人翻到（不猜顺序，按名字）
+    for p in sorted(task_dir.glob("*.md")):
+        if p not in out:
+            try:
+                if p.stat().st_size <= max_bytes:
+                    out.append(p)
+            except OSError:
+                pass
+    return out
+
+
+def project_doc_files(root: Path, wiki_limit: int = 5) -> list[Path]:
+    """项目级文档：README / 协议 / 队列 / 结项报告 + 最近的 wiki 笔记。
+
+    wiki 就是「存为 note」落下去的地方 —— 存了要能翻回来，否则那个按钮是黑洞。
+    """
+    xdir = root / XTEAM_DIRNAME
+    out: list[Path] = []
+    for p in (root / "README.md", xdir / "PROTOCOL.md", xdir / "QUEUE.md",
+              xdir / "REPORT.md"):
+        if p.is_file():
+            out.append(p)
+    try:
+        wfiles = sorted(wiki_files(root), reverse=True)
+    except Exception:                       # noqa: BLE001
+        wfiles = []
+    out.extend(wfiles[:wiki_limit])
+    return out
+
+
+def read_doc(path: Path, max_lines: int = 4000) -> tuple[str, list[str]]:
+    """读一份文档给翻阅层用。返回 (标题, 行)。空/读不了都要说清楚。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"{path.name} 读不了", [f"（{exc}）"]
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[:max_lines] + [f"… 后面还有 {len(text.splitlines()) - max_lines} 行没显示"]
+    return path.name, lines
+
+
 def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
     """翻开一片闭合切片的 spec 全文。返回 (标题, 行)。
 
@@ -4169,7 +4230,7 @@ def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
 def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                   role_map: dict, refresh_secs: float = 2.0,
                   collector=None, dispatcher=None, qa_runner=None,
-                  rotator=None, note_writer=None) -> bool:
+                  rotator=None, note_writer=None, bring_up=None) -> bool:
     """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
 
     **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
@@ -4186,4 +4247,4 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                                  refresh_secs=refresh_secs,
                                  collector=collector, dispatcher=dispatcher,
                                  qa_runner=qa_runner, rotator=rotator,
-                                 note_writer=note_writer)
+                                 note_writer=note_writer, bring_up=bring_up)

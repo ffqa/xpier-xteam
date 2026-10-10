@@ -4568,7 +4568,7 @@ def test_fullscreen_board_tui() -> None:
         if str(_cli_dir) not in sys.path:
             sys.path.insert(0, str(_cli_dir))
         import xteam_board
-        from textual.widgets import Label, ListView, Static, TextArea
+        from textual.widgets import Button, Label, ListView, Static, TextArea
     except ImportError as exc:
         print(f"  ⊘ 跳过：textual 不可用（{exc}）—— 全屏看板组不参与判定")
         return
@@ -4577,11 +4577,13 @@ def test_fullscreen_board_tui() -> None:
         "title": "t", "label": "demo",
         "roles": [
             {"role": "pm", "status": "working", "held": "12m", "owes": "next-slice",
-             "where": "console +14", "box": "empty", "activity_title": "正在写 next-slice 的 spec"},
+             "where": "console +14", "box": "empty", "pane": "p1",
+             "activity_title": "正在写 next-slice 的 spec"},
             {"role": "tl", "status": "blocked", "held": "3m", "owes": "verdict",
-             "where": "auth-api", "box": "draft", "activity_title": ""},
+             "where": "auth-api", "box": "draft", "pane": "p2", "activity_title": ""},
             {"role": "dev", "status": "done", "held": "8m", "owes": "implement",
-             "where": "login-api", "box": "prompt", "activity_title": "正在实现 login-api"},
+             "where": "login-api", "box": "prompt", "pane": "p3",
+             "activity_title": "正在实现 login-api"},
         ],
         "alerts": ["⚠ tl 停在选择框上（等你答，不是做完）"],
         "slices": [{"name": "login-api", "stage": "implement", "note": "在飞"}],
@@ -4592,17 +4594,22 @@ def test_fullscreen_board_tui() -> None:
         "queue": [],
     }
 
+    HOLDER = {"st": STATE}
     tmp = Path(tempfile.mkdtemp())
     try:
         spec_dir = tmp / ".xteam" / "tasks" / "auth-api"
         spec_dir.mkdir(parents=True)
         (spec_dir / "spec.md").write_text(
             "# auth-api\n\nauth-api 的规范第一行\n细节二\n", encoding="utf-8")
+        (spec_dir / "request.md").write_text("需求：登录\n", encoding="utf-8")
+        (tmp / ".xteam" / "PROTOCOL.md").write_text("# 协议\n", encoding="utf-8")
+        (tmp / "README.md").write_text("# 项目说明\n", encoding="utf-8")
 
         class _Proto:
             dir = tmp / ".xteam"
 
         SENT: list = []
+        CALLED: list = []
 
         def _disp(role, msg):
             SENT.append((role, msg))
@@ -4610,11 +4617,12 @@ def test_fullscreen_board_tui() -> None:
 
         app = xteam_board.BoardApp(
             root=tmp, proto=_Proto(), herdr=None, label="demo", role_map={},
-            refresh_secs=0.05, collector=lambda: STATE,
+            refresh_secs=0.05, collector=lambda: HOLDER["st"],
             dispatcher=_disp,
             qa_runner=lambda name: (True, "冷读完 120 字"),
             rotator=lambda role: (True, "已轮换"),
-            note_writer=lambda note: tmp / "note.md")
+            note_writer=lambda note: tmp / "note.md",
+            bring_up=lambda role: (CALLED.append(role), (True, f"已拉起 {role}"))[1])
 
         async def _drive():
             async with app.run_test(size=(120, 40)) as pilot:
@@ -4648,25 +4656,55 @@ def test_fullscreen_board_tui() -> None:
                 await pilot.pause()
                 check("Enter 翻开选中的那片", len(app.screen_stack) > 1, True)
                 top = app.screen_stack[-1]
-                body = getattr(top.query_one("#spec_body", Static), "_Static__content", None)
-                check("没有 spec.md 的片如实说没有",
-                      "这一片没有留下 spec.md" in _plain(body), True)
+                # 选中的是第二片（board-nav，fixture 里没有 spec）——
+                # 目录里剩下的是项目文档，正文照样给得出东西
+                check("翻开的是文档目录（不只 spec）",
+                      len(app.screen_stack[-1].query("#docs_list ListItem")) >= 1, True)
+                body = _plain(getattr(
+                    app.screen_stack[-1].query_one("#docs_body", Static),
+                    "_Static__content", None))
+                check("没有 spec 的片也有东西可看（项目文档顶上）",
+                      "项目说明" in body or "协议" in body, True)
+                await pilot.press("j")
+                await pilot.pause()
+                body2 = _plain(getattr(
+                    app.screen_stack[-1].query_one("#docs_body", Static),
+                    "_Static__content", None))
+                check("目录里能换到下一篇", body2 != body, True)
                 await pilot.press("escape")
                 await pilot.pause()
-                await pilot.press("k")           # 回到第一片（auth-api，fixture 有 spec）
+                # 选回第一片（auth-api，有 spec）再翻开，正文必须是 spec
+                await pilot.press("k")
                 await pilot.pause()
                 check("k 回到第一片", app.archive_idx, 0)
                 await pilot.press("enter")
                 await pilot.pause()
+                body3 = _plain(getattr(
+                    app.screen_stack[-1].query_one("#docs_body", Static),
+                    "_Static__content", None))
+                check("有 spec 的片第一篇就是 spec 正文",
+                      "auth-api 的规范第一行" in body3, True)
+                await pilot.press("escape")
+                await pilot.pause()
+                # 项目文档 / wiki 笔记也要能翻（「存为 note」的归宿）
+                app.action_open_project_docs()
+                await pilot.pause()
                 top = app.screen_stack[-1]
-                body = getattr(top.query_one("#spec_body", Static), "_Static__content", None)
-                check("有 spec 的片翻开就是正文",
-                      "auth-api 的规范第一行" in _plain(body), True)
+                names = [str(i.query_one(Label).render()) for i in top.query("#docs_list ListItem")]
+                check("项目文档层列出 README 等", any("README" in n for n in names), True)
+                await pilot.press("escape")
+                await pilot.pause()
                 check("长告警折行而不是被截断",
                       any("告诉你" in l or "去它的 pane" in l for l in app.status_text_lines)
                       or "停在选择框上" in _plain(app.alerts_text), True)
                 await pilot.press("escape")
                 await pilot.pause()
+                # 左栏按钮：推给/存 note 并排，外部评审单独一个
+                row = app.query_one("#row_actions")
+                btns = list(row.query(Button))
+                check("推给/存 note 并排放", len(btns) == 2
+                      and btns[0].size.width < row.size.width, True)
+                check("外部评审是独立按钮", app.query_one("#qa", Button) is not None, True)
                 # 左边写笔记 → 推给当前角色（tl）
                 app.query_one("#note", TextArea).text = "先做登录，别碰支付"
                 await pilot.click("#push")
@@ -4681,6 +4719,18 @@ def test_fullscreen_board_tui() -> None:
                 await pilot.click("#card_dev")
                 await pilot.pause()
                 check("鼠标点卡后目标是 dev", app._target(), "dev")
+                # pane 挂了的卡：点它 = 一键拉起（不是切目标）
+                CALLED.clear()
+                STATE["roles"][1]["pane"] = ""
+                HOLDER["st"] = STATE
+                await asyncio.sleep(0.4)
+                tl_card = app.query_one("#card_tl", Static)
+                check("pane 挂了的卡有 dead 标识", "dead" in tl_card.classes, True)
+                check("副标题说明点它拉起", "拉起" in str(tl_card.border_subtitle), True)
+                await pilot.click("#card_tl")
+                await pilot.pause()
+                await asyncio.sleep(0.4)
+                check("点挂掉的卡把它拉回来", CALLED, ["tl"])
                 # 外部评审
                 cmd = app.query_one("#cmd")
                 cmd.focus()
