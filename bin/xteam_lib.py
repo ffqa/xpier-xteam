@@ -4107,3 +4107,60 @@ def alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError, ValueError):
         return False
+
+
+def _spec_first_line(path: Path, width: int = 48) -> str:
+    """spec 的第一句有内容的行（跳过 H1 —— 多半是切片名，和列表里重复）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s[:width]
+    return ""
+
+
+def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
+    """翻开一片闭合切片的 spec 全文。返回 (标题, 行)。
+
+    闭合切片不走 `.xteam/closed/` —— 协议里闭合判据就是 `tasks/<片>/closed.md`
+    存在（`_is_closed`），所以整份目录连同 spec.md 一起留在 tasks/ 下。
+    读不到 spec.md 时退回目录里有的一切，并如实说 spec 不在。
+    """
+    spec = task_dir / "spec.md"
+    if spec.is_file():
+        try:
+            lines = spec.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            return f"{name} · spec.md 读不了", [f"（{exc}）"]
+        return f"spec · {name}", lines
+    others = sorted(p.name for p in task_dir.iterdir()) if task_dir.is_dir() else []
+    return f"{name} · 没有 spec.md", (
+        ["（这一片没有留下 spec.md）", ""] + [f"目录里只有：{n}" for n in others] or ["（目录也是空的）"])
+
+
+# ---------------------------------------------------------------- 全屏看板（textual）
+
+def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
+                  role_map: dict, refresh_secs: float = 2.0,
+                  collector=None, dispatcher=None, qa_runner=None,
+                  rotator=None, note_writer=None) -> bool:
+    """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
+
+    **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
+    textual；这里包一层 try，装不上的机器上 board 给一句「pip install textual」，
+    其余子命令照常（xteam_lib 本身零三方依赖，这条不能破）。
+    """
+    if collector is None or dispatcher is None:
+        return False
+    try:
+        import xteam_board
+    except ImportError:
+        return False
+    return xteam_board.run_board(root, proto, herdr, label, role_map,
+                                 refresh_secs=refresh_secs,
+                                 collector=collector, dispatcher=dispatcher,
+                                 qa_runner=qa_runner, rotator=rotator,
+                                 note_writer=note_writer)

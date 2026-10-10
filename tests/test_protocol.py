@@ -4549,6 +4549,148 @@ def test_kanban_board_renderer() -> None:
     check("彩色看板包含 ANSI 转义序列", "\033[" in frame_color, True)
 
 
+def test_fullscreen_board_tui() -> None:
+    """[101] 全屏看板（textual）：五大区域、Tab 切目标的明显标识、档案翻 spec。
+
+    **textual 没装的机器上整组跳过并明说** —— 不假装通过，也不让门禁因为一个
+    可选的界面依赖而红。装了就跑真 App（textual 的 Pilot），断言的都是用户能看
+    到的东西：区域在不在、标识跟不跟着目标走、Enter 翻开的是不是选中那片。
+    """
+    print("\n[101] 全屏看板 TUI（textual ·  Pilot 驱动）")
+
+    def _plain(rich_text) -> str:
+        return rich_text.plain if rich_text is not None else ""
+
+    try:
+        import asyncio
+        from pathlib import Path as _P
+        _cli_dir = _find_cli().parent
+        if str(_cli_dir) not in sys.path:
+            sys.path.insert(0, str(_cli_dir))
+        import xteam_board
+        from textual.widgets import Label, ListView, Static, TextArea
+    except ImportError as exc:
+        print(f"  ⊘ 跳过：textual 不可用（{exc}）—— 全屏看板组不参与判定")
+        return
+
+    STATE = {
+        "title": "t", "label": "demo",
+        "roles": [
+            {"role": "pm", "status": "working", "held": "12m", "owes": "next-slice",
+             "where": "console +14", "box": "empty", "activity_title": "正在写 next-slice 的 spec"},
+            {"role": "tl", "status": "blocked", "held": "3m", "owes": "verdict",
+             "where": "auth-api", "box": "draft", "activity_title": ""},
+            {"role": "dev", "status": "done", "held": "8m", "owes": "implement",
+             "where": "login-api", "box": "prompt", "activity_title": "正在实现 login-api"},
+        ],
+        "alerts": ["⚠ tl 停在选择框上（等你答，不是做完）"],
+        "slices": [{"name": "login-api", "stage": "implement", "note": "在飞"}],
+        "closed": [
+            {"name": "auth-api", "time": "10-10 14:00", "verdict": "PASS", "title": "授权与登录流程"},
+            {"name": "board-nav", "time": "10-09 09:02", "verdict": "FAIL", "title": "看板导航"},
+        ],
+        "queue": [],
+    }
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        spec_dir = tmp / ".xteam" / "tasks" / "auth-api"
+        spec_dir.mkdir(parents=True)
+        (spec_dir / "spec.md").write_text(
+            "# auth-api\n\nauth-api 的规范第一行\n细节二\n", encoding="utf-8")
+
+        class _Proto:
+            dir = tmp / ".xteam"
+
+        SENT: list = []
+
+        def _disp(role, msg):
+            SENT.append((role, msg))
+            return True, "已送达 working"
+
+        app = xteam_board.BoardApp(
+            root=tmp, proto=_Proto(), herdr=None, label="demo", role_map={},
+            refresh_secs=0.05, collector=lambda: STATE,
+            dispatcher=_disp,
+            qa_runner=lambda name: (True, "冷读完 120 字"),
+            rotator=lambda role: (True, "已轮换"),
+            note_writer=lambda note: tmp / "note.md")
+
+        async def _drive():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                for wid in ("#top", "#left", "#middle", "#right", "#status"):
+                    check(f"区域在：{wid}", app.query(wid).first() is not None, True)
+                check("三角色各一张卡", len(list(app.query(".role_card"))) == 3, True)
+                check("默认目标只有一张", len(list(app.query(".role_card.target"))) == 1, True)
+                check("目标卡写明 ◀ 发送目标",
+                      "◀ 发送目标" in _plain(app._card_texts.get("pm")), True)
+                # Tab 切角色：标识必须跟着走（用户明确要求「有明显标识」）
+                await pilot.press("tab")
+                await pilot.pause()
+                tl = list(app.query(".role_card.target"))
+                check("Tab 后目标换成另一张卡", len(tl) == 1 and tl[0].id == "card_tl", True)
+                check("新目标卡同样写明 ◀ 发送目标",
+                      "◀ 发送目标" in _plain(app._card_texts.get("tl")), True)
+                # 档案：列出 + j/k 选 + Enter 翻开选中的那片
+                lv = app.query_one("#archive", ListView)
+                lv.focus()
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                check("k 在档案里选到前一片", app.archive_idx, 1)
+                await pilot.press("enter")
+                await pilot.pause()
+                check("Enter 翻开选中的那片", len(app.screen_stack) > 1, True)
+                top = app.screen_stack[-1]
+                body = getattr(top.query_one("#spec_body", Static), "_Static__content", None)
+                check("没有 spec.md 的片如实说没有",
+                      "这一片没有留下 spec.md" in _plain(body), True)
+                await pilot.press("escape")
+                await pilot.pause()
+                await pilot.press("j")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                top = app.screen_stack[-1]
+                body = getattr(top.query_one("#spec_body", Static), "_Static__content", None)
+                check("有 spec 的片翻开就是正文",
+                      "auth-api 的规范第一行" in _plain(body), True)
+                await pilot.press("escape")
+                await pilot.pause()
+                # 左边写笔记 → 推给当前角色（tl）
+                app.query_one("#note", TextArea).text = "先做登录，别碰支付"
+                await pilot.click("#push")
+                await pilot.pause()
+                for _ in range(40):
+                    await asyncio.sleep(0.05)
+                    if SENT:
+                        break
+                check("笔记被推给当前角色", bool(SENT) and SENT[-1][1] == "先做登录，别碰支付", True)
+                check("推的是当前目标", bool(SENT) and SENT[-1][0] == "tl", True)
+                # 鼠标点角色卡 = 切目标
+                await pilot.click("#card_dev")
+                await pilot.pause()
+                check("鼠标点卡后目标是 dev", app._target(), "dev")
+                # 外部评审
+                cmd = app.query_one("#cmd")
+                cmd.focus()
+                await pilot.pause()
+                cmd.value = ":qa auth-api"
+                await pilot.press("enter")
+                await pilot.pause()
+                for _ in range(40):
+                    await asyncio.sleep(0.05)
+                    if "外部评审" in app.status_text:
+                        break
+                check(":qa 跑了外部评审", "外部评审" in app.status_text, True)
+                check("链路告警在状态区", "停在选择框上" in _plain(app.alerts_text), True)
+
+        asyncio.run(_drive())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -4652,6 +4794,7 @@ def main() -> int:
         test_auto_rotate_and_cold_review,
         test_interactive_board_console,
         test_kanban_board_renderer,
+        test_fullscreen_board_tui,
     ):
         fn()
     print()

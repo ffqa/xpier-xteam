@@ -156,55 +156,39 @@ dev 交付完只能干等（本仓 24 片实测：这段每片 3–12m、中位 
 `xteam stats` 里的**重叠命中**（冻结窗口内另有片在写）是「解锁有没有真的生效」的唯一
 证据 —— 全局冻结下它恒为 0。
 
-## 看板：谁在干什么、链路为什么不动
+## 看板：一屏看清谁在干什么
 
-`xteam status` 是一次快照；`xteam board`（或裸敲 `xteam`）是常驻视图（默认 2 秒刷新，
-`--once` 只打一屏，管道里自动不上色）。它渲染的是**同一份事实**（`.xteam/` + pane 现状）：
+`xteam status` 是一次快照；`xteam board`（或裸敲 `xteam`）是常驻全屏界面 —— 五个区：
 
 ```
- xteam Board [android_dev]   pm: working 12m · tl: blocked 3m10s · dev: done 8m   Updated 14:40
-
- ── 链路（为什么不动）──            ← 只有真有事时才出现
- ⚠ tl 停在选择框上（等你答，不是做完）—— 去它的 pane 里选（Space 切换 / Enter 确认）
-
- ── 角色（真实状态）──
- pm   working  12m      正在写 next-slice 的 spec
-         欠 next-slice @ console +14 · 输入框空
- tl   blocked  3m10s
-         欠 none · ✍ 输入框有草稿（门铃投不进去）
- dev  done     8m        正在实现 login-api
-         欠 implement @ login-api · ⚠ 停在选择框上（等它答）
-
- ── spec 档案（已闭合 · j/k 选 · Enter 翻阅）──
- ▶ 10-09 19:30 PASS  auth-api    授权与登录流程
-   10-08 11:02 PASS  board-nav  看板交互导航
-
- ── 在飞（未闭合）──
-   login-api                [implement]  在飞  dev:implement
+╭ xteam Board · android_dev ── pm working 12m · tl blocked 3m · dev done 8m ─╮
+┌─ 笔记 / 安排 ────────┐ ┌─ pm ◀ 发送目标 ─────────┐ ┌─ spec 档案 ─────────┐
+│ 在这里想事情、排任务  │ │ working  12m            │ │ ▶ 10-09 PASS auth- │
+│                      │ │ 正在写 next-slice 的 spec│ │   10-08 PASS board…│
+│ 先做登录，别碰支付    │ │ 欠 next-slice @ console │ │                    │
+│ [推给当前角色][存note]│ │ 输入框空                │ │ Enter 翻开 spec 全文│
+│ :qa <切片> …         │ ├─ tl  blocked 3m ────────┤ │ j/k 选 · Esc 合上  │
+│                      │ │ ✍ 输入框有草稿           │ │                    │
+│                      │ ├─ dev done 8m ──────────┤ │                    │
+│                      │ │ 欠 implement @ login-api│ │                    │
+└──────────────────────┘ └─────────────────────────┘ └────────────────────┘
+╰ 状态：✓ 已推给 pm ｜ ⚠ 链路：tl 停在选择框上（等你答）                    ╯
 ```
 
-两件事是刻意的：
+- **角色状态是 herdr 的真状态**（`agent_status` / 输入框状态 / 协议债务），不是把 pane
+  日志搬上屏。要看某个 agent 在打什么，去它那个 pane。
+- **`Tab` 或鼠标点卡切目标角色**：目标卡重边框 + 反亮 + `◀ 发送目标`，顶栏同步打 `◀`。
+- **左侧就是「思考 → 安排 → 推给 PM」**：写完点「推给当前角色」一句话门铃过去，
+  或「存为 note」沉淀成 wiki 记忆。
+- **右侧 spec 档案**：闭合切片整份留在 `.xteam/tasks/<片>/`（`closed.md` 在就是闭合），
+  `Enter` 翻开 spec 全文（j/k 滚行 · Ctrl+F/B 翻页 · g/G 顶末）。既是规范，也是记忆。
+- **` :qa <切片>`** 唤起外部冷读（与 `xteam qa run` 同一条路，结论门铃 PM）；
+  **`:rotate <角色>`** 换会话；**`:q` / Ctrl+Q** 退出。
+- 没装 textual / 不是 tty / `--once` / `--kanban`：退回标准库静态渲染（角色视图或
+  --kanban 的 5 泳道瀑布）。装 textual：`python3 -m pip install --user textual`。
 
-1. **角色状态是 herdr 的真状态，不是日志**。`agent_status` / 输入框状态 / 协议债务，
-   没有把 pane 输出搬上屏幕。要看某个 agent 在打什么，去它那个 pane。
-2. **闭合切片整份留在 `.xteam/tasks/<片>/`**（`closed.md` 在就是闭合），spec 随时翻 —
-   既是规范，也是这个项目的记忆。
-
-交互控制台（默认角色视图；`--kanban` 切 5 泳道瀑布）：
-
-| 键 / 命令 | 作用 |
-|---|---|
-| `Esc` | 进 / 出 spec 档案态 |
-| `j` `k`（`↑` `↓`） | 档案里选片；翻阅 spec 时滚页 |
-| `Enter` | 翻开选中片的 spec 全文（`Ctrl+F/B` 翻页 · `g/G` 顶/末 · `Esc` 合上） |
-| `Tab` / `Enter` | 切目标角色 / 发送消息（`Tab` 后直接打字即可） |
-| `:qa <切片>` | 唤起外部冷读（和 `xteam qa run` 同一条路），结论门铃 PM |
-| `:reviewer <话>` | 派活给独立 reviewer（没在跑会提示 `xteam up --reviewer`） |
-| `:rotate <角色>` · `:r` · `:q` | 轮换会话 · 立即刷新 · 退出 |
-
-**看板不改协议状态**：除了指令控制台替人投门铃（v0.2.8 起就有）和 `:qa` 调一次外部
-评审（与命令行等价），它不写任何状态文件 —— 「状态是文件，不是看板」这条不变。
-窄终端（< 70 列）自动从瀑布降级回角色视图。
+两件事没变：**看板不新增事实来源**（状态只在 `.xteam/` 与 pane 里），**`verdict.json`
+仍只有 PM 一个作者**—— 外部评审只是给 PM 多一个视角。
 
 ## 升级 xteam 之后，正在跑的 agent 怎么跟上
 

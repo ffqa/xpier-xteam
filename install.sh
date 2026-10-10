@@ -62,6 +62,23 @@ preflight() {
     || die "python3 $PYV 太低，需要 3.9+"
   say "  python3 $PYV ✓"
 
+  # 全屏看板（`xteam board` 的默认交互界面）跑在 textual 上。**只有 board 用它** ——
+  # 其余子命令仍是纯标准库，没有这个包也照常跑，board 会给人话提示而不是 traceback。
+  # 装不上不阻断安装：离线机器上 xteam 的其余功能完整可用。
+  if python3 -c 'import textual' 2>/dev/null; then
+    TV=$(python3 -c 'import textual; print(textual.__version__)' 2>/dev/null || echo "?")
+    say "  textual $TV ✓（全屏看板可用）"
+  else
+    echo "  ⚠ 没装 textual —— 全屏看板不可用，其余功能不受影响。"
+    echo "    装上：python3 -m pip install --user textual"
+    if python3 -m pip install --user --quiet --break-system-packages textual >/dev/null 2>&1 \
+       && python3 -c 'import textual' 2>/dev/null; then
+      say "  ✓ 已自动装上 textual（pip --user）"
+    else
+      echo "    （自动安装失败，多半是离线或 PEP 668；装不上也不影响安装继续）"
+    fi
+  fi
+
   command -v herdr >/dev/null 2>&1 \
     || say "  ⚠ 找不到 herdr —— xteam 靠它管 pane/agent，装完也跑不起来"
   [ -d "$SRC/roles" ] || die "源目录不完整：$SRC/roles 不存在"
@@ -152,6 +169,9 @@ check_perms
 chmod 755 "$PREFIX" "$BINDIR" "$SHAREDIR" "$LIBDIR" 2>/dev/null || true
 cp "$SRC/bin/xteam" "$LIBDIR/xteam"
 cp "$SRC/bin/xteam_lib.py" "$LIBDIR/xteam_lib.py"
+# 全屏看板（textual）单独一个模块，由 xteam_lib 懒加载 —— 少了它 board 只会
+# 退回 cbreak 版，人看不出来，所以这里必须一起拷。
+cp "$SRC/bin/xteam_board.py" "$LIBDIR/xteam_board.py"
 chmod +x "$LIBDIR/xteam"
 
 # **目录整体替换，不能 `cp -R src dst`。**

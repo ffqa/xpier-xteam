@@ -41,6 +41,9 @@ from xteam_lib import (  # noqa: E402
     Protocol,
     render_role_board,
     render_kanban_board,
+    run_board_tui,
+    _spec_first_line,
+    _spec_view_lines,
     process_board_keystrokes,
     move_archive_index,
     process_archive_keys,
@@ -2591,38 +2594,6 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
     }
 
 
-def _spec_first_line(path: Path, width: int = 48) -> str:
-    """spec 的第一句有内容的行（跳过 H1 —— 多半是切片名，和列表里重复）。"""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    for line in text.splitlines():
-        s = line.strip()
-        if s and not s.startswith("#"):
-            return s[:width]
-    return ""
-
-
-def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
-    """翻开一片闭合切片的 spec 全文。返回 (标题, 行)。
-
-    闭合切片不走 `.xteam/closed/` —— 协议里闭合判据就是 `tasks/<片>/closed.md`
-    存在（`_is_closed`），所以整份目录连同 spec.md 一起留在 tasks/ 下。
-    读不到 spec.md 时退回目录里有的一切，并如实说 spec 不在。
-    """
-    spec = task_dir / "spec.md"
-    if spec.is_file():
-        try:
-            lines = spec.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            return f"{name} · spec.md 读不了", [f"（{exc}）"]
-        return f"spec · {name}", lines
-    others = sorted(p.name for p in task_dir.iterdir()) if task_dir.is_dir() else []
-    return f"{name} · 没有 spec.md", (
-        ["（这一片没有留下 spec.md）", ""] + [f"目录里只有：{n}" for n in others] or ["（目录也是空的）"])
-
-
 def _board_run_qa(root: Path, slice_name: str, workspace: str | None) -> tuple[bool, str]:
     """看板里的 `:qa <切片>`：跑外部冷读并把结论门铃给 PM。
 
@@ -2690,11 +2661,11 @@ def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
 
 
 def cmd_board(args: argparse.Namespace) -> int:
-    """一屏看板：三角色**真实状态** + spec 档案，链路为什么不动置顶。
+    """全屏看板：顶 title ｜ 左：笔记/输入 ｜ 中：三角色 ｜ 右：spec 档案 ｜ 底：状态。
 
-    默认角色视图；`--kanban` 切 5 泳道瀑布视图（窄终端自动降级回角色视图）。
-    交互控制台：Tab 切角色 · Enter 发送 · Esc 进 spec 档案（j/k 选片 · Enter 翻阅全文）·
-    `:qa <切片>` 唤起外部冷读 · `:reviewer <话>` 派活给独立 reviewer · `:q` 退出。
+    默认全屏 TUI（textual）：鼠标点角色卡切目标、点档案片翻开 spec 全文，Tab 切角色
+    （选中卡片高亮 + ◀ 发送目标），左边写笔记/安排任务、一键推给当前角色。
+    没有 textual / 不是 tty / `--once` / `--kanban` 时退回标准库静态渲染。
     """
     root = Path(args.project).resolve()
     proto = Protocol(root)
@@ -2712,20 +2683,43 @@ def cmd_board(args: argparse.Namespace) -> int:
     color = sys.stdout.isatty() and not args.plain
 
     # 脚本、管道或显式 --once：只读静态打印（默认角色视图，--kanban 输出瀑布）
-    if args.once or not sys.stdin.isatty():
+    if args.once or not sys.stdin.isatty() or getattr(args, "kanban", False):
         state = _board_state(root, proto, herdr, label, role_map, tracker)
         fn = render_kanban_board if getattr(args, "kanban", False) else render_role_board
         frame = fn(state, color=color)
         print(frame)
         return 0
 
+    # 全屏 TUI（textual）。缺依赖时退回 cbreak 版的角色视图 —— 老机器上不该看不到板子。
+    started = run_board_tui(
+        root, proto, herdr, label, role_map,
+        refresh_secs=getattr(args, "interval", 2.0) or 2.0,
+        collector=lambda: _board_state(root, proto, herdr, label, role_map, tracker),
+        dispatcher=lambda role, msg: _board_dispatch(root, proto, herdr, role_map, role, msg),
+        qa_runner=lambda name: _board_run_qa(root, name, args.workspace),
+        rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
+        note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
+    )
+    if not started:
+        _board_cbreak_loop(root, proto, herdr, label, role_map, tracker, args, color)
+    return 0
+
+
+def _board_cbreak_loop(root: Path, proto: Protocol, herdr: "Herdr", label: str,
+                        role_map: dict, tracker: IdleTracker, args, color: bool) -> None:
+    """没有 textual 时的退路：标准库版交互看板（cbreak + 整屏重绘）。
+
+    两条交互路径是刻意的：textual 装在机器上就该享受全屏与鼠标，装不上也不能
+    把人挡在板子外面。逻辑共用同一批纯函数（render_role_board / process_archive_keys）。
+    """
+
     # 交互式 TUI 模式：默认角色视图（真实状态 + spec 档案），--kanban 切瀑布视图
     renderer = render_kanban_board if getattr(args, "kanban", False) else render_role_board
 
-    # 交互式 TUI 模式
     import select
     import termios
     import tty
+
 
     available_roles = [r for r in BOOT_ORDER if r in role_map]
     if not available_roles:
@@ -3021,7 +3015,6 @@ def cmd_board(args: argparse.Namespace) -> int:
         sys.stdout.write("\033[?25h\n")
         sys.stdout.flush()
 
-    return 0
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
