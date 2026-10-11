@@ -1079,6 +1079,13 @@ def process_board_keystrokes(
                 actions.append({"action": "rotate", "role": sub_role})
             elif cmd.startswith(":qa"):
                 actions.append({"action": "qa", "slice": cmd[3:].strip()})
+            elif cmd.startswith(":respawn"):
+                # :respawn <role> [agent] —— pane 挂了想顺便换个 agent 时用
+                # （资源耗光之类的场景，原样拉起来可能还是不够）
+                parts = cmd[9:].split()
+                r_role = parts[0] if parts else ""
+                r_agent = parts[1] if len(parts) > 1 else ""
+                actions.append({"action": "respawn", "role": r_role, "agent": r_agent})
             elif cmd.startswith(":reviewer"):
                 actions.append({"action": "reviewer", "msg": cmd[9:].strip()})
             else:
@@ -4230,7 +4237,8 @@ def _spec_view_lines(task_dir: Path, name: str) -> tuple[str, list[str]]:
 def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                   role_map: dict, refresh_secs: float = 2.0,
                   collector=None, dispatcher=None, qa_runner=None,
-                  rotator=None, note_writer=None, bring_up=None) -> bool:
+                  rotator=None, note_writer=None, bring_up=None,
+                  respawn=None) -> bool:
     """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
 
     **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
@@ -4247,4 +4255,5 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                                  refresh_secs=refresh_secs,
                                  collector=collector, dispatcher=dispatcher,
                                  qa_runner=qa_runner, rotator=rotator,
-                                 note_writer=note_writer, bring_up=bring_up)
+                                 note_writer=note_writer, bring_up=bring_up,
+                                 respawn=respawn)

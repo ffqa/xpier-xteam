@@ -1,6 +1,32 @@
 # 变更记录
 
-## 0.2.20
+## 0.2.21
+
+### 看板细节修整 + `:respawn` 换 agent 重拉 + Kandown 研究
+
+用户实测提的五个问题：
+
+- **按钮太大**：textual 的 `Button` 默认 `height: 3` + `line-pad: 1`，在 30 列里就是三面
+  空白围一个字。压成 `height: 1` + `border: none` + `padding: 0`。顺带发现 `line-pad: 0`
+  **不合法**（只认正整数），踩过一次整个样式表解析失败、板子直接起不来。
+- **`:qa` 报 traceback 且看不清输入**：`_qa_task()` 切片不存在时走 `die()` → `sys.exit()`，
+  而它在**工作线程**里 —— SystemExit 只是让那个线程退出，textual 把 traceback 甩到人眼前。
+  现在接住并换成状态行里的一句人话。命令输入行也压成一行（`Input` 默认高 3 行带边框）。
+- **文档层变成全屏薄框**：原来 88% + `border: thick`，既没铺满又糊着一圈，而且打开后连
+  spec 列表都看不见。现在全屏、无框、左列标题明说「文档（这一片的 + 项目级）· j/k 切换」。
+- **键盘能开文档了**：上轮把 Tab 抢去切角色，副作用是键盘焦点再也去不了档案列表、Enter
+  打不开文档。补 `j/k`（选片）、`o`（翻开这片）、`p`（项目文档/笔记），并把**起始焦点设为
+  档案列表** —— 默认焦点落在 TextArea 上，它会吞掉所有可打印键，那四个键全废。
+- **pane 挂了想换 agent**：新命令 `:respawn <role> [agent]`（走 `xteam swap` 同一条路）。
+  挂掉的卡的副标题也把两条路都写出来：「点卡片拉起 · :respawn <角色> 换 agent」。
+
+另外读了 Kandown 官方文档（Board & views / Data model / For AI agents / Terminal UI /
+Launching agents），写进 `docs/一个PM管N个team.md` §7：它最值得抄的四条（一任务一文件无
+索引 / 三界面共用同一份门禁实现 / agent 是看板的另一个用户且 stdout 只出数据 / 每个 agent
+有自己的启动形状）、两条启发、三条不抄（Web daemon、可拖拽列），以及对 N-team 设计的三点
+修正（切片加 team+assignee+ownerType / 冻结粒度降到组 / `xteam work --team`）。
+
+门禁：静态 ✓ · 单测 ✓ · e2e 369/369 ✓
 
 ### 看板交互补齐：外部评审独立按钮、按钮并排、文档不止 spec、pane 挂了能一键拉起、笔记能翻回来
 

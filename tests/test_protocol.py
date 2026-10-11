@@ -4627,6 +4627,10 @@ def test_fullscreen_board_tui() -> None:
         async def _drive():
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.pause()
+                # 起始焦点必须在档案列表，不能是笔记区：TextArea 会吞掉所有可打印键，
+                # 那样 j/k/o/p 全废（textual 默认聚焦第一个可聚焦控件，而那是它）
+                check("起始焦点在档案列表（不是笔记区）",
+                      getattr(app.focused, "id", None), "archive")
                 for wid in ("#top", "#left", "#middle", "#right", "#status"):
                     check(f"区域在：{wid}", app.query(wid).first() is not None, True)
                 check("三角色各一张卡", len(list(app.query(".role_card"))) == 3, True)
@@ -4715,6 +4719,23 @@ def test_fullscreen_board_tui() -> None:
                         break
                 check("笔记被推给当前角色", bool(SENT) and SENT[-1][1] == "先做登录，别碰支付", True)
                 check("推的是当前目标", bool(SENT) and SENT[-1][0] == "tl", True)
+                # 键盘路径：Tab 抢占了焦点键，档案操作靠 j/k/o/p
+                await pilot.press("j")
+                await pilot.pause()
+                check("j 选下一片", app.archive_idx, 1)
+                await pilot.press("k")
+                await pilot.pause()
+                check("k 选回上一片", app.archive_idx, 0)
+                await pilot.press("o")
+                await pilot.pause()
+                check("o 翻开这片文档", len(app.screen_stack) > 1, True)
+                await pilot.press("escape")
+                await pilot.pause()
+                await pilot.press("p")
+                await pilot.pause()
+                check("p 翻开项目文档/笔记", len(app.screen_stack) > 1, True)
+                await pilot.press("escape")
+                await pilot.pause()
                 # 鼠标点角色卡 = 切目标
                 await pilot.click("#card_dev")
                 await pilot.pause()

@@ -66,3 +66,62 @@
 
 值得做，但**排在「独立录入界面（notes → 推给 PM）」之后**：那个界面决定「需求从哪来」，
 它没定之前，N 组并行只是把「人等 PM」变成「PM 等需求」，并行度再高也空转。
+
+---
+
+## 7. Kandown（kander）研究笔记（2026-10-11，读了官方文档四篇）
+
+用户点名要「深度学习 kander」。搜到两个同名候选，读的是 **Kandown**（kandown.dev；
+另一个是 kanban.rs 的 `kanban`，纯 TUI + MCP，形状相近）。读的四篇：Board & views、
+Data model、For AI agents、Terminal UI / Launching agents。
+
+### 7.1 它最值得抄的四条
+
+1. **一个任务一个文件，没有索引** —— `tasks/t1.md` 带 frontmatter，目录 listing **就是**
+   board 状态。三条不变量写在文档里：状态只在 `tasks/*.md`；依赖门禁 / 解析器 / daemon
+   **各只有一份实现**，被 Web UI、终端 UI、CLI 三个界面共用；归档是移动不是删除。
+   → xteam 已经是这个形状（`.xteam/tasks/<slice>/`，闭合不删）。**N 组也不能破它**：
+   加 `team` 字段，不加新索引文件。
+2. **agent 是看板的另一个用户，不是集成** —— `kandown work` 一条命令吐出确定的上下文文档；
+   **stdout 只出数据**（✓ Created… 全走 stderr），退出码有意义，所以 `$(kandown create …)`
+   拿到的东西永远干净。
+   → xteam 的 `whoami` 就是它的 `work`。N 组之后要 `xteam whoami --team a`。另外
+   **「stdout 只出数据」这条值得全项目学** —— 现在 `xteam status` 的表格混着装饰输出。
+3. **依赖门禁从任何界面都拦** —— 「agent 不能把依赖未满足的任务挪到终栏」。门禁是共享代码，
+   不是某个界面的规则。
+   → xteam 的 `verdict.json` 单作者 + `STAGE_FILES` 就是门禁，已在协议层。N 组时它必须
+   还是**协议层的一段代码**，绝不能变成 board 里的 if/else。
+4. **每个 agent 有自己的启动形状**（交互式会话 / 一次性 prompt / 上下文写 /tmp），而且
+   **只列 PATH 上存在的**。
+   → xteam 已有 `_boot_role` + `ONESHOT_VERIFIED`。N 组里「哪个 agent 能无人值守跑」
+   会决定一组能不能真并行 —— 这张表要变成显式的（`xteam agents` 里标 `unattended`）。
+
+### 7.2 它启发、但我们该走自己的路的两条
+
+- **agent hook（按 `g` 把任务 POST 到你自己的编排器）**。xteam 的对应物不是 webhook，是
+  `xteam say --team a dev "…"`（门铃直投）。**但这条给出了「PM 怎么把活交给一组」的最小
+  形状：一个显式的投递动作 + 一条可回放的记录** —— 现在 doorbell.log 就是。
+- **`report:` 行把完成的任务变成工作日志**，并在 UI 里显著渲染。xteam 的对应物就是闭合切片
+  里的 spec / delivered / verdict —— 看板刚补的「翻开这一片全部文档」正是干这个。
+
+### 7.3 明确不抄的
+
+- **Web daemon + 浏览器看板**：多一个常驻服务、一个端口、一份 token 管理。终端看板 + 文件
+  协议已经覆盖使用场景，抄它等于把「状态是文件」这条底线换成「状态是 daemon 的缓存」。
+- **可拖拽的列**：3 个角色下没有「拖」的必要（v0.2.17 的结论），kander 有价值是因为它的
+  列是用户自定义的。
+
+### 7.4 对 N-team 设计的三点修正
+
+1. **切片上加 `team` + `assignee` + `ownerType`**（对齐 kander 的 assignee/ownerType），
+   派组这件事从「PM 口头说」变成「文件里的一行」，board 按 ownerType 过滤「人的活 vs agent 的活」。
+2. **门禁仍是一个 PM 一个 verdict**，但**冻结粒度降到组**：A 组待判不冻 B 组，只冻 touches
+   冲突的片。这把并行度上限暴露成 `1/(PM gate 时长)`，并逼出下一个议题：多 PM。
+3. **`xteam work --team <组>`** 作为每组 agent 的唯一上下文入口（对齐 `kandown work`），
+   这样「一个 PM 盯 N 组」才有便宜的读法：PM 读 N 份摘要，细节按需。
+
+### 7.5 判断不变
+
+仍然建议**先做独立录入界面**：kander 的前提是「任务从哪来」有一个明确的入口（`n` 新建、
+`a` 派给 agent）。我们没有这个入口之前，N 组只是并行地等需求。
+

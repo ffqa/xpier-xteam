@@ -72,6 +72,7 @@ class DocsScreen(ModalScreen):
         with Horizontal(id="docs_dialog"):
             with Vertical(id="docs_left"):
                 yield Label(self._title, id="docs_title")
+                yield Label("文档（这一片的 + 项目级）· j/k 切换", id="docs_sub")
                 yield ArchiveList(id="docs_list")
             with Vertical(id="docs_right"):
                 with VerticalScroll(id="docs_body_scroll"):
@@ -133,20 +134,26 @@ class BoardApp(App):
     #top { height: 3; }
     #body { height: 1fr; }
     /* 宽度分配：中间是主角（三角色），左右是辅助。右侧档案行短，不需要 46 列。 */
+    /* 左栏：一行一行的紧凑排布。 Button 默认 height 3 + line-pad 1，
+       在 30 列里就是三面空白围一个字 —— 按钮因此看起来巨大。全部压成一行。 */
     #left { width: 30; border: round $primary; padding: 0 1; }
     #left Label { margin: 0 0 1 0; }
-    #note { height: 1fr; border: none; }
-    /* 推给/存 note 并排，外部评审单独一整行（它是重动作，要点名切片）。
-       min-width: 0 是必须的：Button 默认 min-width 16，两个并排要 32 列，
-       而左栏内里只有 26 —— 不归零的话第二个按钮直接溢出到中栏去。 */
+    /* 笔记区要「看起来是能写字的地方」—— 给个框。同时限高：1fr 会把下面的
+       命令输入行挤出屏幕（左栏里它排最后）。 */
+    #note { height: 1fr; min-height: 6; max-height: 16;
+            border: round $panel; padding: 0 1; }
     #row_actions { height: auto; }
-    #row_actions Button { width: 1fr; min-width: 0; height: 3;
-                          border: none; background: $boost; }
+    /* line-pad 不接受 0（textual 只认正整数），横向留 1 列由它负责 */
+    #row_actions Button { width: 1fr; min-width: 0; height: 1;
+                          border: none; padding: 0; background: $boost; }
     #row_actions Button:hover { background: $primary; }
-    #qa { width: 1fr; min-width: 0; height: 3; border: none;
-          background: $warning; color: $text; }
-    #qa:hover { background: $warning-lighten-1; }
-    #cmd { margin: 1 0 0 0; }
+    #qa { width: 1fr; min-width: 0; height: 1; border: none;
+          padding: 0; background: $warning; color: $text; }
+    #qa:hover { background: $warning; }
+    /* 命令输入一行就够：它只接受 :qa / :rotate / :respawn / :q 这种短命令，
+       长话在上面的笔记区写（那里会换行）。Input 默认高 3 行带边框，一行足矣。 */
+    #cmd { height: 1; border: none; padding: 0 1; background: $surface;
+           margin: 1 0 0 0; }
     /* 中间不套外框：卡片自己就是盒子。双层边框把每张卡都挤小一圈。 */
     #middle { width: 1fr; min-width: 52; padding: 0 1; }
     .role_card { height: auto; border: round $panel; padding: 0 1; margin: 0 0 1 0;
@@ -154,16 +161,21 @@ class BoardApp(App):
     /* 目标卡：重边框 + 反色，切角色时一眼能看到是谁 */
 .role_card.target { border: heavy yellow; background: $boost;
                         border-title-color: $text; }
-    .role_card.dead { border: dashed red; background: $error-darken-3; }
+    /* pane 挂了的卡：红虚线框 + 深一点的底。别用 $error-darken-3 这种变量名 ——
+       textual 的主题里没有它，整个样式表会解析失败（板子直接起不来）。 */
+    .role_card.dead { border: dashed $error; background: $boost; }
     #right { width: 34; border: round $secondary; padding: 0 1; }
     #archive { height: 1fr; }
     #status { height: auto; min-height: 3; border: round $warning; padding: 0 1; }
     #alerts { height: auto; color: $warning; }
     #statusline { height: auto; }
-    #docs_dialog { align: center middle; width: 92%; height: 88%;
-                   border: thick $accent; background: $surface; padding: 0 1; }
-    #docs_left { width: 30; border: round $panel; }
-    #docs_title { margin: 0 0 1 0; }
+    /* 全屏、无粗边框：它是一层「视图」，不是弹窗。粗边框 + 88% 尺寸看起来
+       既没铺满又糊着一圈。 */
+    #docs_dialog { width: 100%; height: 100%; border: none;
+                   background: $surface; padding: 0 1; }
+    #docs_left { width: 32; border: round $panel; }
+    #docs_title { margin: 0 0 0 0; text-style: bold; }
+    #docs_sub { color: $text-muted; margin: 0 0 1 0; }
     #docs_list { height: 1fr; }
     #docs_right { width: 1fr; border: none; padding: 0 1; }
     #docs_body_scroll { height: 1fr; border: none; }
@@ -175,16 +187,25 @@ class BoardApp(App):
     # · q 不放这：焦点在卡片上时按 q 就退板子太容易误触，退出走 Ctrl+Q / Ctrl+C；
     # · j/k/enter 也不放这：它们归 ArchiveList（见下），放 App 级会被聚焦中的
     #   输入框吃掉 —— 人在笔记里打个 j 就变成翻档案。
+    # 只放「任何时候都该是这个意思」的键。
+    # · tab 必须 priority：textual 默认把 Tab 给 focus_next，不抢的话人按 Tab 只是
+    #   光标跳格子。**代价是键盘焦点再也去不了右侧档案列表**，所以下面用 j/k/o/p
+    #   把档案操作补回来（它们在笔记区聚焦时会被 TextArea 吃掉，不影响打字）。
+    # · q 不放这：焦点在卡片上按 q 就退板子太容易误触，退出走 Ctrl+Q / Ctrl+C。
     BINDINGS = [
         Binding("tab", "cycle_target", "切角色", priority=True),
         Binding("ctrl+q", "quit_board", "退出"),
         Binding("ctrl+r", "refresh_now", "刷新"),
+        Binding("j,down", "archive_down", "档案下一片"),
+        Binding("k,up", "archive_up", "档案上一片"),
+        Binding("o", "open_spec", "翻开这片文档"),
+        Binding("p", "open_project_docs", "项目文档/笔记"),
     ]
 
     def __init__(self, root=None, proto=None, herdr=None, label="",
                  role_map=None, refresh_secs=2.0, collector=None,
                  dispatcher=None, qa_runner=None, rotator=None,
-                 note_writer=None, bring_up=None) -> None:
+                 note_writer=None, bring_up=None, respawn=None) -> None:
         super().__init__()
         self.root = root
         self.proto = proto
@@ -198,6 +219,7 @@ class BoardApp(App):
         self._rotator = rotator
         self._note_writer = note_writer
         self._bring_up = bring_up
+        self._respawn = respawn
         self.state: dict = {}
         self.roles: list[str] = []
         self.target_idx = 0
@@ -216,7 +238,7 @@ class BoardApp(App):
         yield Header(id="top")
         with Horizontal(id="body"):
             with Vertical(id="left"):
-                yield Label("笔记 / 安排 —— 想事情、排任务")
+                yield Label("笔记 / 安排")
                 yield TextArea(id="note")
                 # 并排的两个只放短标签（30 列里「推给当前角色」六个字就 12 列，
                 # 两个并排一定被切），外部评审单独一整行
@@ -225,7 +247,7 @@ class BoardApp(App):
                     yield Button("存 note", id="note_save")
                 yield Button("外部评审 :qa", id="qa")
                 yield Input(id="cmd",
-                            placeholder=":qa <切片> · :rotate <角色> · Ctrl+Q 退出")
+                            placeholder=":qa <切片> · :respawn <角色> · :q")
             with VerticalScroll(id="middle"):
                 pass
             with Vertical(id="right"):
@@ -240,6 +262,13 @@ class BoardApp(App):
         self.sub_title = str(self.label)
         self._collect()
         self.set_interval(max(0.05, self.refresh_secs), self._collect)
+        # 起始焦点给档案列表，**不是笔记区**：textual 默认聚焦第一个可聚焦控件，
+        # 而那是 TextArea —— 它会吞掉所有可打印键，j/k/o/p 就全废了。
+        # 要写字点一下笔记区即可，聚焦是显式动作。
+        try:
+            self.query_one("#archive", ArchiveList).focus()
+        except Exception:
+            pass
 
     # ---- 采集（herdr 调用放到工作线程，不让界面卡） ----
     @work(thread=True, exclusive=True)
@@ -354,7 +383,8 @@ class BoardApp(App):
             # 之前是 CSS 边框 + Panel 边框各一层 —— 双层边框把每张卡都显小一圈。
             self._card_texts[name] = t
             card.border_title = name
-            card.border_subtitle = "pane 挂了 · 点卡片拉起" if dead else ""
+            card.border_subtitle = ("pane 挂了 · 点卡片拉起 · :respawn " + name + " 换 agent"
+                                    if dead else "")
             card.update(t)
 
     # ---- 右侧：spec 档案 ----
@@ -410,6 +440,16 @@ class BoardApp(App):
 
     def action_refresh_now(self) -> None:
         self._collect()
+
+    def action_archive_down(self) -> None:
+        if self.archive:
+            self.archive_idx = (self.archive_idx + 1) % len(self.archive)
+            self._refresh_archive()
+
+    def action_archive_up(self) -> None:
+        if self.archive:
+            self.archive_idx = (self.archive_idx - 1) % len(self.archive)
+            self._refresh_archive()
 
     def action_open_spec(self) -> None:
         if not self.archive:
@@ -605,10 +645,10 @@ class BoardApp(App):
 def run_board(root: Path, proto, herdr, label: str, role_map: dict,
               refresh_secs: float = 2.0, collector=None, dispatcher=None,
               qa_runner=None, rotator=None, note_writer=None,
-              bring_up=None) -> bool:
+              bring_up=None, respawn=None) -> bool:
     """起板子（textual 已由调用方确认可 import）。"""
     BoardApp(root=root, proto=proto, herdr=herdr, label=label, role_map=role_map,
              refresh_secs=refresh_secs, collector=collector, dispatcher=dispatcher,
              qa_runner=qa_runner, rotator=rotator, note_writer=note_writer,
-             bring_up=bring_up).run()
+             bring_up=bring_up, respawn=respawn).run()
     return True

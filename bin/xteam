@@ -1844,7 +1844,10 @@ def cmd_up(args: argparse.Namespace) -> int:
     # 命令行 up 和板子上拉起必须是同一条路，否则 pane 挂了之后两条路的行为会分叉
     print(f"[{now()}] 角色配置已校验：" + "  ".join(
         f"{r}={specs[r].describe()}" for r in started_order(args)))
-    boot = bring_up_roles(root, proto, label, specs)
+    # 只拉 started_order() 里的角色 —— 别忘了 reviewer 默认不起
+    # （`xteam up --reviewer` 才拉）。抽成 bring_up_roles 时这里一度传了全部
+    # BOOT_ORDER，结果没要 reviewer 也起了一个，pane 平白多一块。
+    boot = bring_up_roles(root, proto, label, specs, only=started_order(args))
 
     state = {
         "workspace": label,
@@ -1856,7 +1859,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         # 哪些角色的 pane 是「带身份文件起的」（系统提示词里有身份）。
         # cmd_reopen 靠它决定要不要把章程再抄进对话 —— 复用的老 pane 记不进来，
         # 那种 pane 会被当成「没有身份」处理（宁多投一遍，也不让它自己猜）。
-        "identity": identity_of,
+        "identity": boot["identity"],
         "started_at": now(),
         "started_at_utc": now_utc(),
     }
@@ -1870,8 +1873,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     chosen = {
         role: {"kind": specs[role].kind, **({"model": specs[role].model}
                                            if specs[role].model else {})}
-        for role in started
-        if specs[role].model or specs[role].kind != ROLES[role][0]
+        for role in boot["started"]
+        if role in specs and (specs[role].model or specs[role].kind != ROLES[role][0])
     }
     if chosen:
         merged = dict(chosen)
@@ -1884,8 +1887,8 @@ def cmd_up(args: argparse.Namespace) -> int:
         write_json(team_path, {"roles": merged, "_updated": now()}, indent=2)
         print(f"  已写入 .xteam/team.json（下次 up 自动沿用）")
 
-    print(f"\n[{now()}] 启动完成。角色：{', '.join(started)}")
-    for role, agent in used.items():
+    print(f"\n[{now()}] 启动完成。角色：{', '.join(boot['started'])}")
+    for role, agent in boot["agents"].items():
         print(f"  {role:<6} → {agent}")
     print(f"  看状态：xteam status    门铃：xteam say <role> \"...\"")
     if args.watch:
@@ -2651,7 +2654,13 @@ def _board_run_qa(root: Path, slice_name: str, workspace: str | None) -> tuple[b
     门铃 PM），不另造一条 —— 两条路必然有一条先烂。
     返回 (ok, 状态行要显示的一句话)。
     """
-    task = _qa_task(root, slice_name)
+    try:
+        task = _qa_task(root, slice_name)
+    except SystemExit:
+        # _qa_task 找不到切片时走 die() → sys.exit()。**在工作线程里 SystemExit
+        # 只是那个线程退出**，textual 会把 traceback 甩到人眼前。这里接住，
+        # 换成状态行里的一句人话。
+        return False, f"没有这个切片：{slice_name}"
     if task is None or not task.exists():
         return False, f"找不到切片 {slice_name!r}（.xteam/tasks/ 下没有它）"
     cfg = QaConfig(root).load()
@@ -2708,6 +2717,23 @@ def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
     if delivered:
         return True, "已送达 working"
     return True, f"已投递 ({cur})"
+
+
+def _board_respawn(root: Path, label: str, role: str, agent: str = "") -> tuple[bool, str]:
+    """看板的「换个 agent 重拉」：pane 挂了想换 agent 时用它。
+
+    和 `xteam swap <角色> <agent>` 走同一条路（换 agent 必然重建 pane，顺便就把
+    挂掉的 pane 换掉了）。不给 agent 就用当前配置里的。
+    """
+    try:
+        ns = argparse.Namespace(project=str(root), workspace=label, role=role,
+                                agent=agent or None, model=None, force=True)
+        cmd_swap(ns)
+        return True, f"已把 {role} 换成 {agent or '当前配置的 agent'}"
+    except SystemExit as exc:
+        return False, f"换 {role} 失败（退出码 {exc.code}）"
+    except Exception as exc:                          # noqa: BLE001
+        return False, str(exc)
 
 
 def _board_bring_up(root: Path, proto: Protocol, label: str, role: str) -> tuple[bool, str]:
@@ -2767,6 +2793,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         dispatcher=lambda role, msg: _board_dispatch(root, proto, herdr, role_map, role, msg),
         qa_runner=lambda name: _board_run_qa(root, name, args.workspace),
         bring_up=lambda role: _board_bring_up(root, proto, label, role),
+        respawn=lambda role, agent="": _board_respawn(root, label, role, agent),
         rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
