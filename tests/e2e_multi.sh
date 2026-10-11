@@ -442,7 +442,7 @@ run xin "$T" init --repo-kind multi-api --projects fe,api,admin --shared-api api
 assert_rc "MP-15.0 init 布景 rc=0" 0
 # request.md 落盘 → 阶段 implement → dev 欠 implement（布景三场景共用这笔欠账）。
 mk_task "$T" cur '{}'
-printf '# request\n' > "$T/.xteam/tasks/cur/request.md"
+printf '# request\n\n## 验收标准\n- `make verify` 全绿\n' > "$T/.xteam/tasks/cur/request.md"
 
 # 三段尾巴原文逐字抄自 spec §2.1（PM 实抓）。检测器只认完整形态：
 # 只留两行选项会返回 False，替身必须带 footer 或命令上下文（spec 已警示）。
@@ -768,7 +768,7 @@ for s in s1 s2 s3; do
   d="$T/.xteam/tasks/$s"; mkdir -p "$d"
   printf '# spec\n'     > "$d/spec.md"
   printf '{"round":1}\n' > "$d/spec.json"
-  printf '# request\n'  > "$d/request.md"
+  printf '# request\n\n## 验收标准\n- 可跑\n'  > "$d/request.md"
   printf 'closed\n'     > "$d/closed.md"
 done
 EVLOG="$T/.xteam/watch/events.log"
@@ -840,7 +840,7 @@ printf '# spec\n'   > "$d/spec.md"
 printf 'closed\n'   > "$d/closed.md"
 d="$T/.xteam/tasks/q1"; mkdir -p "$d"
 printf '# spec\n'    > "$d/spec.md"
-printf '# request\n' > "$d/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n' > "$d/request.md"
 printf '| 1 | q1 | doing | |\n' >> "$T/.xteam/QUEUE.md"
 
 # 替身：pm/tl idle，dev working（spec §1.1 的同型：下游在跑、PM 闲着）。
@@ -1069,12 +1069,12 @@ assert_rc "MP-24.0 init 布景 rc=0" 0
 # b = 只有 request.md → 修复前 dev 欠它的 implement。
 d="$T/.xteam/tasks/a"; mkdir -p "$d"
 printf '# spec\n'       > "$d/spec.md"
-printf '# request\n'    > "$d/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n'    > "$d/request.md"
 printf '{"round":1}\n'    > "$d/delivered.json"
 printf '{"delivery":1}\n' > "$d/ready.json"
 d="$T/.xteam/tasks/b"; mkdir -p "$d"
 printf '# spec\n'    > "$d/spec.md"
-printf '# request\n' > "$d/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n' > "$d/request.md"
 
 # 替身：三 pane 恒 idle（同 MP-21 的静态形状），label 参数化。
 mkdir -p "$BASE/bin24"
@@ -1480,7 +1480,7 @@ assert_rc "MP-29.0 init 布景 rc=0" 0
 # os.utime 拨回 601s 前模拟超阈值（不真实睡眠）。
 d="$T/.xteam/tasks/stale-req"; mkdir -p "$d"
 printf '# spec\n'    > "$d/spec.md"
-printf '# request\n' > "$d/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n' > "$d/request.md"
 python3 - "$d/request.md" <<'PY'
 import os, sys, time
 t = time.time() - 601
@@ -1695,10 +1695,10 @@ assert_rc "MP-32.0 init 布景 rc=0" 0
 mkdir -p "$T/.xteam/tasks/a" "$T/.xteam/tasks/b"
 printf '# spec\n' > "$T/.xteam/tasks/a/spec.md"
 printf '{"round":1}\n' > "$T/.xteam/tasks/a/spec.json"
-printf '# request\n' > "$T/.xteam/tasks/a/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n' > "$T/.xteam/tasks/a/request.md"
 printf '{"round":1,"changed":["bin/xteam"]}\n' > "$T/.xteam/tasks/a/delivered.json"
 printf '{"paths":["bin/xteam"]}\n' > "$T/.xteam/tasks/a/touches.json"
-printf '# request\n' > "$T/.xteam/tasks/b/request.md"
+printf '# request\n\n## 验收标准\n- 可跑\n' > "$T/.xteam/tasks/b/request.md"
 printf '| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n| 1 | a | doing | |\n| 2 | b | doing | |\n' \
   > "$T/.xteam/QUEUE.md"
 

@@ -1,5 +1,47 @@
 # 变更记录
 
+## 0.2.22
+
+### 看板入口重做（去掉顶部菜单栏）+ spec 直接渲染 + mermaid 画成 ASCII 图
+
+用户三连问：「顶部菜单有意义吗？不如像 kander 那样 o 进 option、m 进 menu」「spec 现在
+只是看 markdown 源码，最好能直接 preview，还要考虑流程图的显示」「派活不能只有开发目标，
+没有验收标准」。
+
+**1. 顶部菜单栏撤掉，换成 kander 形状的单键通道**
+- 删掉 textual 自带的 `Header`（占 3 行，其中时钟与加载图标没有信息量）。角色真状态改到
+  顶部一行 `#top` 里 —— 有用的内容是那一行，不是那个容器。
+- `?` 键位速查表（对齐 kander 的 `?`）：把全部键与命令列全，没有菜单栏就必须有一屏索引。
+- `m` 全局菜单：立即刷新 / 项目文档与笔记 / 键位速查 / 退出。
+- `O` 对选中切片的动作菜单：翻开文档 / 外部评审 / 派给 dev / 派给 tl / 轮换会话。
+- 单键能做的事不进菜单（`o` 翻开、`p` 项目文档、`Tab` 切角色、`j/k` 选片保持原样）。
+- 踩坑：菜单列表最初用普通 `ListView`，它不认 j/k，键盘用户直接卡住 —— 换成
+  `ArchiveList`（ListView 子类，带 j/k/g/G）。
+
+**2. spec 直接渲染，不再显示源码**
+文档正文从 `Static` 换成 `MarkdownViewer`：标题、列表、代码块、表格按排版显示，不再把
+`#`、`-`、`**` 怼到人眼前。
+
+**3. mermaid 流程图画成 ASCII**
+`mermaid_to_ascii()` 支持常见子集：`graph|flowchart TD|LR`、五种节点形状、
+`-->`/`---`/`-.->`/`==>` 边（可带 `|标签|`）、链式写法。按最长路径分层画框连线。
+**认不出的语法（sequenceDiagram / gantt / subgraph / 有环）整块退回源码** ——
+画错一张图比不画更糟。其余 markdown 原样交给 MarkdownViewer。
+
+**4. 派活必须带验收标准（kander 的评估思想落到状态机）**
+`request.md` 必须有「验收标准」节，否则 **dev 不欠 implement**、改成 **TL 欠 criteria**，
+巡检一直催到补上。已交付的片不受这条约束（返工/复审不被拦）。协议模板、PM/TL 章程同步。
+
+**5. 修掉两个只有端到端层能逮住的回归**（都在 `bring_up_roles()` 抽函数时引入）
+- `cmd_up` 还引用被抽走的 `identity_of` / `started` → NameError，`up` 直接崩；
+- 没传 `only=started_order(args)` → 没给 `--reviewer` 也把 reviewer 拉起来，而 preflight
+  又跳过 reviewer 的 kind 校验 → herdr 把 `qoderclicn` 静默折成 `qodercli`，
+  本机没装 → pane 里 `command not found` exit 127。现在 `up --reviewer` 早就在
+  preflight 拦住，报错直接点名 kind 并给建议（已验证）。
+
+测试：[101] 组改断言 Markdown 渲染 + mermaid 图；新增 [102] 验收标准门禁 7 条、
+[103] mermaid/markdown 16 条。门禁三层 + e2e 369/369。
+
 ## 0.2.21
 
 ### 看板细节修整 + `:respawn` 换 agent 重拉 + Kandown 研究

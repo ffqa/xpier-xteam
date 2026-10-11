@@ -19,12 +19,13 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (Button, Footer, Header, Input, Label,
+                             MarkdownViewer,
                              ListItem, ListView, Static, TextArea)
 from rich.text import Text
 
 try:                                     # 单测里直接 import 本模块时给个友好失败
     from xteam_lib import (_box_state_text, wrap_display, read_doc,
-                           doc_files_in, project_doc_files)
+                           doc_files_in, project_doc_files, render_doc_markdown)
 except ImportError:                      # pragma: no cover - 装在 lib/ 布局下
     from .xteam_lib import _box_state_text, _spec_view_lines  # type: ignore
 
@@ -75,9 +76,12 @@ class DocsScreen(ModalScreen):
                 yield Label("文档（这一片的 + 项目级）· j/k 切换", id="docs_sub")
                 yield ArchiveList(id="docs_list")
             with Vertical(id="docs_right"):
-                with VerticalScroll(id="docs_body_scroll"):
-                    yield Static(Text(""), id="docs_body")
-                yield Label("j/k 选文档 · 滚行 Ctrl+F/B · g/G 顶末 · Esc 合上",
+                # Markdown 直接渲染：标题/列表/代码块/表格都按排版显示，
+                # 不再把 `#`、`-`、`**` 这些源码符号怼到人眼前。
+                # mermaid 代码块已由 render_doc_markdown() 转成 ASCII 图，
+                # 所以它也走同一条渲染路（图本身就是普通代码块）。
+                yield MarkdownViewer("", id="docs_body", show_table_of_contents=False)
+                yield Label("j/k 选文档 · g/G 顶末 · Esc 合上",
                             id="docs_hint")
 
     def on_mount(self) -> None:
@@ -90,16 +94,17 @@ class DocsScreen(ModalScreen):
         self._load(0)
 
     def _load(self, idx: int) -> None:
+        viewer = self.query_one("#docs_body", MarkdownViewer)
         if not self._files:
-            self.query_one("#docs_body", Static).update(Text("（没有可翻的文档）"))
+            viewer.document.update("（没有可翻的文档）")
             return
         self._idx = max(0, min(idx, len(self._files) - 1))
         _label, path = self._files[self._idx]
         title, lines = read_doc(path)
-        width = max(20, (self.size.width or 100) - 44)
-        body = wrap_display("\n".join(lines), width)
-        self.query_one("#docs_body", Static).update(
-            Text(f"── {title} ──\n" + "\n".join(body)))
+        width = max(30, (self.size.width or 100) - 44)
+        body = render_doc_markdown("\n".join(lines), width=width)
+        # 文档名单独一行（MarkdownViewer 自己会渲染正文，标题行只是给人定位）
+        viewer.document.update(f"**{title}**\n\n{body}")
 
     def action_next_doc(self) -> None:
         self._load(self._idx + 1)
@@ -110,20 +115,85 @@ class DocsScreen(ModalScreen):
         self.query_one("#docs_list", ArchiveList).index = self._idx
 
     def action_page_down(self) -> None:
-        self.query_one("#docs_body_scroll", VerticalScroll).scroll_page_down()
+        self.query_one("#docs_body", MarkdownViewer).scroll_page_down()
 
     def action_page_up(self) -> None:
-        self.query_one("#docs_body_scroll", VerticalScroll).scroll_page_up()
+        self.query_one("#docs_body", MarkdownViewer).scroll_page_up()
 
     def action_top(self) -> None:
-        self.query_one("#docs_body_scroll", VerticalScroll).scroll_home()
+        self.query_one("#docs_body", MarkdownViewer).scroll_home()
 
     def action_bottom(self) -> None:
-        self.query_one("#docs_body_scroll", VerticalScroll).scroll_end()
+        self.query_one("#docs_body", MarkdownViewer).scroll_end()
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         if event.list_view.id == "docs_list":
             self._load(event.list_view.index)
+
+
+class ActionMenu(ModalScreen):
+    """动作菜单：一个列表，选中即执行。
+
+    kander 的终端 TUI 没有顶部菜单栏，入口全是单键 + 上下文动作（`a` 派 agent、
+    `g` 送 hook）。这里照它的形状做两个：
+      · `o` —— 对**当前选中对象**的动作（档案里选中的那片，或正在看的目标角色）
+      · `m` —— 全局动作（刷新 / 项目文档 / 退出）
+    单键能做到的事不放菜单，菜单只放"要选一下"的事。
+    """
+
+    BINDINGS = [
+        Binding("escape,q", "dismiss", "关闭"),
+        Binding("j,down", "cursor_down", "下一项"),
+        Binding("k,up", "cursor_up", "上一项"),
+    ]
+
+    def __init__(self, title: str, items: list) -> None:
+        """items: [(标签, 回调)]。回调在选中时同步调用，然后关掉菜单。"""
+        super().__init__()
+        self._title = title
+        self._items = list(items)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="menu_dialog"):
+            yield Label(self._title, id="menu_title")
+            # 用 ArchiveList（ListView 子类，带 j/k/g/G）—— 普通 ListView 不认
+            # j/k，菜单就只剩方向键能走，键盘用户直接卡住
+            yield ArchiveList(id="menu_list")
+            yield Label("j/k 选 · Enter 执行 · Esc 关", id="menu_hint")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#menu_list", ArchiveList)
+        for label, _cb in self._items:
+            lv.append(ListItem(Label(label)))
+        if self._items:
+            lv.index = 0
+        lv.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        i = event.list_view.index
+        if 0 <= i < len(self._items):
+            _label, cb = self._items[i]
+            self.dismiss()
+            cb()
+
+
+class CheatSheet(ModalScreen):
+    """键位速查表。没有菜单栏，就必须有一屏把所有键列全 —— 这是 kander 的 `?`。"""
+
+    BINDINGS = [Binding("escape,q,?", "dismiss", "关闭")]
+
+    def __init__(self, rows: list) -> None:
+        super().__init__()
+        self._rows = rows
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="cheat_dialog"):
+            yield Label("键位（? 或 Esc 关）", id="cheat_title")
+            for left, right in self._rows:
+                yield Label(f"  {left:<14} {right}")
+
+    def on_mount(self) -> None:
+        self.query_one("#cheat_dialog", VerticalScroll).focus()
 
 
 class BoardApp(App):
@@ -131,7 +201,9 @@ class BoardApp(App):
 
     CSS = """
     Screen { layout: vertical; }
-    #top { height: 3; }
+    /* 顶栏压成一行：只放三角色真状态。textual 自带 Header 的时钟与加载图标
+       没有信息量，还白占 3 行。 */
+    #top { height: 1; background: $primary; color: $text; }
     #body { height: 1fr; }
     /* 宽度分配：中间是主角（三角色），左右是辅助。右侧档案行短，不需要 46 列。 */
     /* 左栏：一行一行的紧凑排布。 Button 默认 height 3 + line-pad 1，
@@ -178,8 +250,17 @@ class BoardApp(App):
     #docs_sub { color: $text-muted; margin: 0 0 1 0; }
     #docs_list { height: 1fr; }
     #docs_right { width: 1fr; border: none; padding: 0 1; }
-    #docs_body_scroll { height: 1fr; border: none; }
+    #docs_body { height: 1fr; border: none; background: $surface; }
     #docs_hint { color: $text-muted; }
+    /* 动作菜单 / 速查表：居中一块，别铺满（它们是被召唤出来的，铺满会抢主视野） */
+    #menu_dialog { align: center middle; width: 56%; height: auto; max-height: 80%;
+                   border: round $accent; background: $surface; padding: 1 2; }
+    #menu_title { text-style: bold; margin: 0 0 1 0; }
+    #menu_list { height: auto; max-height: 16; border: none; }
+    #menu_hint { color: $text-muted; margin: 1 0 0 0; }
+    #cheat_dialog { align: center middle; width: 62%; height: 82%;
+                    border: round $accent; background: $surface; padding: 1 2; }
+    #cheat_title { text-style: bold; margin: 0 0 1 0; }
     """
 
     # 只放「任何时候都该是这个意思」的键。
@@ -200,6 +281,9 @@ class BoardApp(App):
         Binding("k,up", "archive_up", "档案上一片"),
         Binding("o", "open_spec", "翻开这片文档"),
         Binding("p", "open_project_docs", "项目文档/笔记"),
+        Binding("question_mark", "cheat_sheet", "键位速查"),
+        Binding("m", "global_menu", "全局菜单"),
+        Binding("O", "object_menu", "对选中片的动作"),
     ]
 
     def __init__(self, root=None, proto=None, herdr=None, label="",
@@ -235,7 +319,9 @@ class BoardApp(App):
 
     # ---- 组装 ----
     def compose(self) -> ComposeResult:
-        yield Header(id="top")
+        # 顶部一条：三角色真状态。textual 的 Header 占 3 行，其中时钟和加载图标
+        # 没有用 —— 省下的两行给内容。
+        yield Static("", id="top")
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield Label("笔记 / 安排")
@@ -317,6 +403,8 @@ class BoardApp(App):
         status = f"[{self.status_kind}] {self.status_text}"
         self.status_text_lines = wrap_display(status, width)
         try:
+            self.query_one("#top", Static).update(
+                Text(f" xteam Board · {self.label} ┃ {hud}"))
             self.query_one("#alerts", Label).update(self.alerts_text)
             self.query_one("#statusline", Label).update(
                 Text("\n".join(self.status_text_lines),
@@ -461,6 +549,80 @@ class BoardApp(App):
         """项目级文档 + wiki 笔记（「存为 note」落下去的地方，要能翻回来）。"""
         files = [("项目 · " + p.name, p) for p in project_doc_files(self.root)]
         self.push_screen(DocsScreen("项目文档", files))
+
+    def action_cheat_sheet(self) -> None:
+        self.push_screen(CheatSheet(self._cheat_rows()))
+
+    def action_global_menu(self) -> None:
+        self.push_screen(ActionMenu("菜单（全局）", self._global_items()))
+
+    def action_object_menu(self) -> None:
+        self.push_screen(ActionMenu(self._object_title(), self._object_items()))
+
+    def _cheat_rows(self) -> list:
+        return [
+            ("Tab", "切换发送目标角色（目标卡高亮 + ◀ 发送目标）"),
+            ("j / k", "在 spec 档案里选片（在笔记区打字时照常打字）"),
+            ("o", "翻开选中这片切片的全部文档"),
+            ("p", "项目文档与 wiki 笔记"),
+            ("O 或点空行", "对选中这片切片的动作（评审/派活/换 agent）"),
+            ("m", "全局菜单（刷新/退出）"),
+            (":qa <切片>", "外部冷读，结论门铃 PM"),
+            (":reviewer <话>", "派活给独立 reviewer"),
+            (":respawn <角色> [agent]", "pane 挂了重拉，可顺便换 agent"),
+            (":rotate <角色>", "轮换该角色会话"),
+            (":pm/:tl/:dev <话>", "直接派话给某角色"),
+            ("左栏按钮", "推给当前角色 / 存 note / 外部评审（鼠标）"),
+            ("Ctrl+Q 或 Ctrl+C", "退出看板"),
+            ("?", "这一屏"),
+        ]
+
+    def _selected_slice(self) -> str:
+        if not self.archive:
+            return ""
+        return str(self.archive[self.archive_idx].get("name") or "")
+
+    def _object_title(self) -> str:
+        name = self._selected_slice()
+        return f"对这片切片的动作：{name}" if name else "对这片切片的动作（未选中）"
+
+    def _object_items(self) -> list:
+        name = self._selected_slice()
+        if not name:
+            return [("（先在右侧档案里选一片）", lambda: None)]
+        return [
+            (f"翻开 {name} 的文档", lambda: self._open_slice(name)),
+            (f"外部评审 {name}（冷读，结论给 PM）", lambda: self._run_qa(name)),
+            (f"派给 dev：开工", lambda: self._dispatch_msg("dev", f"开始实现 {name}，先读 spec.md")),
+            (f"派给 tl：验收 {name}", lambda: self._dispatch_msg("tl", f"验收 {name}")),
+            (f"轮换 {name} 相关角色会话", lambda: self._rotate(self._target())),
+        ]
+
+    def _global_items(self) -> list:
+        return [
+            ("立即刷新", self.action_refresh_now),
+            ("项目文档与 wiki 笔记", self.action_open_project_docs),
+            ("键位速查", self.action_cheat_sheet),
+            ("退出看板", self.action_quit_board),
+        ]
+
+    def _dispatch_msg(self, role: str, msg: str) -> None:
+        if self._dispatcher is None:
+            self._set_status("这台机器没有投递回调", "warn")
+            return
+        self._set_status(f"正在推给 {role}…", "info")
+
+        def _do() -> None:
+            try:
+                ok, reason = self._dispatcher(role, msg)
+            except Exception as exc:                  # noqa: BLE001
+                ok, reason = False, str(exc)
+            self.call_from_thread(
+                self._set_status,
+                (f"✓ 已推给 {role}: {reason}" if ok else f"⚠ {role} 没收到: {reason}"),
+                "success" if ok else "warn")
+
+        self.run_worker(_do, thread=True, exclusive=True, group="dispatch")
 
     def action_quit_board(self) -> None:
         self.exit()

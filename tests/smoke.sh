@@ -385,9 +385,16 @@ d1b=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "assess")
 [ "$d1b" -ge 1 ] && ok "spec v1 → TL 欠 assess（必须回评估）" \
   || bad "spec v1 未产生 assess 义务"
 
+# request 必须带「验收标准」节，dev 才欠 implement（0.2.22 起：
+# 只有开发目标没有验收标准的派活，dev 只能靠猜做完了没有）
 printf '# request\n' > .xteam/tasks/smoke/request.md
+d0=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "criteria")
+[ "$d0" -ge 1 ] && ok "request 缺验收标准 → TL 欠 criteria、dev 不欠 implement" \
+  || bad "缺验收标准的 request 没拦住 dev"
+
+printf '# request\n\n## 验收标准\n- `make verify` 全绿\n' > .xteam/tasks/smoke/request.md
 d2=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "implement")
-[ "$d2" -ge 1 ] && ok "写了 request → dev 欠 implement" || bad "request 未产生 implement 义务"
+[ "$d2" -ge 1 ] && ok "补上验收标准 → dev 欠 implement" || bad "request 未产生 implement 义务"
 
 printf '{"round":1,"head":"x","verification":[]}' > .xteam/tasks/smoke/delivered.json
 d3=$("$BIN" --project "$WORK" --workspace "$WS" status 2>&1 | grep -c "chase")

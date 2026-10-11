@@ -121,7 +121,7 @@ STAGE_FILES: dict[str, tuple[str, object]] = {
     "specv":     ("spec.json", {"round": 1}),
     "assess":    ("assessment.json", {"spec_round": 1, "verdict": "agree", "objections": []}),
     "agree":     ("agreement.json", {"spec_round": 1, "note": "达成一致"}),
-    "request":   ("request.md", "# 拆解"),
+    "request":   ("request.md", "# 拆解\n\n## 验收标准\n- `make verify` 全绿\n"),
     "delivered": ("delivered.json", {"round": 1, "head": "bbb", "verification": []}),
     "ready":     ("ready.json", {"delivery": 1}),
     "verdict":   ("verdict.json", {"round": 1, "delivery": 1, "verdict": "PASS"}),
@@ -399,7 +399,7 @@ def test_multiple_tasks_accumulate_debts() -> None:
         b.advance_to("specv")                      # a 有版本号但 TL 未评估
         second = b.proto.tasks / "b"
         second.mkdir(parents=True, exist_ok=True)
-        (second / "request.md").write_text("# b 拆解", encoding="utf-8")
+        (second / "request.md").write_text("# b 拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
         debts = b.proto.obligations()
         check("a 欠 TL 评估", [o for _, o in debts["tl"]], ["assess"])
         check("b 欠 dev 实现", [o for _, o in debts["dev"]], ["implement"])
@@ -1609,7 +1609,7 @@ def test_dep_gate_holds_after_decomposition() -> None:
             encoding="utf-8")
         (fe / "spec.md").write_text("# s", encoding="utf-8")
         (fe / "spec.json").write_text('{"round":1}', encoding="utf-8")
-        (fe / "request.md").write_text("# 已拆解", encoding="utf-8")   # 关键：已拆解
+        (fe / "request.md").write_text("# 已拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")   # 关键：已拆解
 
         check("已拆解 + 前置未闭合 → 仍然拦", proto.debts(fe), {"tl": "wait-dep"})
         check("dev 拿不到 implement", "dev" in proto.debts(fe), False)
@@ -2199,7 +2199,7 @@ def test_recap_path_and_alert_isolation() -> None:
 
         # #3 按需：只问在这个切片里留下过工件的角色
         task = root / "tasks" / "s"; task.mkdir(parents=True)
-        (task / "request.md").write_text("# r", encoding="utf-8")      # tl 拆过
+        (task / "request.md").write_text("# r\n\n## 验收标准\n- 可跑\n", encoding="utf-8")      # tl 拆过
         (task / "delivered.json").write_text("{}", encoding="utf-8")    # dev 交付过
         check("参与过的角色被识别", roles_touched_task(task), {"tl", "dev"})
         (task / "verdict.json").write_text("{}", encoding="utf-8")
@@ -3208,7 +3208,7 @@ def test_gate_window_freezes_other_implement() -> None:
         b.advance_to("delivered")
         tb = b.proto.tasks / "b"
         tb.mkdir()
-        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (tb / "request.md").write_text("# 拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
         check("ready 未写也在窗口（交付即冻结）",
               b.proto.pending_gate_tasks(), ["a"])
         check("窗口内 b 的 implement 冻结（dev 不欠）", b.owes("dev"), [])
@@ -3860,7 +3860,7 @@ def test_overlap_allows_disjoint_implement() -> None:
                                              encoding="utf-8")
         tb = b.proto.tasks / "b"
         tb.mkdir()
-        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (tb / "request.md").write_text("# 拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
         check("b 没声明触碰 = 未知 → 仍冻结（向后兼容）",
               b.proto.debts(tb).get("dev"), None)
         (tb / "touches.json").write_text('{"paths": ["bin/xteam"]}', encoding="utf-8")
@@ -3888,7 +3888,7 @@ def test_start_next_still_gated_by_pending_window() -> None:
         a.mkdir()
         (a / "spec.md").write_text("# spec\n", encoding="utf-8")
         (a / "spec.json").write_text('{"round": 1}', encoding="utf-8")
-        (a / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (a / "request.md").write_text("# 拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
         (a / "delivered.json").write_text('{"round": 1}', encoding="utf-8")
         check("出现待判窗口 + 下一片没声明触碰 → 不再催（保守）",
               b.proto.overall_debts().get("pm"), None)
@@ -3906,7 +3906,7 @@ def test_consume_preempts_implement() -> None:
                                              encoding="utf-8")
         tb = b.proto.tasks / "b"
         tb.mkdir()
-        (tb / "request.md").write_text("# 拆解\n", encoding="utf-8")
+        (tb / "request.md").write_text("# 拆解\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
         (tb / "touches.json").write_text('{"paths": ["docs/*.md"]}', encoding="utf-8")
         check("FAIL 对准本次交付 → dev 欠 a 重做（不是 consume）",
               b.proto.debts(b.task).get("dev"), "implement")
@@ -4029,6 +4029,35 @@ def test_doorbell_guards_human_draft_and_retries_enter() -> None:
           [c[0] for c in h.calls if c[0] == "prompt"], ["prompt"])
     check("认不出的 kind 不补键", [c for c in h.calls if c[0] == "run"], [])
     check("认不出的 kind 返回 status", res.startswith("status="), True)
+
+
+def test_request_needs_acceptance_criteria() -> None:
+    """[102] 派活必须带验收标准：只有开发目标的 request.md 不让 dev 开工。"""
+    print("\n[102] 派活必须带验收标准（怎么测 / 什么算过 / 谁验）")
+    b = Bench()
+    try:
+        b.advance_to("agree")
+        # 没有「验收标准」节的 request.md
+        b.write("request.md", "# 拆解\n只写了要实现什么，没写怎么算过。\n")
+        check("缺验收标准 → TL 欠 criteria", b.owes("tl"), ["criteria"])
+        check("缺验收标准 → dev 不得开工", b.owes("dev"), [])
+        check("缺验收标准 → PM 不欠 gate", b.owes("pm"), [])
+
+        # 补上「验收标准」节（带「验收」二字的标题行即可）
+        b.write("request.md",
+                "# 拆解\n\n## 验收标准\n"
+                "- `make verify` 全绿（一条命令可跑出期望值）\n"
+                "- 判据之间不矛盾\n")
+        check("补上后 → TL 不再欠", b.owes("tl"), [])
+        check("补上后 → dev 欠 implement", b.owes("dev"), ["implement"])
+
+        # 已经交付过的片子不受这条约束（返工/复审不该被拦）
+        b.advance_to("delivered")
+        b.write("request.md", "# 拆解\n（交付后有人把验收标准删了）\n")
+        check("已交付的片不因缺验收标准回退", b.owes("dev"), [])
+        check("已交付 → TL 欠 chase", b.owes("tl"), ["chase"])
+    finally:
+        b.cleanup()
 
 
 def test_render_board_and_choice_detector() -> None:
@@ -4568,10 +4597,19 @@ def test_fullscreen_board_tui() -> None:
         if str(_cli_dir) not in sys.path:
             sys.path.insert(0, str(_cli_dir))
         import xteam_board
-        from textual.widgets import Button, Label, ListView, Static, TextArea
+        from textual.widgets import Button, Label, ListView, MarkdownViewer, Static, TextArea
     except ImportError as exc:
         print(f"  ⊘ 跳过：textual 不可用（{exc}）—— 全屏看板组不参与判定")
         return
+
+    def _doc_text(app) -> str:
+        """翻开层正文当前的文本（MarkdownViewer 渲染后的可见 Static 拼起来）。"""
+        try:
+            mv = app.screen_stack[-1].query_one("#docs_body", MarkdownViewer)
+        except Exception:
+            return ""
+        return "\n".join(str(getattr(w, "_Static__content", ""))
+                          for w in mv.query("Static"))
 
     STATE = {
         "title": "t", "label": "demo",
@@ -4600,7 +4638,9 @@ def test_fullscreen_board_tui() -> None:
         spec_dir = tmp / ".xteam" / "tasks" / "auth-api"
         spec_dir.mkdir(parents=True)
         (spec_dir / "spec.md").write_text(
-            "# auth-api\n\nauth-api 的规范第一行\n细节二\n", encoding="utf-8")
+            "# auth-api\n\nauth-api 的规范第一行\n细节二\n\n"
+            "```mermaid\ngraph TD\n  A[写 spec] --> B[TL 评估]\n"
+            "  B --> C[dev 实现]\n```\n", encoding="utf-8")
         (spec_dir / "request.md").write_text("需求：登录\n", encoding="utf-8")
         (tmp / ".xteam" / "PROTOCOL.md").write_text("# 协议\n", encoding="utf-8")
         (tmp / "README.md").write_text("# 项目说明\n", encoding="utf-8")
@@ -4664,16 +4704,12 @@ def test_fullscreen_board_tui() -> None:
                 # 目录里剩下的是项目文档，正文照样给得出东西
                 check("翻开的是文档目录（不只 spec）",
                       len(app.screen_stack[-1].query("#docs_list ListItem")) >= 1, True)
-                body = _plain(getattr(
-                    app.screen_stack[-1].query_one("#docs_body", Static),
-                    "_Static__content", None))
+                body = _doc_text(app)
                 check("没有 spec 的片也有东西可看（项目文档顶上）",
                       "项目说明" in body or "协议" in body, True)
                 await pilot.press("j")
                 await pilot.pause()
-                body2 = _plain(getattr(
-                    app.screen_stack[-1].query_one("#docs_body", Static),
-                    "_Static__content", None))
+                body2 = _doc_text(app)
                 check("目录里能换到下一篇", body2 != body, True)
                 await pilot.press("escape")
                 await pilot.pause()
@@ -4683,11 +4719,15 @@ def test_fullscreen_board_tui() -> None:
                 check("k 回到第一片", app.archive_idx, 0)
                 await pilot.press("enter")
                 await pilot.pause()
-                body3 = _plain(getattr(
-                    app.screen_stack[-1].query_one("#docs_body", Static),
-                    "_Static__content", None))
+                body3 = _doc_text(app)
                 check("有 spec 的片第一篇就是 spec 正文",
                       "auth-api 的规范第一行" in body3, True)
+                check("markdown 直接渲染（不再显示 # 源码）",
+                      "##" not in body3 and "auth-api 的规范第一行" in body3, True)
+                check("mermaid 代码块画成了 ASCII 流程图",
+                      "╭" in body3 and "写 spec" in body3, True)
+                check("mermaid 代码块被画成 ASCII 流程图",
+                      "╭" in _doc_text(app) or "mermaid" not in _doc_text(app), True)
                 await pilot.press("escape")
                 await pilot.pause()
                 # 项目文档 / wiki 笔记也要能翻（「存为 note」的归宿）
@@ -4736,6 +4776,50 @@ def test_fullscreen_board_tui() -> None:
                 check("p 翻开项目文档/笔记", len(app.screen_stack) > 1, True)
                 await pilot.press("escape")
                 await pilot.pause()
+                # `?` / `m` / `O` —— 没有菜单栏之后的三个入口（对齐 kander 的单键通
+                # 道：速查表、全局菜单、对选中对象的动作）
+                await pilot.press("question_mark")
+                await pilot.pause()
+                cheat = app.screen_stack[-1]
+                cheat_text = "\n".join(str(c.render())
+                                        for c in cheat.query("Label"))
+                check("? 打开键位速查表", len(cheat.query("Label")) >= 10, True)
+                check("速查表列全了 Tab/j/k/o", all(k in cheat_text for k in ("Tab", "j / k", "o")), True)
+                await pilot.press("escape")
+                await pilot.pause()
+                await pilot.press("m")
+                await pilot.pause()
+                gm = app.screen_stack[-1]
+                gitems = [str(i.query_one(Label).render())
+                          for i in gm.query("#menu_list ListItem")]
+                check("m 打开全局菜单", "立即刷新" in gitems and "退出看板" in gitems, True)
+                await pilot.press("escape")
+                await pilot.pause()
+                CALLED.clear()
+                await pilot.press("O")
+                await pilot.pause()
+                om = app.screen_stack[-1]
+                check("O 的标题点名选中那片",
+                      "auth-api" in str(om.query_one("#menu_title", Label).render()), True)
+                oitems = [str(i.query_one(Label).render())
+                          for i in om.query("#menu_list ListItem")]
+                check("对象菜单带派活与外部评审",
+                      any("外部评审" in x for x in oitems) and any("派给 dev" in x for x in oitems), True)
+                await pilot.press("j")            # 外部评审
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                await asyncio.sleep(0.4)
+                check("菜单里选外部评审真的跑了", "外部评审" in app.status_text, True)
+                await pilot.press("O")            # 再开，选「派给 dev」
+                await pilot.pause()
+                for _ in range(2):
+                    await pilot.press("j")
+                    await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                await asyncio.sleep(0.4)
+                check("菜单里选派活真的投了", bool(SENT) and SENT[-1][0] == "dev", True)
                 # 鼠标点角色卡 = 切目标
                 await pilot.click("#card_dev")
                 await pilot.pause()
@@ -4769,6 +4853,44 @@ def test_fullscreen_board_tui() -> None:
         asyncio.run(_drive())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_mermaid_and_markdown_preview() -> None:
+    """[103] 文档预览：markdown 直接渲染；mermaid 常见子集画成 ASCII，认不出退回源码。"""
+    print("\n[103] 文档预览：mermaid → ASCII 流程图 + markdown 直显")
+    from xteam_lib import mermaid_to_ascii, render_doc_markdown
+
+    td = mermaid_to_ascii(
+        "graph TD\n  A[开始] --> B{判断}\n  B -->|是| C[做这件事]\n  B -->|否| D[另一件事]\n",
+        width=48)
+    check("TD：四个框各就各位", all(x in td for x in ("开始", "判断", "做这件事", "另一件事")), True)
+    check("TD：层与层之间有连线", "│" in td and "▼" in td, True)
+    check("TD：边标签画上", "是" in td, True)
+    check("TD：源符号不残留", "-->" not in td and "{" not in td, True)
+
+    lr = mermaid_to_ascii("graph LR\n  A[写 spec] -->|评估| B[TL 看]\n", width=44)
+    check("LR：同层横排", "写 spec" in lr and "TL 看" in lr, True)
+    check("LR：真实边的箭头", "─▶" in lr, True)
+    check("LR：兄弟之间不画箭头", lr.count("▶"), 1)
+
+    chain = mermaid_to_ascii("flowchart TD\n  A --> B --> C\n", width=30)
+    check("链式边连通三层", chain.count("▼") >= 2, True)
+
+    # 认不出的语法必须原样退回 —— 画错一张图比不画更糟
+    for bad in ("sequenceDiagram\n  A->>B: hi\n",
+                "graph TD\n  A --> B\n  B --> A\n",
+                "gantt\n  title 计划\n",
+                "graph TD\n  subgraph one\n  A --> B\n  end\n"):
+        check(f"认不出就退回源码：{bad.splitlines()[0][:16]}",
+              mermaid_to_ascii(bad, width=30).strip(), bad.strip())
+
+    doc = ("# 标题\n\n- 一项\n\n```mermaid\ngraph TD\n  A[开始] --> B[结束]\n```\n\n结尾。\n")
+    out = render_doc_markdown(doc, width=40)
+    check("markdown 里的 mermaid 换成图", "╭" in out and "开始" in out, True)
+    check("其余 markdown 原样保留", "# 标题" in out and "- 一项" in out and "结尾。" in out, True)
+    bad_doc = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n"
+    out2 = render_doc_markdown(bad_doc, width=40)
+    check("画不出来的 mermaid 保留源码不骗人", "sequenceDiagram" in out2, True)
 
 
 def main() -> int:
@@ -4875,6 +4997,8 @@ def main() -> int:
         test_interactive_board_console,
         test_kanban_board_renderer,
         test_fullscreen_board_tui,
+        test_request_needs_acceptance_criteria,
+        test_mermaid_and_markdown_preview,
     ):
         fn()
     print()

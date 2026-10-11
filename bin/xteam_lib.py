@@ -634,6 +634,256 @@ def _fit_cell(text: str, max_w: int) -> str:
     return acc + "…"
 
 
+# ---------------------------------------------------------------- 文档预览
+
+_MERMAID_NODE_SHAPES = ("[[", "((", "{{", "[[", ">", "((", ")")
+_MERMAID_ARROW = re.compile(r"\s*(-{2,}>|-{3,}|-\.+->|={2,}>)\s*")
+
+_MERMAID_DIRECTIONS = {"TD": "tb", "TB": "tb", "BT": "tb", "LR": "lr",
+                       "RL": "lr"}
+
+
+def _mermaid_node_label(raw: str) -> tuple[str, str]:
+    """把一个节点定义拆成 (id, 标签)。认 `A[标签]` / `A(标签)` / `A{标签}` /
+    `A((标签))` / `A[[标签]]` 五种常见形状。返回的标签已去掉首尾空白。"""
+    s = raw.strip()
+    for opener, closer in (("((", "))"), ("[[", "]]"), ("{{", "}}"),
+                           ("{", "}"), ("[", "]"), ("(", ")"), (">", "]")):
+        i = s.find(opener)
+        if i > 0 and s.endswith(closer):
+            return s[:i].strip(), s[i + len(opener):-len(closer)].strip()
+    return s, s
+
+
+def mermaid_to_ascii(src: str, width: int = 60) -> str:
+    """把 mermaid 流程图的**常见子集**画成 ASCII。认不了就原样退回源码。
+
+    支持：`graph|flowchart TD|LR`、节点 `A[标签]`/`A(标签)`/`A{标签}`/`A((标签))`/
+    `A[[标签]]`、边 `-->` / `---` / `-.->` / `==>`（可带 `|标签|`）、链式 `A --> B --> C`。
+    其余语法（sequenceDiagram / gantt / subgraph / classDef 等）整块退回 —— 宁可显示
+    源码，也不要画错一张图：一张错的流程图比没有流程图更糟。
+
+    画法：按最长路径分层，一层一行；层内子节点尽量排在父节点正下方，减少交叉。
+    标签宽度按显示列宽算（和盒子模型同一套口径，中文不会错位）。
+    """
+    lines = [l.strip() for l in src.strip().splitlines()]
+    if not lines:
+        return src
+    head = lines[0].split()
+    if not head or head[0].lower() not in ("graph", "flowchart"):
+        return src
+    direction = "tb"
+    for token in head[1:]:
+        if token.upper() in _MERMAID_DIRECTIONS:
+            direction = _MERMAID_DIRECTIONS[token.upper()]
+            break
+
+    labels: dict[str, str] = {}
+    edges: list[tuple[str, str, str]] = []
+    order: list[str] = []
+
+    def _touch(nid: str, label: str = "") -> None:
+        if nid and nid not in labels:
+            labels[nid] = label or nid
+            order.append(nid)
+        elif label and labels.get(nid) == nid:
+            labels[nid] = label
+
+    for raw in lines[1:]:
+        s = raw.strip()
+        if not s or s.startswith("%%") or s.lower().startswith(
+                ("subgraph", "end", "classdef", "class ", "style", "linkstyle",
+                 "direction", "click")):
+            return src                       # 不猜，退回源码
+        parts = _MERMAID_ARROW.split(s)
+        # 第一个片段是源头节点，必须先登记 —— 否则整行的起点丢失，边也就断了
+        nid0, lab0 = _mermaid_node_label(parts[0].strip())
+        _touch(nid0, lab0)
+        prev = nid0
+        for k in range(1, len(parts), 2):
+            edge_label, nxt = "", parts[k + 1].strip()
+            m = re.match(r"^\|([^|]*)\|\s*(.*)$", nxt)
+            if m:
+                edge_label, nxt = m.group(1).strip(), m.group(2).strip()
+            if not nxt:
+                return src                   # 语法不认，退回
+            nid2, lab2 = _mermaid_node_label(nxt)
+            _touch(nid2, lab2)
+            if prev is not None:
+                edges.append((prev, nid2, edge_label))
+            prev = nid2
+
+    if not labels:
+        return src
+
+    # ---- 分层：最长路径（Kahn 拓扑，层号 = max(父层) + 1）----
+    indeg = {n: 0 for n in order}
+    for _u, v, _l in edges:
+        indeg[v] = indeg.get(v, 0) + 1
+    level = {n: 0 for n in order}
+    queue = [n for n in order if indeg[n] == 0]
+    seen = 0
+    while queue:
+        n = queue.pop(0)
+        seen += 1
+        for u, v, _l in edges:
+            if u == n:
+                level[v] = max(level[v], level[n] + 1)
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    queue.append(v)
+    if seen != len(order):
+        return src                           # 有环：退回，不画死循环
+
+    layers: dict[int, list[str]] = {}
+    for n in order:
+        layers.setdefault(level[n], []).append(n)
+    max_level = max(layers)
+
+    # ---- 层内排布：子节点跟着父节点的横向序号走，然后连续编号避免重叠 ----
+    slot: dict[str, float] = {}
+    for lv in range(max_level + 1):
+        members = layers.get(lv, [])
+        desired = []
+        for n in members:
+            parents = [slot[u] for u, v, _l in edges
+                       if v == n and u in slot]
+            desired.append(sum(parents) / len(parents) if parents else 0.0)
+        for i, n in sorted(enumerate(members),
+                           key=lambda t: (desired[t[0]], order.index(t[1]))):
+            slot[n] = float(i)
+    ncols = max(len(layers.get(lv, [])) for lv in range(max_level + 1))
+    col_w = max(6, width // max(1, ncols))
+    lab_w = max(4, col_w - 4)
+
+    def _box(text: str) -> list[str]:
+        label = text if _cell_len(text) <= lab_w else _fit_cell(text, lab_w)
+        inner = _cell_len(label)
+        return ["╭" + "─" * (inner + 2) + "╮",
+                "│ " + label + " " * (inner - _cell_len(label) + 1) + "│",
+                "╰" + "─" * (inner + 2) + "╯"]
+
+    out: list = []
+    if direction == "lr":
+        # 横向流程图：一层一段，段内用 ──▶ 串起来。竖着画 LR 是骗人。
+        for lv in range(max_level + 1):
+            members = layers.get(lv, [])
+            if not members:
+                continue
+            boxes = [_box(labels[n]) for n in members]
+            bw = max(len(b[0]) for b in boxes)
+            gap = 4
+            # 每个盒子的中心 x，用来在层与层之间画真实存在的边
+            centers = [i * (bw + gap) + bw // 2 for i in range(len(boxes))]
+            for row_i in range(3):
+                cells = []
+                for i, b in enumerate(boxes):
+                    pad = bw - len(b[0])
+                    cells.append(b[row_i] if row_i < len(b)
+                                 else " " * bw)
+                    cells.append(" " * (pad + gap))
+                out.append("".join(cells).rstrip())
+            nxt = layers.get(lv + 1, [])
+            if not nxt:
+                continue
+            # 层间连线：只画真实存在的边，兄弟节点之间不画箭头
+            lane = [" "] * (len(boxes) * (bw + gap))
+            for i, child in enumerate(nxt):
+                parents = [u for u, v, _l in edges
+                           if v == child and level[u] == lv]
+                if not parents:
+                    continue
+                p = members.index(parents[0])
+                x = centers[p]
+                arrow_at = x + bw // 2 + 2
+                for k in range(x, arrow_at):
+                    if k < len(lane):
+                        lane[k] = "─"
+                if arrow_at < len(lane):
+                    lane[arrow_at] = "▶"
+                lab = next((l for u, v, l in edges
+                            if v == child and u == parents[0] and l), "")
+                if lab:
+                    lane[x + bw // 2 + 5:x + bw // 2 + 5 + len(lab)] = list(lab)
+            out.append("".join(lane).rstrip())
+        return "\n".join(out)
+
+    for lv in range(max_level + 1):
+        members = layers.get(lv, [])
+        if not members:
+            continue
+        boxes = [_box(labels[n]) for n in members]
+        bw = max(len(b[0]) for b in boxes)
+        h = max(len(b) for b in boxes)
+        for row in range(h):
+            cells = []
+            for i, b in enumerate(boxes):
+                cells.append(b[row] if row < len(b) else " " * bw)
+                if i != len(boxes) - 1:
+                    cells.append(" " * max(1, col_w - bw))
+            out.append("".join(cells).rstrip())
+        nxt = layers.get(lv + 1, [])
+        if not nxt:
+            continue
+        for child in nxt:
+            parents = [u for u, v, _l in edges
+                       if v == child and level[u] == lv]
+            if not parents:
+                continue
+            if direction != "tb":
+                out.append("  │")
+                continue
+            px = int(slot[parents[0]]) * col_w + bw // 2
+            edge_label = next((lab for u, v, lab in edges
+                               if v == child and u == parents[0] and lab), "")
+            cx = int(slot[child]) * col_w + bw // 2
+            pad = " " * px
+            if cx == px:
+                out.append(pad + "│" + (f" {edge_label}" if edge_label else ""))
+                out.append(pad + "▼")
+            else:
+                # 父子不同列：先横后竖（简单画法，宁可直白也不画错）
+                step = "▶" if cx > px else "◀"
+                out.append(pad + "│" + (f" {edge_label}" if edge_label else ""))
+                out.append(pad + "└" + "─" * abs(cx - px) + "▼")
+    return "\n".join(out)
+
+
+def render_doc_markdown(text: str, width: int = 60) -> str:
+    """把一份文档变成「能直接看」的 markdown：mermaid 代码块换成 ASCII 图。
+
+    其余部分原样交给 MarkdownViewer 渲染（标题/列表/代码块/表格它都认）。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```") and "mermaid" in stripped.lower():
+            j = i + 1
+            block: list[str] = []
+            while j < n and not lines[j].strip().startswith("```"):
+                block.append(lines[j])
+                j += 1
+            src = "\n".join(block)
+            art = mermaid_to_ascii(src, width=width)
+            if art.strip() == src.strip():
+                out.append("```")            # 画不出来：保留源码，别骗人
+                out.extend(block)
+                out.append("```")
+            else:
+                out.append("```")
+                out.extend(art.splitlines())
+                out.append("```")
+            i = j + 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def wrap_display(text: str, width: int) -> list[str]:
     """按**显示列宽**折行（中英文混排不会把字切断）。
 
@@ -1845,6 +2095,24 @@ def _verdict_passed(task: Path) -> bool:
     return str(_read_json(task / "verdict.json").get("verdict", "")).upper() == "PASS"
 
 
+def _has_acceptance(task: Path) -> bool:
+    """request.md 里有没有「验收标准」节。
+
+    **派活不能只有开发目标。** 没有验收标准，dev 无从判断「做完了没有」，gate 也只能
+    靠 PM 现场编判据（用户 2026-10-11）。判据是文件里的一节，不是嘴上有说过 ——
+    所以只认 request.md 里带「验收」二字的标题行。
+    """
+    p = task / "request.md"
+    if not p.is_file():
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(line.lstrip().startswith("#") and "验收" in line
+               for line in text.splitlines())
+
+
 def _spec_round(task: Path) -> int:
     return _round(task / "spec.json", "round")
 
@@ -2216,6 +2484,12 @@ class Protocol:
         # 阶段二：执行
         if (task / "request.md").exists() and not closed:
             delivered = (task / "delivered.json").exists()
+            # **验收标准是 dev 开工的前置。** 缺它就不给 dev「开工」这条义务 ——
+            # 否则 dev 只能靠猜「做完了没有」，PM 门禁也只能当场编判据。
+            # 欠 TL 一条 criteria：巡检会一直催到补上，链条看得见在等什么。
+            if not delivered and not _has_acceptance(task):
+                out["tl"] = "criteria"
+                return out          # dev 不得在没有验收标准的 request 上开工
             fail_pending = (
                 (task / "verdict.json").exists()
                 and not _verdict_passed(task)
@@ -2685,6 +2959,9 @@ OBLIGATIONS: dict[str, str] = {
               "spec.json 的 round +1 重发，或写明为什么不改），无异议就写 "
               "agreement.json 确认并引导 TL 拆解。",
     "decompose": "spec 已与 PM 达成一致，现在可以拆解了 —— 去写 request.md。",
+    "criteria": "request.md 缺「验收标准」节 —— 补上怎么测（一条命令可跑出期望值）、"
+               "什么算过、谁验，再让 dev 开工。**只有开发目标没有验收标准的派活，"
+               "dev 只能靠猜做完了没有。**",
     "implement": "request.md 已下但还没收到你的 delivered.json —— 开工，做完上报。",
     "chase": "dev 已交付但你还没做工作 review —— 去看 diff，该打回就打回。",
     "gate": "TL 已喊 ready，本切片等你出 verdict.json（PASS/FAIL）—— PM 门禁。",
