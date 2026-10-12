@@ -1,5 +1,22 @@
 # 变更记录
 
+## 0.2.26
+
+### 修「跳到 pane」按钮点了没反应
+
+用户实测：点板子上的「⇥ 跳到 pane」，pane 不动。
+
+**根因**：`herdr pane focus` 只接受方向参数（`--direction left|right|up|down`），
+聚焦的是**邻居** pane；传 `--pane` 它直接打印用法并退出。而 `herdr agent focus
+<pane_id>` 才是按 pane 寻址的正路（实测 `agent focus wM:p1` → `focused: true`）。
+原代码先找 agent 记录的 `name` 字段，herdr 根本不返回这个字段，于是永远走到
+`pane focus --pane` 那条死路。
+
+**修法**：一律 `agent focus <pane_id>`。pane_id 是 herdr 返回里一定有的字段，
+比 name 稳。补了回归断言（点跳转钮必须找到那个角色的 pane）。
+
+门禁：静态 ✓ · 单测 1052 条断言 ✓ · e2e 369/369 ✓ · 端到端 ✓
+
 ## 0.2.25
 
 ### 人的需求录入：想清楚 → 写下来 → 立成队列项 → 推给 PM

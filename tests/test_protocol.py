@@ -4834,6 +4834,17 @@ def test_fullscreen_board_tui() -> None:
                 await pilot.pause()
                 await asyncio.sleep(0.4)
                 check("菜单里选派活真的投了", bool(SENT) and SENT[-1][0] == "dev", True)
+                # 跳到 pane：必须调 `herdr agent focus <pane_id>`。
+                # 回归：原来走 `pane focus --pane`，而 herdr 的 pane focus 只认方向
+                # （left/right/up/down），传 pane 直接打印用法退出 —— 按钮看着没反应。
+                FOCUSED = []
+                app._focus_pane = lambda role: (FOCUSED.append(role),
+                                                (True, f"{role} 已到前面"))[1]
+                await pilot.click("#jump_dev")
+                await pilot.pause()
+                await asyncio.sleep(0.4)
+                check("点跳转钮去找那个角色的 pane", FOCUSED, ["dev"])
+                check("状态行回报聚焦结果", "已到前面" in app.status_text, True)
                 # 每张卡都有「跳到 pane」按钮，且点完不抢焦点（抢了焦点 j/k 就失灵）
                 check("三角色卡各有跳到 pane 钮",
                       len(list(app.query(".role_card .jump"))), 3)
