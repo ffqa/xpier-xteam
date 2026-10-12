@@ -655,6 +655,49 @@ def _mermaid_node_label(raw: str) -> tuple[str, str]:
     return s, s
 
 
+
+def _group_row(boxes: list, members: list, group_of: dict, bw: int, h: int):
+    """把一层的盒子按 subgraph 包成面板。同组相邻的盒子进同一个框，
+    框标题是组名；没有组的盒子原样输出。"""
+    panels: list = []
+    i = 0
+    while i < len(boxes):
+        g = group_of.get(members[i], "")
+        j = i
+        while j + 1 < len(boxes) and group_of.get(members[j + 1], "") == g:
+            j += 1
+        chunk = boxes[i:j + 1]
+        if not g:
+            panels.extend(chunk)
+        else:
+            n = len(chunk)
+            inner_w = n * bw + (n - 1)          # 盒子间距 1 列
+            title = f" {g} "
+            top = "┌" + title + "─" * max(0, inner_w - _cell_len(title)) + "┐"
+            rows = [top]
+            for r in range(h):
+                cells = []
+                for k, b in enumerate(chunk):
+                    line = b[r] if r < len(b) else " " * bw
+                    cells.append(line if _cell_len(line) == bw
+                                 else _pad_cell(line, bw))
+                    if k != n - 1:
+                        cells.append(" ")
+                body = "".join(cells)
+                rows.append("│" + body + " " * max(0, inner_w - _cell_len(body)) + "│")
+            rows.append("└" + "─" * inner_w + "┘")
+            panels.append(rows)
+        i = j + 1
+    # 统一成「每项是一个 3 行（或更高）块」的列表，交给后面的逐行拼装
+    norm: list = []
+    for p in panels:
+        if isinstance(p, list):
+            norm.append(p)
+        else:
+            norm.append([p])
+    return norm
+
+
 def mermaid_to_ascii(src: str, width: int = 60) -> str:
     """把 mermaid 流程图的**常见子集**画成 ASCII。认不了就原样退回源码。
 
@@ -681,40 +724,76 @@ def mermaid_to_ascii(src: str, width: int = 60) -> str:
     labels: dict[str, str] = {}
     edges: list[tuple[str, str, str]] = []
     order: list[str] = []
+    group_of: dict[str, str] = {}          # 节点 → subgraph 标签（没有则为 ""）
+    groups: list = []                      # 出现顺序，用于渲染时保持稳定
 
     def _touch(nid: str, label: str = "") -> None:
         if nid and nid not in labels:
             labels[nid] = label or nid
             order.append(nid)
+            group_of[nid] = cur[0]
+            if cur[0] and cur[0] not in groups:
+                groups.append(cur[0])
         elif label and labels.get(nid) == nid:
             labels[nid] = label
 
+    cur = [""]                              # 当前 subgraph 标签（栈只用一层）
+    declared: dict = {}                     # subgraph → 块里提到的节点
     for raw in lines[1:]:
         s = raw.strip()
-        if not s or s.startswith("%%") or s.lower().startswith(
-                ("subgraph", "end", "classdef", "class ", "style", "linkstyle",
-                 "direction", "click")):
+        if not s or s.startswith("%%"):
+            continue
+        low = s.lower()
+        if low.startswith("subgraph"):
+            # subgraph 标题可有可无：`subgraph one[第一组]` 或 `subgraph one`
+            rest = s[len("subgraph"):].strip()
+            if rest:
+                _gid, _glab = _mermaid_node_label(rest)
+                cur[0] = _glab or _gid
+                if cur[0] and cur[0] not in groups:
+                    groups.append(cur[0])
+            continue
+        if low == "end":
+            cur[0] = ""
+            continue
+        if low.startswith(("classdef", "class ", "style", "linkstyle",
+                           "direction", "click")):
             return src                       # 不猜，退回源码
         parts = _MERMAID_ARROW.split(s)
         # 第一个片段是源头节点，必须先登记 —— 否则整行的起点丢失，边也就断了
         nid0, lab0 = _mermaid_node_label(parts[0].strip())
         _touch(nid0, lab0)
+        if cur[0]:
+            declared.setdefault(cur[0], []).append(nid0)
         prev = nid0
         for k in range(1, len(parts), 2):
             edge_label, nxt = "", parts[k + 1].strip()
             m = re.match(r"^\|([^|]*)\|\s*(.*)$", nxt)
             if m:
                 edge_label, nxt = m.group(1).strip(), m.group(2).strip()
+            elif nxt.startswith("|"):
+                # 边标签没闭上（`A -->|label B`）—— 语法坏了。按字面当成节点名
+                # 会画出一个名叫「|label B」的框，那是错图；退回源码。
+                return src
             if not nxt:
                 return src                   # 语法不认，退回
             nid2, lab2 = _mermaid_node_label(nxt)
             _touch(nid2, lab2)
+            if cur[0]:
+                declared.setdefault(cur[0], []).append(nid2)
             if prev is not None:
                 edges.append((prev, nid2, edge_label))
             prev = nid2
 
     if not labels:
         return src
+
+    # 节点归属以 subgraph 里的声明为准 —— 先在外面连了边、后面才进 subgraph 的
+    # 节点仍算那个组（mermaid 的语义），不能按「首次出现在哪」判。
+    for gname, nodes in declared.items():
+        for nid in nodes:
+            if nid in labels:
+                group_of[nid] = gname
 
     # ---- 分层：最长路径（Kahn 拓扑，层号 = max(父层) + 1）----
     indeg = {n: 0 for n in order}
@@ -771,7 +850,7 @@ def mermaid_to_ascii(src: str, width: int = 60) -> str:
             if not members:
                 continue
             boxes = [_box(labels[n]) for n in members]
-            bw = max(len(b[0]) for b in boxes)
+            bw = max(_cell_len(b[0]) for b in boxes)
             gap = 4
             # 每个盒子的中心 x，用来在层与层之间画真实存在的边
             centers = [i * (bw + gap) + bw // 2 for i in range(len(boxes))]
@@ -813,12 +892,19 @@ def mermaid_to_ascii(src: str, width: int = 60) -> str:
         if not members:
             continue
         boxes = [_box(labels[n]) for n in members]
-        bw = max(len(b[0]) for b in boxes)
+        bw = max(_cell_len(b[0]) for b in boxes)
         h = max(len(b) for b in boxes)
-        for row in range(h):
+        # 同一层里同一 subgraph 的盒子包进一个面板（组名做面板标题）
+        if groups:
+            boxes = _group_row(boxes, members, group_of, bw, h)
+        block_h = max((len(b) for b in boxes), default=h)
+        widths = [_cell_len(b[0]) for b in boxes]
+        for row in range(block_h):
             cells = []
             for i, b in enumerate(boxes):
-                cells.append(b[row] if row < len(b) else " " * bw)
+                line = b[row] if row < len(b) else (" " * widths[i])
+                cells.append(line if _cell_len(line) == widths[i]
+                             else _pad_cell(line, widths[i]))
                 if i != len(boxes) - 1:
                     cells.append(" " * max(1, col_w - bw))
             out.append("".join(cells).rstrip())
@@ -2093,6 +2179,63 @@ def _verdict_delivery(task: Path) -> int:
 
 def _verdict_passed(task: Path) -> bool:
     return str(_read_json(task / "verdict.json").get("verdict", "")).upper() == "PASS"
+
+
+# ---------------------------------------------------------------- 多 team
+
+TEAMS_FILE = "teams.json"
+DEFAULT_TEAM = "main"
+
+
+def teams_path(root: Path) -> Path:
+    return root / XTEAM_DIRNAME / TEAMS_FILE
+
+
+def read_teams(root: Path, fallback_label: str = "") -> list:
+    """这个项目有哪些 team。**没有 teams.json 就是单 team** ——
+    那一条是所有既有行为的兜底：name="main"、label=项目自己的 workspace。
+
+    返回 [{"name": str, "label": str}]，顺序即启动顺序。
+    """
+    p = teams_path(root)
+    if not p.is_file():
+        return [{"name": DEFAULT_TEAM, "label": fallback_label}]
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [{"name": DEFAULT_TEAM, "label": fallback_label}]
+    teams = [t for t in (data.get("teams") or []) if isinstance(t, dict) and t.get("name")]
+    if not any(t["name"] == DEFAULT_TEAM for t in teams):
+        teams.insert(0, {"name": DEFAULT_TEAM, "label": fallback_label})
+    return teams
+
+
+def write_teams(root: Path, teams: list) -> None:
+    write_json(teams_path(root), {"teams": teams, "_updated": now()}, indent=2)
+
+
+def team_of(task: Path, default: str = DEFAULT_TEAM) -> str:
+    """切片归哪个 team 干。没写就是 main —— 单 team 项目永远走这条，行为不变。"""
+    tj = task / "task.json"
+    if tj.is_file():
+        try:
+            data = json.loads(tj.read_text(encoding="utf-8"))
+            t = str(data.get("team") or "").strip()
+            if t:
+                return t
+        except (OSError, json.JSONDecodeError):
+            pass
+    spec = task / "spec.md"
+    if spec.is_file():
+        try:
+            for line in spec.read_text(encoding="utf-8", errors="replace").splitlines()[:8]:
+                if line.lower().startswith("team:"):
+                    t = line.split(":", 1)[1].strip()
+                    if t:
+                        return t
+        except OSError:
+            pass
+    return default
 
 
 def _has_acceptance(task: Path) -> bool:
@@ -4515,7 +4658,7 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                   role_map: dict, refresh_secs: float = 2.0,
                   collector=None, dispatcher=None, qa_runner=None,
                   rotator=None, note_writer=None, bring_up=None,
-                  respawn=None) -> bool:
+                  respawn=None, teams=None) -> bool:
     """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
 
     **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
@@ -4533,4 +4676,4 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                                  collector=collector, dispatcher=dispatcher,
                                  qa_runner=qa_runner, rotator=rotator,
                                  note_writer=note_writer, bring_up=bring_up,
-                                 respawn=respawn)
+                                 respawn=respawn, teams=teams)

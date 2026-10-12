@@ -72,6 +72,11 @@ from xteam_lib import (  # noqa: E402
     wiki_search,
     wiki_dir,
     wiki_files,
+    teams_path,
+    read_teams,
+    write_teams,
+    team_of,
+    DEFAULT_TEAM,
     parse_context_pct,
     XTEAM_DIRNAME,
     recap_path,
@@ -1941,6 +1946,15 @@ def cmd_say(args: argparse.Namespace) -> int:
     proto = Protocol(root)
     label, _ws_why = resolve_ws_label(root, args.workspace)
     herdr = Herdr(scope=label)
+    team = getattr(args, "team", "") or ""
+    if team:
+        # 派给某个 team 的 tl/dev：那个 team 有**自己的 workspace**（PM 仍只有一个）。
+        teams = read_teams(root, label)
+        hit = [t for t in teams if t["name"] == team]
+        if not hit:
+            die(f"没有 team {team!r}。现有：{'、'.join(t['name'] for t in teams)}")
+        label = hit[0].get("label") or f"{label}-{team}"
+        herdr = Herdr(scope=label)
     ws = herdr.find_workspace(label)
     if not ws:
         die(f"找不到 workspace {label!r}")
@@ -2588,6 +2602,7 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         if t.name in gate:
             note = "**待 gate**"
         slices.append({"name": t.name, "stage": proto._stage(t),
+                       "team": team_of(t),
                        "note": f"{note}  {owes or '（没人欠活）'}"})
 
     events = []
@@ -2755,6 +2770,86 @@ def _board_bring_up(root: Path, proto: Protocol, label: str, role: str) -> tuple
         return False, str(exc)
 
 
+def cmd_team(args: argparse.Namespace) -> int:
+    """多 team：一个 PM 底下挂 N 套 tl/dev。单 team 时这条命令只是查看。"""
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    main_label, _ = resolve_ws_label(root, args.workspace)
+    teams = read_teams(root, main_label)
+
+    if args.team_action == "list":
+        print(f"[{now()}] {len(teams)} 个 team（项目 {main_label!r}）")
+        herdr = Herdr(scope=main_label)
+        for t in teams:
+            name, label = t["name"], t.get("label") or main_label
+            roles = []
+            ws = herdr.find_workspace(label)
+            if ws:
+                rm = herdr.role_map(ws["workspace_id"])
+                for r in ("tl", "dev"):
+                    a = rm.get(r)
+                    if a:
+                        roles.append(f"{r}={a.get('agent_status', '?')}")
+            open_slices = [x.name for x in proto.open_tasks()
+                           if team_of(x) == name]
+            note = " · ".join(roles) if roles else "（tl/dev 没在跑）"
+            print(f"  {name:<10} {note}"
+                  + (f" · 在飞 {len(open_slices)} 片：{'、'.join(open_slices[:3])}"
+                     if open_slices else ""))
+        if len(teams) == 1:
+            print("  （单 team —— `xteam team add <名字>` 起第二套 tl/dev）")
+        return 0
+
+    if args.team_action == "add":
+        name = (args.name or "").strip()
+        if not name:
+            die("team 名不能空：xteam team add <名字>")
+        if name == DEFAULT_TEAM:
+            die(f"{DEFAULT_TEAM!r} 是默认组，不用 add")
+        if any(t["name"] == name for t in teams):
+            die(f"team {name!r} 已存在")
+        if not name.replace("-", "").replace("_", "").isalnum():
+            die(f"team 名只能用字母数字和 -_：收到 {name!r}")
+        label = f"{main_label}-{name}"
+        herdr = Herdr(scope=label)
+        if not herdr.find_workspace(label):
+            # 只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）
+            out = bring_up_roles(root, proto, label, load_roles(root),
+                                 only=["tl", "dev"])
+            print(f"  team {name!r} 的 tl/dev 已起：{out['started']}")
+        else:
+            print(f"  workspace {label!r} 已存在，直接收编")
+        teams.append({"name": name, "label": label})
+        write_teams(root, teams)
+        print(f"  已记入 {teams_path(root).relative_to(root)}"
+              f"（切片写 team: {name} 就归这组干）")
+        print(f"  派活：xteam say --team {name} dev \"…\"")
+        return 0
+
+    if args.team_action == "rm":
+        name = (args.name or "").strip()
+        if name == DEFAULT_TEAM:
+            die(f"{DEFAULT_TEAM!r} 组删不得")
+        hit = [t for t in teams if t["name"] == name]
+        if not hit:
+            die(f"没有 team {name!r}")
+        busy = [x.name for x in proto.open_tasks() if team_of(x) == name]
+        if busy:
+            die(f"team {name!r} 手上还有在飞的片：{'、'.join(busy)} —— "
+                f"先闭合或把它们的 team 改掉")
+        label = hit[0].get("label") or f"{main_label}-{name}"
+        herdr = Herdr(scope=label)
+        ws = herdr.find_workspace(label)
+        if ws:
+            herdr.close_workspace(ws["workspace_id"])
+            print(f"  已关 workspace {label!r}")
+        write_teams(root, [t for t in teams if t["name"] != name])
+        print(f"  已从 {teams_path(root).relative_to(root)} 移除")
+        return 0
+
+    die(f"未知 team 动作：{args.team_action}")
+
+
 def cmd_board(args: argparse.Namespace) -> int:
     """全屏看板：顶 title ｜ 左：笔记/输入 ｜ 中：三角色 ｜ 右：spec 档案 ｜ 底：状态。
 
@@ -2794,6 +2889,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         qa_runner=lambda name: _board_run_qa(root, name, args.workspace),
         bring_up=lambda role: _board_bring_up(root, proto, label, role),
         respawn=lambda role, agent="": _board_respawn(root, label, role, agent),
+        teams=read_teams(root, label),
         rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
@@ -3395,7 +3491,18 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"\n队列：{pending_n} 项未完成 / 共 {total_n} 项")
     open_tasks = proto.slice_order(proto.open_tasks())
     if open_tasks:
-        print(f"未闭合切片：{', '.join(t.name for t in open_tasks)}")
+        # 多 team 才按组分组印 —— 单 team 项目输出与以前逐字节相同
+        teams = read_teams(root, label)
+        if len(teams) > 1:
+            by_team: dict = {}
+            for t in open_tasks:
+                by_team.setdefault(team_of(t), []).append(t.name)
+            print("未闭合切片（按 team）：")
+            for tm in teams:
+                got = by_team.get(tm["name"]) or []
+                print(f"  {tm['name']:<10} {', '.join(got) if got else '（没有在飞的片）'}")
+        else:
+            print(f"未闭合切片：{', '.join(t.name for t in open_tasks)}")
 
         # 依赖状态：等前置的切片看起来和「卡住」一模一样，必须单独讲清。
         cycles = proto.dep_cycles()
@@ -4805,6 +4912,11 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_search)
 
+    p = sub.add_parser("team", help="多 team：一个 PM 挂 N 套 tl/dev（单 team 时只是查看）")
+    p.add_argument("team_action", choices=["list", "add", "rm"])
+    p.add_argument("name", nargs="?", default="", help="add/rm 的 team 名")
+    p.set_defaults(func=cmd_team)
+
     p = sub.add_parser("wiki", help="翻 wiki 沉淀（默认看最近的几条 → show 读全文）")
     p.add_argument("wiki_action", nargs="?", default="tail",
                    choices=["tail", "list", "show"], help="tail 最近 / list 全部 / show 读一份")
@@ -4897,6 +5009,8 @@ def main() -> int:
     p.add_argument("--settle", type=int, default=0, help="投递后等几秒再读状态")
     p.add_argument("--wait-empty", type=float, default=15.0, metavar="SECS",
                    help="输入框里有草稿时，等它变空几秒（默认 15；0 = 不等，直接不投）")
+    p.add_argument("--team", default="",
+                   help="派给哪个 team 的 tl/dev（单 team 不用给）")
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("snap", help="按 delivered.json.changed[] 钉交付快照（提交）")
@@ -4926,6 +5040,7 @@ def main() -> int:
     p.set_defaults(func=cmd_stats)
 
     p = sub.add_parser("status", help="状态表（带时间戳）")
+    p.add_argument("--team", default="", help="只看某个 team 的在飞切片")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("stamp", help="给本角色输出打时间戳并记入共享时间线")

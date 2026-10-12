@@ -1,5 +1,35 @@
 # 变更记录
 
+## 0.2.23
+
+### mermaid 支持 subgraph；多 team 起步（一个 PM 挂 N 套 tl/dev）
+
+两件事：
+
+**1. mermaid 支持 `subgraph`**
+- `subgraph 名[标签] … end` 现在会把该组节点包进带标题的面板；先在外部连了边、后面
+  才进组的节点也算那个组（mermaid 的语义，按声明位置判，不按首次出现位置）。
+- 同层同组多节点在面板里并排。
+- 顺手修一个真缺口：未闭合的边标签（`A -->|label B`）原来会被当成节点名，画出一个
+  名叫「|label B」的框 —— 那是错图。现在这种语法整块退回源码。
+- 渲染宽度一律改用显示列宽：含中文时 `len()` ≠ 列宽，混用会把面板截断出「…」。
+
+**2. 多 team：`xteam team list|add|rm`，一个 PM 挂 N 套 tl/dev**
+- 每个 team 是**自己的 workspace**（`<项目>-<team>`），里面跑 tl/dev；PM 仍然只有一个
+  —— 它是唯一裁决者，也是人的替身。这样 `role_map` / `_boot_role` / `say` 全部不用改，
+  pane 命名与寻址保持原样。
+- 切片归属写在 `task.json` 的 `team` 或 `spec.md` 的 front-matter；不写就是 `main`。
+- `status` 多 team 时按组印在飞切片；`say --team <名字> <角色> "…"` 把门铃投到那组的
+  pane。
+- board 多 team 时顶部出一条组带（每组在飞片数 + 当前组 `◀`），`[` `]` 切组。
+- **单 team 行为一字节没动**：没有 `.xteam/teams.json` 就是单 team，组带不出现、
+  `status` 输出格式与以前相同、`team list` 只是查看。第 [104] 组钉了这一条。
+- `team rm` 拒绝删掉手上还有在飞片的组。
+
+明确没做（设计在 `docs/一个PM管N个team.md`）：PM 自动派组、跨组负载均衡、多 PM。
+
+测试：[103] 组补 subgraph 4 条；新增 [104] 组多 team 注册 9 条（含单 team 兜底）。
+
 ## 0.2.22
 
 ### 看板入口重做（去掉顶部菜单栏）+ spec 直接渲染 + mermaid 画成 ASCII 图

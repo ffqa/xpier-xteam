@@ -283,13 +283,16 @@ class BoardApp(App):
         Binding("p", "open_project_docs", "项目文档/笔记"),
         Binding("question_mark", "cheat_sheet", "键位速查"),
         Binding("m", "global_menu", "全局菜单"),
+        Binding("bracket_right", "next_team", "下一组"),
+        Binding("bracket_left", "prev_team", "上一组"),
         Binding("O", "object_menu", "对选中片的动作"),
     ]
 
     def __init__(self, root=None, proto=None, herdr=None, label="",
                  role_map=None, refresh_secs=2.0, collector=None,
                  dispatcher=None, qa_runner=None, rotator=None,
-                 note_writer=None, bring_up=None, respawn=None) -> None:
+                 note_writer=None, bring_up=None, respawn=None,
+                 teams=None) -> None:
         super().__init__()
         self.root = root
         self.proto = proto
@@ -304,6 +307,9 @@ class BoardApp(App):
         self._note_writer = note_writer
         self._bring_up = bring_up
         self._respawn = respawn
+        self.teams = teams or [{"name": "main"}]
+        self.active_team = self.teams[0]["name"]
+        self.slices_by_team: dict = {}
         self.state: dict = {}
         self.roles: list[str] = []
         self.target_idx = 0
@@ -374,6 +380,15 @@ class BoardApp(App):
             self._rebuild_role_cards()
         else:
             self._refresh_role_cards()
+        # 在飞切片按 team 归类（task.json/spec 的 team 字段，没有就算 main）
+        self.slices_by_team = {}
+        for s in self.state.get("slices") or []:
+            nm = str(s.get("team") or "main")
+            self.slices_by_team.setdefault(nm, []).append(s)
+        if len(self.teams) > 1 and self.active_team not in self.slices_by_team:
+            for nm in self.slices_by_team:
+                self.active_team = nm
+                break
         self.archive = list(self.state.get("closed") or [])
         if not self.archive:
             self.archive_idx = 0
@@ -403,8 +418,19 @@ class BoardApp(App):
         status = f"[{self.status_kind}] {self.status_text}"
         self.status_text_lines = wrap_display(status, width)
         try:
+            strip = ""
+            if len(self.teams) > 1:
+                # 多 team：一条组带（每组 working/idle/blocked + 在飞片数），
+                # 当前组高亮。单 team 项目连这行都不出。
+                parts = []
+                for t in self.teams:
+                    nm = t["name"]
+                    mark = "◀" if nm == self.active_team else " "
+                    n_flight = sum(1 for c in self.slices_by_team.get(nm, []))
+                    parts.append(f"{mark}{nm}({n_flight})")
+                strip = " ┃ team: " + " ".join(parts)
             self.query_one("#top", Static).update(
-                Text(f" xteam Board · {self.label} ┃ {hud}"))
+                Text(f" xteam Board · {self.label} ┃ {hud}{strip}"))
             self.query_one("#alerts", Label).update(self.alerts_text)
             self.query_one("#statusline", Label).update(
                 Text("\n".join(self.status_text_lines),
@@ -549,6 +575,20 @@ class BoardApp(App):
         """项目级文档 + wiki 笔记（「存为 note」落下去的地方，要能翻回来）。"""
         files = [("项目 · " + p.name, p) for p in project_doc_files(self.root)]
         self.push_screen(DocsScreen("项目文档", files))
+
+    def action_next_team(self) -> None:
+        if len(self.teams) < 2:
+            return
+        i = [t["name"] for t in self.teams].index(self.active_team)
+        self.active_team = self.teams[(i + 1) % len(self.teams)]["name"]
+        self._set_status(f"看 team {self.active_team}", "info")
+
+    def action_prev_team(self) -> None:
+        if len(self.teams) < 2:
+            return
+        i = [t["name"] for t in self.teams].index(self.active_team)
+        self.active_team = self.teams[(i - 1) % len(self.teams)]["name"]
+        self._set_status(f"看 team {self.active_team}", "info")
 
     def action_cheat_sheet(self) -> None:
         self.push_screen(CheatSheet(self._cheat_rows()))
@@ -807,10 +847,10 @@ class BoardApp(App):
 def run_board(root: Path, proto, herdr, label: str, role_map: dict,
               refresh_secs: float = 2.0, collector=None, dispatcher=None,
               qa_runner=None, rotator=None, note_writer=None,
-              bring_up=None, respawn=None) -> bool:
+              bring_up=None, respawn=None, teams=None) -> bool:
     """起板子（textual 已由调用方确认可 import）。"""
     BoardApp(root=root, proto=proto, herdr=herdr, label=label, role_map=role_map,
              refresh_secs=refresh_secs, collector=collector, dispatcher=dispatcher,
              qa_runner=qa_runner, rotator=rotator, note_writer=note_writer,
-             bring_up=bring_up, respawn=respawn).run()
+             bring_up=bring_up, respawn=respawn, teams=teams).run()
     return True

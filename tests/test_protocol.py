@@ -110,6 +110,11 @@ from xteam_lib import (  # noqa: E402
     move_archive_index,
     process_archive_keys,
     process_board_keystrokes,
+    teams_path,
+    read_teams,
+    write_teams,
+    team_of,
+    DEFAULT_TEAM,
     detect_choice_prompt,
 )
 
@@ -4877,12 +4882,25 @@ def test_mermaid_and_markdown_preview() -> None:
     check("链式边连通三层", chain.count("▼") >= 2, True)
 
     # 认不出的语法必须原样退回 —— 画错一张图比不画更糟
+    # 这些仍然认不出（subgraph 自 0.2.23 起已支持，不在此列）
     for bad in ("sequenceDiagram\n  A->>B: hi\n",
                 "graph TD\n  A --> B\n  B --> A\n",
                 "gantt\n  title 计划\n",
-                "graph TD\n  subgraph one\n  A --> B\n  end\n"):
+                "graph TD\n  A -->|label without close B\n"):
         check(f"认不出就退回源码：{bad.splitlines()[0][:16]}",
               mermaid_to_ascii(bad, width=30).strip(), bad.strip())
+
+    sg = mermaid_to_ascii(
+        "graph TD\n  A[开始] --> B[甲]\n  A --> C[乙]\n"
+        "  subgraph g1[组一]\n  B\n  end\n  subgraph g2[组二]\n  C\n  end\n",
+        width=60)
+    check("subgraph：同层两组各包各的面板", "组一" in sg and "组二" in sg, True)
+    check("subgraph：面板把节点框在里面", sg.count("┌") >= 2, True)
+    check("subgraph：后进的组也认（先在外部连边再进组）", "甲" in sg and "乙" in sg, True)
+    inner = mermaid_to_ascii(
+        "graph TD\n  subgraph one[第一组]\n    A[甲] --> B[乙]\n    A --> C[丙]\n  end\n",
+        width=50)
+    check("subgraph：同组同层多节点并排", "甲" in inner and "乙" in inner and "丙" in inner, True)
 
     doc = ("# 标题\n\n- 一项\n\n```mermaid\ngraph TD\n  A[开始] --> B[结束]\n```\n\n结尾。\n")
     out = render_doc_markdown(doc, width=40)
@@ -4891,6 +4909,46 @@ def test_mermaid_and_markdown_preview() -> None:
     bad_doc = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n"
     out2 = render_doc_markdown(bad_doc, width=40)
     check("画不出来的 mermaid 保留源码不骗人", "sequenceDiagram" in out2, True)
+
+
+def test_multi_team_registry() -> None:
+    """[104] 多 team：没有 teams.json 就是单 team（行为与以前逐字节相同）。"""
+    print("\n[104] 多 team 注册：单 team 兜底 / 切片归属 / 增删")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        # 1) 没有 teams.json → 单 team，label 用项目自己的 workspace
+        teams = read_teams(root, "demo")
+        check("没有 teams.json → 单 team main", [t["name"] for t in teams], ["main"])
+        check("单 team 的 label 是项目 workspace", teams[0]["label"], "demo")
+        check("切片不写 team → 归 main", team_of(proto.tasks / "x"), "main")
+
+        # 2) 写一个切片，team 来自 task.json / spec front-matter
+        t = proto.tasks / "api-side"
+        t.mkdir(parents=True)
+        (t / "task.json").write_text(json.dumps({"team": "api"}), encoding="utf-8")
+        check("task.json 的 team 优先", team_of(t), "api")
+        t2 = proto.tasks / "fe-side"
+        t2.mkdir(parents=True)
+        (t2 / "spec.md").write_text("team: fe\n# 需求\n", encoding="utf-8")
+        check("spec front-matter 的 team 也认", team_of(t2), "fe")
+
+        # 3) teams.json 里没有 main 时，读出来要补一个（兜底不能丢）
+        write_teams(root, [{"name": "api", "label": "demo-api"}])
+        back = read_teams(root, "demo")
+        check("teams.json 缺 main 时自动补", [t["name"] for t in back], ["main", "api"])
+        check("补的 main 用项目 workspace", back[0]["label"], "demo")
+
+        # 4) 坏文件不当机
+        teams_path(root).write_text("{ 坏 json", encoding="utf-8")
+        check("teams.json 坏了退回单 team", [t["name"] for t in read_teams(root, "d")],
+              ["main"])
+
+        # 5) status 的分组只在多 team 时出现：单 team 无 teams.json
+        check("单 team 项目不写 teams.json", teams_path(root).exists(), True)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main() -> int:
@@ -4999,6 +5057,7 @@ def main() -> int:
         test_fullscreen_board_tui,
         test_request_needs_acceptance_criteria,
         test_mermaid_and_markdown_preview,
+        test_multi_team_registry,
     ):
         fn()
     print()
