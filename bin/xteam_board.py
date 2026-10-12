@@ -309,7 +309,7 @@ class BoardApp(App):
                  role_map=None, refresh_secs=2.0, collector=None,
                  dispatcher=None, qa_runner=None, rotator=None,
                  note_writer=None, bring_up=None, respawn=None,
-                 teams=None, focus_pane=None) -> None:
+                 teams=None, focus_pane=None, intake=None) -> None:
         super().__init__()
         self.root = root
         self.proto = proto
@@ -325,6 +325,7 @@ class BoardApp(App):
         self._bring_up = bring_up
         self._respawn = respawn
         self._focus_pane = focus_pane
+        self._intake = intake
         self.teams = teams or [{"name": "main"}]
         self.active_team = self.teams[0]["name"]
         self.slices_by_team: dict = {}
@@ -353,10 +354,14 @@ class BoardApp(App):
                 yield TextArea(id="note")
                 # 并排的两个只放短标签（30 列里「推给当前角色」六个字就 12 列，
                 # 两个并排一定被切），外部评审单独一整行
+                # 推给/存 note 并排（短标签才放得下）；外部评审、立为需求项各一整行
                 with Horizontal(id="row_actions"):
                     yield _flat_button("推给 pm", id="push", variant="primary")
                     yield _flat_button("存 note", id="note_save")
                 yield _flat_button("外部评审 :qa", id="qa")
+                # 立为需求项：落到 QUEUE.md（状态 todo）+ .xteam/intake/<slug>/note.md，
+                # PM 因此背上 start-next 义务 —— 想法不会说完就消失。
+                yield _flat_button("立为需求项 → PM", id="intake")
                 yield Input(id="cmd",
                             placeholder=":qa <切片> · :respawn <角色> · :q")
             with VerticalScroll(id="middle"):
@@ -808,6 +813,8 @@ class BoardApp(App):
             self._push_note()
         elif event.button.id == "note_save":
             self._save_note()
+        elif event.button.id == "intake":
+            self._make_intake()
         elif event.button.id == "qa":
             # 外部评审要点名切片：把光标放进底部输入框并预填 :qa
             cmd = self.query_one("#cmd", Input)
@@ -843,6 +850,28 @@ class BoardApp(App):
             return
         self._dispatch(note)
         self.query_one("#note", TextArea).text = ""
+
+    def _make_intake(self) -> None:
+        note = self.query_one("#note", TextArea).text.strip()
+        if not note:
+            self._set_status("左边是空的，没什么可录", "warn")
+            return
+        if self._intake is None:
+            self._set_status("这台机器没有 intake 回调；命令行：xteam intake \"要做什么\"",
+                             "warn")
+            return
+        self._set_status("正在立为需求项…", "info")
+
+        def _do() -> None:
+            try:
+                ok, msg = self._intake(note)
+            except Exception as exc:                  # noqa: BLE001
+                ok, msg = False, str(exc)
+            self.call_from_thread(self._set_status,
+                                  f"{'✓' if ok else '⚠'} {msg}",
+                                  "success" if ok else "warn")
+
+        self.run_worker(_do, thread=True, exclusive=True, group="intake")
 
     def _save_note(self) -> None:
         note = self.query_one("#note", TextArea).text.strip()
@@ -954,11 +983,12 @@ class BoardApp(App):
 def run_board(root: Path, proto, herdr, label: str, role_map: dict,
               refresh_secs: float = 2.0, collector=None, dispatcher=None,
               qa_runner=None, rotator=None, note_writer=None,
-              bring_up=None, respawn=None, teams=None, focus_pane=None) -> bool:
+              bring_up=None, respawn=None, teams=None, focus_pane=None,
+              intake=None) -> bool:
     """起板子（textual 已由调用方确认可 import）。"""
     BoardApp(root=root, proto=proto, herdr=herdr, label=label, role_map=role_map,
              refresh_secs=refresh_secs, collector=collector, dispatcher=dispatcher,
              qa_runner=qa_runner, rotator=rotator, note_writer=note_writer,
              bring_up=bring_up, respawn=respawn, teams=teams,
-             focus_pane=focus_pane).run()
+             focus_pane=focus_pane, intake=intake).run()
     return True

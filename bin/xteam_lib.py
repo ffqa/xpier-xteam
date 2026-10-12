@@ -2191,6 +2191,83 @@ def teams_path(root: Path) -> Path:
     return root / XTEAM_DIRNAME / TEAMS_FILE
 
 
+# ---------------------------------------------------------------- 人的需求录入（intake）
+
+INTAKE_DIRNAME = "intake"
+INTAKE_STATES = ("draft", "pushed", "accepted", "dropped")
+
+
+def intake_dir(root: Path) -> Path:
+    return root / XTEAM_DIRNAME / INTAKE_DIRNAME
+
+
+def intake_slug(text: str, taken: set | None = None) -> str:
+    """从一句话里取一个能做目录名/切片名的 slug。取不到就用 intake-n。"""
+    base = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", text.strip()).strip("-")
+    base = base[:24] or "intake"
+    if not taken:
+        return base
+    cand, n = base, 2
+    while cand in taken:
+        cand = f"{base}-{n}"
+        n += 1
+    return cand
+
+
+def read_intakes(root: Path) -> list:
+    """列出 `.xteam/intake/<slug>/note.md`。**目录即状态**，不另存索引。"""
+    d = intake_dir(root)
+    if not d.is_dir():
+        return []
+    out = []
+    for sub in sorted(d.iterdir()):
+        if not sub.is_dir():
+            continue
+        meta = {}
+        mf = sub / "meta.json"
+        if mf.is_file():
+            try:
+                meta = json.loads(mf.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                meta = {}
+        note = sub / "note.md"
+        body = ""
+        if note.is_file():
+            try:
+                body = note.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                body = ""
+        out.append({"slug": sub.name, "state": meta.get("state", "draft"),
+                    "title": meta.get("title") or sub.name,
+                    "queue_order": meta.get("queue_order"),
+                    "updated": meta.get("updated") or "",
+                    "body": body})
+    return out
+
+
+def intake_queue_row(root: Path, slug: str, title: str) -> int:
+    """把一条需求录进 QUEUE.md（状态 `todo`，备注指向 intake 目录）。
+
+    **为什么落在 QUEUE.md 而不是自建 inbox**：队列本来就是唯一的待办真相，
+    PM 已经有「队列里有未开工项」这条义务（`start-next`）。人的需求进了队列，
+    义务自动成立 —— 不需要再造一个「PM 要去翻的收件箱」，那等于第二份真相。
+    """
+    q = root / XTEAM_DIRNAME / "QUEUE.md"
+    if not q.is_file():
+        return 0
+    lines = q.read_text(encoding="utf-8").splitlines()
+    orders = [int(c[0]) for c in (l.strip().strip("|").split("|") for l in lines
+                                  if l.startswith("|"))
+              if c and c[0].strip().isdigit()]
+    nxt = max(orders) + 1 if orders else 1
+    note = f"人的需求录入：详见 `.xteam/{INTAKE_DIRNAME}/{slug}/note.md`（`xteam intake show {slug}`）"
+    row = f"| {nxt} | {slug} | todo | {note} |"
+    # 追加到表格末尾（表头前的内容保持原样）
+    lines.append(row)
+    q.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return nxt
+
+
 def team_digest(root: Path, team: str, label: str = "") -> dict:
     """一个 team 的机器摘要：**从 .xteam/ 现算，不靠 agent 自觉写**。
 
@@ -4710,7 +4787,8 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                   role_map: dict, refresh_secs: float = 2.0,
                   collector=None, dispatcher=None, qa_runner=None,
                   rotator=None, note_writer=None, bring_up=None,
-                  respawn=None, teams=None, focus_pane=None) -> bool:
+                  respawn=None, teams=None, focus_pane=None,
+                  intake=None) -> bool:
     """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
 
     **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
@@ -4729,4 +4807,4 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                                  qa_runner=qa_runner, rotator=rotator,
                                  note_writer=note_writer, bring_up=bring_up,
                                  respawn=respawn, teams=teams,
-                                 focus_pane=focus_pane)
+                                 focus_pane=focus_pane, intake=intake)

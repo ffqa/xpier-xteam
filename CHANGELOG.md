@@ -1,5 +1,33 @@
 # 变更记录
 
+## 0.2.25
+
+### 人的需求录入：想清楚 → 写下来 → 立成队列项 → 推给 PM
+
+用户原话：「我可以有一个独立的界面，进行内容录入，既像是思考，又像是安排任务（类似notes），
+觉得 OK 了就可以推给 PM。这才是一个真实的软件开发状态。」
+
+- `xteam intake "<一句话>"` —— 正文落成 `.xteam/intake/<slug>/note.md`（可反复改），
+  同时**追加一行 QUEUE.md（状态 `todo`）**，备注指向 note 全文。
+- `xteam intake list / show <slug> / push <slug>` —— 看、读、门铃 PM。
+- 看板左栏多一个「立为需求项 → PM」按钮：笔记写完点它，同样落队列 + intake 目录。
+
+**为什么落在 QUEUE.md 而不是自建 inbox**：队列本来就是唯一的待办真相，PM 早就有
+「队列里有未开工项」这条义务（`start-next`）。人的需求一进行列，义务自动成立 ——
+不需要再造一个「PM 要去翻的收件箱」，那等于第二份真相。`xteam intake show <slug>`
+读全文，`xteam search` 也能搜到（wiki 之外的第二个沉淀处）。
+
+**顺带修一个真缺口**：`whoami` 只读 per-task 的 `obligations()`，没合并
+`overall_debts()` —— 于是 `start-next` / `report` 这两条跨切片合成义务在 whoami 里
+看不见。whoami 是上下文被清空后 agent 读的第一屏，它漏一条，人就真的不动了。
+（`status` 一直是合并的，只有 whoami 漏。）
+
+修一个按钮丢失：「外部评审 :qa」在上一轮左栏改版里被挤掉，按钮还在帮助文字里，
+实际点不到 —— 已补回，并补了「按钮必须在」的断言。
+
+测试：新增 [105] 组 11 条（进队列拿队序 / PM 背 start-next / 队序递增 / 同名 slug
+不撞 / **开工后 start-next 被消费并交棒给 version-spec**）。门禁三层全绿。
+
 ## 0.2.24
 
 ### PM 每组摘要（机器算，不靠 agent 自觉写）+ 角色卡一键跳 pane + 看板认 team

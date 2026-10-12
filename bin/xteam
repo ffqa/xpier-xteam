@@ -76,6 +76,10 @@ from xteam_lib import (  # noqa: E402
     read_teams,
     write_teams,
     team_of,
+    intake_dir,
+    intake_slug,
+    read_intakes,
+    intake_queue_row,
     team_digest,
     team_digest_lines,
     DEFAULT_TEAM,
@@ -2070,15 +2074,28 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     def _uniq(pairs: list[tuple[str, str]]) -> list[str]:
         return list(dict.fromkeys(f"{slug}:{ob}" for slug, ob in pairs))
 
+    # **必须合并 overall_debts()**：`start-next` / `report` 这两条是跨切片的合成
+    # 义务，只读 per-task 的 obligations() 会看不到 —— 于是「队列里明明有活、
+    # 三个 pane 全闲着」在 whoami 里显示成「你不欠任何活」。whoami 是上下文被清空
+    # 后 agent 读的第一屏，它漏一条，人就真的不动了。
+    overall = proto.overall_debts()
     debts = proto.obligations()
-    mine = _uniq(debts.get(role) or [])
+    merged = dict(debts)
+    for r, obs in overall.items():
+        pairs = [tuple(x.split(":", 1)) if ":" in x else (x, "")
+                 for x in obs]
+        have = {(s, o) for s, o in merged.get(r, [])}
+        for pair in pairs:
+            if pair not in have:
+                merged.setdefault(r, []).append(pair)
+    mine = _uniq(merged.get(role) or [])
     print("\n你欠的义务：")
     if mine:
         for item in mine:
             print(f"  · {item}")
     else:
         print("  （无 —— idle 且不欠活是合法终态：做完了，在等下一项）")
-    others = {r: _uniq(v) for r, v in debts.items() if r != role and v}
+    others = {r: _uniq(v) for r, v in merged.items() if r != role and v}
     if others:
         print("别人欠的：")
         for r in sorted(others):
@@ -2828,6 +2845,102 @@ def _board_bring_up(root: Path, proto: Protocol, label: str, role: str) -> tuple
         return False, str(exc)
 
 
+def cmd_intake(args: argparse.Namespace) -> int:
+    """人的需求录入：想清楚、写下来、立成队列项、推给 PM。
+
+    和 `xteam say pm "…"` 的区别：say 是一条会滚过去的门铃；intake 是**落到队列里的
+    需求项**（QUEUE.md 状态 todo + `.xteam/intake/<slug>/note.md` 全文），PM 因此背上
+    「队列里有未开工项」这条现成义务 —— 人 dismissal 的想法不会说完就消失。
+    """
+    root = Path(args.project).resolve()
+    proto = Protocol(root)
+    if not proto.dir.is_dir():
+        die(f"{proto.dir} 不存在 —— 先 xteam init")
+    d = intake_dir(root)
+
+    # 动作缺省：第一个参数是正文，不是子命令 —— `xteam intake "要做什么"` 就得能用
+    action = (args.intake_action or "").strip()
+    if action not in ("list", "show", "push"):
+        action = "new"
+        if not args.text:
+            args.text = args.intake_action or ""
+        args.target = ""
+
+    if action == "list":
+        items = read_intakes(root)
+        if not items:
+            print(f"[{now()}] 还没有录过需求（{d.relative_to(root)} 不存在或为空）")
+            print("  录一条：xteam intake \"一句话说清要什么\"")
+            return 0
+        print(f"[{now()}] {len(items)} 条需求录入：")
+        for it in items:
+            order = f" 队序 {it['queue_order']}" if it.get("queue_order") else ""
+            print(f"  · {it['slug']:<24} [{it['state']}]{order}  {it['title']}")
+        return 0
+
+    if action == "show":
+        want = (args.target or "").strip()
+        for it in read_intakes(root):
+            if it["slug"] == want:
+                print(f"── {it['slug']}（{it['state']}）──")
+                print(it["body"].rstrip() or "（空）")
+                return 0
+        die(f"没有这条录入：{want!r}。列全部：xteam intake list")
+
+    # new / push 都需要正文
+    text = args.text or ""
+    if args.file:
+        try:
+            text = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            die(f"读不了 {args.file}: {exc}")
+    if not text.strip():
+        die("正文不能空：xteam intake \"要做什么\" 或 --file <路径>")
+
+    taken = {it["slug"] for it in read_intakes(root)}
+    slug = intake_slug(text.splitlines()[0], taken)
+    sub = d / slug
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "note.md").write_text(text.rstrip() + "\n", encoding="utf-8")
+
+    if action == "new":
+        order = intake_queue_row(root, slug, text.splitlines()[0][:40])
+        write_json(sub / "meta.json",
+                   {"title": text.splitlines()[0][:40], "state": "draft",
+                    "queue_order": order, "created": now(), "updated": now()})
+        print(f"[{now()}] 已录入 {slug}（队序 {order or '?'}）—— "
+              f"PM 现在欠「队列里有未开工项」")
+        print(f"  改稿：xteam intake show {slug} 之后手改 note.md，或重写一遍覆盖")
+        print(f"  推给 PM：xteam intake push {slug}")
+        return 0
+
+    # push：门铃 PM + 标记已推
+    label, _ = resolve_ws_label(root, args.workspace)
+    ok, reason = False, ""
+    try:
+        ns = argparse.Namespace(project=str(root), workspace=args.workspace,
+                                role="pm", message=(
+                                    f"【人的需求】{slug} 已录入队列（QUEUE.md 状态 todo）。"
+                                    f"先读 `.xteam/intake/{slug}/note.md`，再按章程立项："
+                                    f"写 spec → 派 TL。别问答式确认，除非需求本身有歧义。"),
+                                settle=0, wait_empty=15.0, team="")
+        cmd_say(ns)
+        ok, reason = True, "已门铃 PM"
+    except SystemExit as exc:
+        ok, reason = False, f"say 退出码 {exc.code}"
+    except Exception as exc:                          # noqa: BLE001
+        ok, reason = False, str(exc)
+    state = "pushed" if ok else "draft"
+    write_json(sub / "meta.json",
+               {"title": text.splitlines()[0][:40], "state": state,
+                "queue_order": None, "pushed_at": now() if ok else "",
+                "created": now(), "updated": now()})
+    print(f"[{now()}] {'✓' if ok else '⚠'} {slug}: {reason}")
+    if not ok:
+        print("  （pane 没起来也能用：队列里已经有这一条，PM 下次起来就会看到）")
+    return 0 if ok else 1
+
+
 def cmd_team(args: argparse.Namespace) -> int:
     """多 team：一个 PM 底下挂 N 套 tl/dev。单 team 时这条命令只是查看。"""
     root = Path(args.project).resolve()
@@ -2918,6 +3031,28 @@ def cmd_team(args: argparse.Namespace) -> int:
     die(f"未知 team 动作：{args.team_action}")
 
 
+def _board_intake(root: Path, text: str) -> tuple[bool, str]:
+    """看板的「立为需求项」：把左栏笔记落成 QUEUE.md 的 todo 行 + intake 目录。
+
+    和直接 `say pm` 的区别落在**义务**上：队列里多一条未开工项，PM 就自动背上
+    `start-next`；门铃会滚过去，队列项不会。
+    """
+    if not text.strip():
+        return False, "左边是空的，没什么可录"
+    proto = Protocol(root)
+    d = intake_dir(root)
+    taken = {it["slug"] for it in read_intakes(root)}
+    slug = intake_slug(text.splitlines()[0], taken)
+    sub = d / slug
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "note.md").write_text(text.rstrip() + "\n", encoding="utf-8")
+    order = intake_queue_row(root, slug, text.splitlines()[0][:40])
+    write_json(sub / "meta.json",
+               {"title": text.splitlines()[0][:40], "state": "draft",
+                "queue_order": order, "created": now(), "updated": now()})
+    return True, f"已立为需求项 {slug}（队序 {order}）—— PM 现在欠 start-next"
+
+
 def cmd_board(args: argparse.Namespace) -> int:
     """全屏看板：顶 title ｜ 左：笔记/输入 ｜ 中：三角色 ｜ 右：spec 档案 ｜ 底：状态。
 
@@ -2960,6 +3095,7 @@ def cmd_board(args: argparse.Namespace) -> int:
         respawn=lambda role, agent="": _board_respawn(root, label, role, agent),
         teams=read_teams(root, label),
         focus_pane=lambda role: _board_focus_pane(root, label, role_map, role),
+        intake=lambda text: _board_intake(root, text),
         rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
@@ -4981,6 +5117,15 @@ def main() -> int:
     p.add_argument("query")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("intake", help="人的需求录入：写下来 → 立成队列项 → 推给 PM")
+    p.add_argument("intake_action", nargs="?", default="",
+                   help="list / show <slug> / push <slug>；缺省把后面的正文当成新录入")
+    p.add_argument("text", nargs="?", default="", help="需求正文（缺省动作时用）")
+    p.add_argument("target", nargs="?", default="", help="show 的 slug")
+    p.add_argument("--file", help="正文从文件读")
+    p.add_argument("--workspace", help="push 时用哪个 workspace 名", default=None)
+    p.set_defaults(func=cmd_intake)
 
     p = sub.add_parser("team", help="多 team：一个 PM 挂 N 套 tl/dev（单 team 时只是查看）")
     p.add_argument("team_action", choices=["list", "add", "rm", "digest"])

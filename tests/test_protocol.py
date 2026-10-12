@@ -116,6 +116,10 @@ from xteam_lib import (  # noqa: E402
     team_of,
     team_digest,
     team_digest_lines,
+    intake_dir,
+    intake_slug,
+    read_intakes,
+    intake_queue_row,
     DEFAULT_TEAM,
     detect_choice_prompt,
 )
@@ -4758,6 +4762,7 @@ def test_fullscreen_board_tui() -> None:
                 check("推给/存 note 并排放", len(btns) == 2
                       and btns[0].size.width < row.size.width, True)
                 check("外部评审是独立按钮", app.query_one("#qa", Button) is not None, True)
+                check("立为需求项按钮在", app.query_one("#intake", Button) is not None, True)
                 # 左边写笔记 → 推给当前角色（tl）
                 app.query_one("#note", TextArea).text = "先做登录，别碰支付"
                 await pilot.click("#push")
@@ -4989,6 +4994,59 @@ def test_multi_team_registry() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_human_intake_to_pm() -> None:
+    """[105] 人的需求录入：写下来 → 进队列 → PM 背上 start-next。"""
+    print("\n[105] 人的需求录入（note → 队列 → PM 义务）")
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        (proto.dir / "QUEUE.md").write_text(
+            "# 队列\n\n| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n",
+            encoding="utf-8")
+        check("没有 intake 目录时读出来是空", read_intakes(root), [])
+
+        d = intake_dir(root)
+        sub = d / "clean-worktree"
+        sub.mkdir(parents=True)
+        (sub / "note.md").write_text("命令行一键起一个干净的 worktree\n验收：能跑通\n",
+                                     encoding="utf-8")
+        order = intake_queue_row(root, "clean-worktree", "命令行一键起一个干净的 worktree")
+        check("进队列拿到一个新队序", order, 1)
+        items = proto.queue_items()
+        check("队列里多了一条 todo", [(i["slice"], i["state"]) for i in items],
+              [("clean-worktree", "todo")])
+        check("队序不与既有项撞", order, max(i["order"] for i in items))
+
+        # 关键：人的需求一进队列，PM 就背上 start-next（不需要再造一个收件箱）
+        overall = proto.overall_debts()
+        check("PM 欠 start-next（队列里有未开工项）",
+              overall.get("pm"), ["(队列):start-next"])
+        check("TL/dev 不因此欠活", overall.get("tl"), None)
+
+        # 第二条接着排，队序递增
+        sub2 = d / "second"
+        sub2.mkdir(parents=True)
+        (sub2 / "note.md").write_text("第二件事\n", encoding="utf-8")
+        check("第二条接到后面", intake_queue_row(root, "second", "第二件事"), 2)
+
+        # slug 去重
+        check("同名 slug 不撞车", intake_slug("同一句话", {"同一句话"}),
+              "同一句话-2")
+        check("没有内容时退回默认名", intake_slug("   "), "intake")
+
+        # PM 真的开工（写了 spec.md）后，`start-next` 被消费掉，换成下一阶段的
+        # `version-spec` —— 义务必须能交接，不能卡在同一条上永远催
+        (proto.tasks / "clean-worktree").mkdir(parents=True)
+        (proto.tasks / "clean-worktree" / "spec.md").write_text("# s\n", encoding="utf-8")
+        after = proto.overall_debts().get("pm") or []
+        check("开工后不再欠 start-next",
+              [x for x in after if x.endswith(":start-next")], [])
+        check("开工后换成下一阶段义务", after, ["clean-worktree:version-spec"])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -5096,6 +5154,7 @@ def main() -> int:
         test_request_needs_acceptance_criteria,
         test_mermaid_and_markdown_preview,
         test_multi_team_registry,
+        test_human_intake_to_pm,
     ):
         fn()
     print()
