@@ -76,6 +76,8 @@ from xteam_lib import (  # noqa: E402
     read_teams,
     write_teams,
     team_of,
+    team_digest,
+    team_digest_lines,
     DEFAULT_TEAM,
     parse_context_pct,
     XTEAM_DIRNAME,
@@ -2082,6 +2084,17 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         for r in sorted(others):
             print(f"  · {r}: {'、'.join(others[r])}")
 
+    # 多 team 时给 PM 一份**机器算的组摘要**：PM 一个人盯 N 组，不能把每组的切片
+    # 目录都读一遍（那等于把 N 组细节全塞进它一个人的上下文）。摘要只答三件事：
+    # 这组手上有哪些片、各自卡在谁手上、最近发生了什么。单 team 时这一段不出现。
+    teams = read_teams(root, _read_label(root))
+    if len(teams) > 1:
+        print("\n各组摘要（机器算的，随时最新）：")
+        for t in teams:
+            for line in team_digest_lines(team_digest(root, t["name"])):
+                print(f"  {line}")
+        print("  细看某一组：xteam team digest <组名>")
+
     opens = proto.open_tasks()
     print("\n未闭合切片：")
     if opens:
@@ -2551,9 +2564,35 @@ def cmd_review_tree(args: argparse.Namespace) -> int:
     return 0
 
 
+def _team_role_map(root: Path, label: str, role_map: dict, team: str) -> tuple:
+    """某个 team 的角色表 + 它的 workspace 标签。
+
+    PM 是全局唯一的（一个项目一个 PM，它是唯一裁决者），所以**任何组的视图都带
+    PM**；tl/dev 取该组自己的 workspace。单 team（main）时原样返回，行为不变。
+    """
+    if not team or team == DEFAULT_TEAM:
+        return role_map, label
+    teams = read_teams(root, label)
+    hit = [t for t in teams if t["name"] == team]
+    if not hit:
+        return role_map, label
+    tlabel = hit[0].get("label") or f"{label}-{team}"
+    out = {"pm": role_map.get("pm")} if role_map.get("pm") else {}
+    try:
+        th = Herdr(scope=tlabel)
+        ws = th.find_workspace(tlabel)
+        if ws:
+            out.update(th.role_map(ws["workspace_id"]))
+    except Exception:                          # noqa: BLE001
+        pass
+    return {k: v for k, v in out.items() if v}, tlabel
+
+
 def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
-                 role_map: dict, tracker: IdleTracker) -> dict:
+                 role_map: dict, tracker: IdleTracker, team: str = "") -> dict:
     """采集一屏看板要的事实。**只读**：不改状态、不投递、不新增事实来源。"""
+    if team:
+        role_map, label = _team_role_map(root, label, role_map, team)
     debts = proto.obligations()
     overall = proto.overall_debts()
     rows = []
@@ -2657,6 +2696,7 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
         "title": (f"xteam board  {now()}  {label!r}  {root}  "
                   f"（xteam {_installed_version() or '?'}）"),
         "label": label,
+        "team": team or DEFAULT_TEAM,
         "roles": rows, "alerts": alerts, "slices": slices, "events": events,
         "queue": queue_items, "closed": closed_slices,
     }
@@ -2734,6 +2774,24 @@ def _board_dispatch(root: Path, proto: Protocol, herdr: Herdr,
     return True, f"已投递 ({cur})"
 
 
+def _board_focus_pane(root: Path, label: str, role_map: dict, role: str) -> tuple[bool, str]:
+    """看板的「跳到 pane」：把这个角色的 pane 调到终端前面（herdr agent focus）。"""
+    rec = role_map.get(role) or {}
+    pane = str(rec.get("pane_id") or "")
+    name = str(rec.get("name") or "")
+    if not pane:
+        return False, f"{role} 没有在跑的 pane（先拉起）"
+    try:
+        herdr = Herdr(scope=label)
+        if name:
+            herdr._run("agent", "focus", name)
+        else:
+            herdr._run("pane", "focus", "--pane", pane)
+        return True, f"{role} 的 pane 已到前面（{pane}）"
+    except Exception as exc:                          # noqa: BLE001
+        return False, f"聚焦 {role} 失败: {exc}"
+
+
 def _board_respawn(root: Path, label: str, role: str, agent: str = "") -> tuple[bool, str]:
     """看板的「换个 agent 重拉」：pane 挂了想换 agent 时用它。
 
@@ -2793,11 +2851,21 @@ def cmd_team(args: argparse.Namespace) -> int:
             open_slices = [x.name for x in proto.open_tasks()
                            if team_of(x) == name]
             note = " · ".join(roles) if roles else "（tl/dev 没在跑）"
-            print(f"  {name:<10} {note}"
-                  + (f" · 在飞 {len(open_slices)} 片：{'、'.join(open_slices[:3])}"
-                     if open_slices else ""))
+            d = team_digest(root, name)
+        print(f"  {name:<10} {note}"
+                  + f" · 在飞 {d['counts']['open']} 片"
+                  + (f"（实现中 {d['counts']['inflight']} · 待 gate {d['counts']['gate']}）"
+                     if d["counts"]["open"] else ""))
         if len(teams) == 1:
             print("  （单 team —— `xteam team add <名字>` 起第二套 tl/dev）")
+        return 0
+
+    if args.team_action == "digest":
+        name = (args.name or "").strip() or DEFAULT_TEAM
+        if not any(t["name"] == name for t in teams):
+            die(f"没有 team {name!r}。现有：{'、'.join(t['name'] for t in teams)}")
+        for line in team_digest_lines(team_digest(root, name)):
+            print(line)
         return 0
 
     if args.team_action == "add":
@@ -2884,12 +2952,14 @@ def cmd_board(args: argparse.Namespace) -> int:
     started = run_board_tui(
         root, proto, herdr, label, role_map,
         refresh_secs=getattr(args, "interval", 2.0) or 2.0,
-        collector=lambda: _board_state(root, proto, herdr, label, role_map, tracker),
+        collector=lambda team="": _board_state(root, proto, herdr, label,
+                                              role_map, tracker, team),
         dispatcher=lambda role, msg: _board_dispatch(root, proto, herdr, role_map, role, msg),
         qa_runner=lambda name: _board_run_qa(root, name, args.workspace),
         bring_up=lambda role: _board_bring_up(root, proto, label, role),
         respawn=lambda role, agent="": _board_respawn(root, label, role, agent),
         teams=read_teams(root, label),
+        focus_pane=lambda role: _board_focus_pane(root, label, role_map, role),
         rotator=lambda role: do_reopen(root, role, workspace=label, force=True),
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
@@ -4913,7 +4983,7 @@ def main() -> int:
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("team", help="多 team：一个 PM 挂 N 套 tl/dev（单 team 时只是查看）")
-    p.add_argument("team_action", choices=["list", "add", "rm"])
+    p.add_argument("team_action", choices=["list", "add", "rm", "digest"])
     p.add_argument("name", nargs="?", default="", help="add/rm 的 team 名")
     p.set_defaults(func=cmd_team)
 

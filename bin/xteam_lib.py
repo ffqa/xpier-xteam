@@ -2191,6 +2191,58 @@ def teams_path(root: Path) -> Path:
     return root / XTEAM_DIRNAME / TEAMS_FILE
 
 
+def team_digest(root: Path, team: str, label: str = "") -> dict:
+    """一个 team 的机器摘要：**从 .xteam/ 现算，不靠 agent 自觉写**。
+
+    PM 盯 N 组时不能逐组读全部切片目录 —— 那等于把 N 组的细节全塞进它一个人的
+    上下文。这个摘要只回答三件事：这组手上有哪些片、各自卡在谁手上、最近发生了什么。
+    它是派生数据（协议状态 + 事件日志），永远新鲜，也不会和文件打架。
+
+    返回 {"team", "inflight": [{name, stage, owes, team}], "counts", "events": [...]}
+    """
+    proto = Protocol(root)
+    rows = []
+    for t in proto.slice_order(proto.open_tasks()):
+        if team_of(t) != team:
+            continue
+        owes = "、".join(f"{r}:{o}" for r, o in proto.debts(t).items()) or "无人欠活"
+        rows.append({"name": t.name, "stage": proto._stage(t), "owes": owes})
+    inflight = set(proto.inflight_slices())
+    gate = set(proto.pending_gate_tasks())
+    events: list = []
+    ev = proto.dir / "watch" / "events.log"
+    if ev.exists():
+        try:
+            keys = ("ALERT", "ESCALATE", "NEEDS-HUMAN", "STUCK", "QA ", "AUTO-ROTATE")
+            lines = ev.read_text(encoding="utf-8", errors="replace").splitlines()
+            hit = [x for x in lines if any(k in x for k in keys)][-5:]
+            events = [re.sub(r"^(\d{4})-(\d\d-\d\d)T(\d\d:\d\d:\d\d)Z ",
+                             r"\2 \3 ", x)[:100] for x in hit]
+        except OSError:
+            events = []
+    counts = {
+        "open": len(rows),
+        "inflight": sum(1 for r in rows if r["name"] in inflight),
+        "gate": sum(1 for r in rows if r["name"] in gate),
+    }
+    return {"team": team, "inflight": rows, "counts": counts, "events": events}
+
+
+def team_digest_lines(d: dict, width: int = 76) -> list:
+    """把 team_digest() 渲染成给人/PM 一眼读的行。单 team 时只有两三行。"""
+    out = [f"team {d['team']}：在飞 {d['counts']['open']} 片"
+           f"（实现中 {d['counts']['inflight']} · 待 gate {d['counts']['gate']}）"]
+    if not d["inflight"]:
+        out.append("  （这组手上没有未闭合的片）")
+    for r in d["inflight"][:8]:
+        out.append(f"  · {r['name']:<24} [{r['stage']}]  {r['owes']}")
+    if len(d["inflight"]) > 8:
+        out.append(f"  …还有 {len(d['inflight']) - 8} 片")
+    for e in d["events"][:3]:
+        out.append(f"  {e}")
+    return out
+
+
 def read_teams(root: Path, fallback_label: str = "") -> list:
     """这个项目有哪些 team。**没有 teams.json 就是单 team** ——
     那一条是所有既有行为的兜底：name="main"、label=项目自己的 workspace。
@@ -4658,7 +4710,7 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                   role_map: dict, refresh_secs: float = 2.0,
                   collector=None, dispatcher=None, qa_runner=None,
                   rotator=None, note_writer=None, bring_up=None,
-                  respawn=None, teams=None) -> bool:
+                  respawn=None, teams=None, focus_pane=None) -> bool:
     """起全屏看板。返回 False = textual 没装（调用方要给人话提示）。
 
     **textual 只在这一刻被 import**：界面在 `xteam_board.py` 里，那里顶部就 import
@@ -4676,4 +4728,5 @@ def run_board_tui(root: Path, proto: "Protocol", herdr: "Herdr", label: str,
                                  collector=collector, dispatcher=dispatcher,
                                  qa_runner=qa_runner, rotator=rotator,
                                  note_writer=note_writer, bring_up=bring_up,
-                                 respawn=respawn, teams=teams)
+                                 respawn=respawn, teams=teams,
+                                 focus_pane=focus_pane)

@@ -131,6 +131,18 @@ class DocsScreen(ModalScreen):
             self._load(event.list_view.index)
 
 
+def _flat_button(label: str, **kw) -> "Button":
+    """不抢焦点的扁平按钮。
+
+    **为什么必须不可聚焦**：焦点留在按钮上时，j/k 被 Button 的消息处理吃掉，
+    用户翻右侧档案突然全线失灵（实测：点了「推给 pm」之后按 j 无反应）。
+    textual 的 CSS 没有 can-focus 这个属性，只能在代码里关。
+    """
+    btn = Button(label, **kw)
+    btn.can_focus = False
+    return btn
+
+
 class ActionMenu(ModalScreen):
     """动作菜单：一个列表，选中即执行。
 
@@ -215,7 +227,7 @@ class BoardApp(App):
     #note { height: 1fr; min-height: 6; max-height: 16;
             border: round $panel; padding: 0 1; }
     #row_actions { height: auto; }
-    /* line-pad 不接受 0（textual 只认正整数），横向留 1 列由它负责 */
+    /* line-pad 不接受 0（textual 只认正整数），横向留 1 列由它负责。 */
     #row_actions Button { width: 1fr; min-width: 0; height: 1;
                           border: none; padding: 0; background: $boost; }
     #row_actions Button:hover { background: $primary; }
@@ -236,6 +248,11 @@ class BoardApp(App):
     /* pane 挂了的卡：红虚线框 + 深一点的底。别用 $error-darken-3 这种变量名 ——
        textual 的主题里没有它，整个样式表会解析失败（板子直接起不来）。 */
     .role_card.dead { border: dashed $error; background: $boost; }
+    /* 卡内跳转钮：一行、无框、靠右。存在感低但找得到 —— 它是个快捷方式，
+       不是这个卡的主要动作（主要动作是点卡选中/拉起）。 */
+    .role_card .jump { width: 1fr; min-width: 0; height: 1; border: none;
+                       padding: 0; background: $panel; color: $text-muted; }
+    .role_card .jump:hover { background: $primary; color: $text; }
     #right { width: 34; border: round $secondary; padding: 0 1; }
     #archive { height: 1fr; }
     #status { height: auto; min-height: 3; border: round $warning; padding: 0 1; }
@@ -292,7 +309,7 @@ class BoardApp(App):
                  role_map=None, refresh_secs=2.0, collector=None,
                  dispatcher=None, qa_runner=None, rotator=None,
                  note_writer=None, bring_up=None, respawn=None,
-                 teams=None) -> None:
+                 teams=None, focus_pane=None) -> None:
         super().__init__()
         self.root = root
         self.proto = proto
@@ -307,6 +324,7 @@ class BoardApp(App):
         self._note_writer = note_writer
         self._bring_up = bring_up
         self._respawn = respawn
+        self._focus_pane = focus_pane
         self.teams = teams or [{"name": "main"}]
         self.active_team = self.teams[0]["name"]
         self.slices_by_team: dict = {}
@@ -321,6 +339,7 @@ class BoardApp(App):
         self._card_texts: dict = {}      # 每张卡当前画的文本（可断言）
         self._archive_lines: list = []   # 档案当前的行（可断言）
         self._archive_sig: tuple = ()    # 档案内容指纹：没变就不重画（防闪）
+        self._archive_n: int = -1        # 上次真的 extend 了几条（防重复重建）
         self.status_text_lines: list = []  # 状态行折行后的文本（可断言）
 
     # ---- 组装 ----
@@ -335,9 +354,9 @@ class BoardApp(App):
                 # 并排的两个只放短标签（30 列里「推给当前角色」六个字就 12 列，
                 # 两个并排一定被切），外部评审单独一整行
                 with Horizontal(id="row_actions"):
-                    yield Button("推给 pm", id="push", variant="primary")
-                    yield Button("存 note", id="note_save")
-                yield Button("外部评审 :qa", id="qa")
+                    yield _flat_button("推给 pm", id="push", variant="primary")
+                    yield _flat_button("存 note", id="note_save")
+                yield _flat_button("外部评审 :qa", id="qa")
                 yield Input(id="cmd",
                             placeholder=":qa <切片> · :respawn <角色> · :q")
             with VerticalScroll(id="middle"):
@@ -352,8 +371,9 @@ class BoardApp(App):
     def on_mount(self) -> None:
         self.title = "xteam Board"
         self.sub_title = str(self.label)
-        self._collect()
-        self.set_interval(max(0.05, self.refresh_secs), self._collect)
+        self._collect(self.active_team)
+        self.set_interval(max(0.05, self.refresh_secs),
+                          lambda: self._collect(self.active_team))
         # 起始焦点给档案列表，**不是笔记区**：textual 默认聚焦第一个可聚焦控件，
         # 而那是 TextArea —— 它会吞掉所有可打印键，j/k/o/p 就全废了。
         # 要写字点一下笔记区即可，聚焦是显式动作。
@@ -361,12 +381,18 @@ class BoardApp(App):
             self.query_one("#archive", ArchiveList).focus()
         except Exception:
             pass
+        # 中间区只是卡片的滚动容器，不该抢焦点：点卡里的按钮时，textual 会把焦点
+        # 给「最近的可聚焦祖先」，那就是它 —— 于是焦点从档案列表跑掉，j/k 失灵。
+        try:
+            self.query_one("#middle", VerticalScroll).can_focus = False
+        except Exception:
+            pass
 
     # ---- 采集（herdr 调用放到工作线程，不让界面卡） ----
     @work(thread=True, exclusive=True)
-    def _collect(self) -> None:
+    def _collect(self, team: str = "") -> None:
         try:
-            st = self._collector()
+            st = (self._collector(team) if self._collector else {})
         except Exception as exc:                  # noqa: BLE001
             self.call_from_thread(self._set_status, f"采集失败: {exc}", "error")
             return
@@ -449,17 +475,45 @@ class BoardApp(App):
         middle = self.query_one("#middle", VerticalScroll)
         middle.remove_children()
         for r in self.state.get("roles") or []:
-            middle.mount(Static(id=f"card_{r.get('role','')}", classes="role_card"))
+            role = str(r.get("role", ""))
+            card = Vertical(classes="role_card", id=f"card_{role}")
+            middle.mount(card)
         # mount() 不 await：卡片这一刻还没进树，立刻填内容会 query 不到。
         # 等这一次刷新完成再填 —— 首帧才不会是一片空卡片。
-        self.call_after_refresh(self._refresh_role_cards)
+        self.call_after_refresh(self._fill_role_cards)
+
+    def _fill_role_cards(self) -> None:
+        """给每张卡装上「文本 + 跳到 pane」两个子件（只在卡片空着时装）。"""
+        # **装完要把焦点还回去**：Button 是可聚焦的，mount 它会抢焦点 ——
+        # 用户正用 j/k 翻右侧档案，一次刷新之后焦点跑到按钮上，按键全线失灵
+        # （实测：full-suite 里必现，单独跑不现，因为装配是延迟一帧做的）。
+        was_focused = self.focused
+        for r in self.state.get("roles") or []:
+            role = str(r.get("role", ""))
+            try:
+                card = self.query_one(f"#card_{role}", Vertical)
+            except Exception:
+                continue
+            if card.children:
+                continue
+            # 卡片容器也不可聚焦：点卡里的跳转钮时，textual 会把焦点挪到
+            # 「最近的可聚焦祖先」，那就是这张卡 —— 焦点一样会跑掉。
+            card.can_focus = False
+            card.mount(Static(id=f"text_{role}"))
+            card.mount(_flat_button("⇥ 跳到 pane", id=f"jump_{role}",
+                                    classes="jump"))
+        if was_focused is not None:
+            try:
+                self.set_focus(was_focused)
+            except Exception:
+                pass
 
     def _refresh_role_cards(self) -> None:
         target = self._target()
         for r in self.state.get("roles") or []:
             name = str(r.get("role", ""))
             try:
-                card = self.query_one(f"#card_{name}", Static)
+                card = self.query_one(f"#card_{name}", Vertical)
             except Exception:
                 continue
             is_target = name == target
@@ -499,7 +553,10 @@ class BoardApp(App):
             card.border_title = name
             card.border_subtitle = ("pane 挂了 · 点卡片拉起 · :respawn " + name + " 换 agent"
                                     if dead else "")
-            card.update(t)
+            try:
+                self.query_one(f"#text_{name}", Static).update(t)
+            except Exception:
+                pass
 
     # ---- 右侧：spec 档案 ----
     def _archive_signature(self) -> tuple:
@@ -516,32 +573,58 @@ class BoardApp(App):
         except Exception:
             return                      # 界面还没装完（首次采集就跑进来了）
         sig = self._archive_signature()
-        if sig == self._archive_sig and len(lv.children) == len(self.archive):
-            # 内容没变：只把选中标记挪到位（高亮由 ListView 自己画，不 rebuild）
+        # 用「上次真的 extend 了几条」判断建没建过，**不看 lv.children** ——
+        # extend() 也是异步的，children 会 lag，拿它当判据会导致每次刷新都重建，
+        # 而重建窗口里落下的按键会被整份吃掉（实测：j 偶发失效）。
+        if sig == self._archive_sig and self._archive_n == len(self.archive):
+            # 内容没变：一行都不动。**尤其不许把 index 设回 archive_idx** ——
+            # ListView 的光标才是用户看到的焦点，强行同步会把刚按的 j/k 吃回去。
+            # 反过来：以 ListView 的 index 为准，校正 archive_idx。
             if self.archive:
                 try:
-                    if lv.index != self.archive_idx:
-                        lv.index = self.archive_idx
+                    if 0 <= lv.index < len(self.archive):
+                        self.archive_idx = lv.index
                 except Exception:
                     pass
             return
+        # 重建前记住两样东西：光标位置，和**键盘焦点在不在列表上**。
+        # clear() 会移除子节点，焦点跟着丢 —— 用户正在用 j/k 翻档案，等一次刷新
+        # （默认 2 秒）之后按键突然全线失灵，直到他再点一下列表。这是真 bug，
+        # 不是测试瑕疵：实测复现，focus() 之后一次刷新就静默失效。
+        try:
+            prev_index = lv.index
+        except Exception:
+            prev_index = None
+        had_focus = bool(lv.has_focus
+                         or any(c.has_focus for c in lv.children))
         self._archive_sig = sig
         lv.clear()
         self._archive_lines = []
-        for i, c in enumerate(self.archive):
+        items = []
+        for c in self.archive:
             verdict = str(c.get("verdict") or "PASS")
             title = str(c.get("title") or "")
-            mark = "▶ " if i == self.archive_idx else "  "
-            line = f"{mark}{c.get('time','')}  {verdict}  {c.get('name','')}"
+            # 不在行文本里画 ▶：选中光标由 ListView 自己画，两份真相必然打架
+            line = f"{c.get('time','')}  {verdict}  {c.get('name','')}"
             if title:
                 line += f"  {title}"
             self._archive_lines.append(line)
-            lv.append(ListItem(Label(line)))
-        if self.archive:
+            items.append(ListItem(Label(line)))
+        # 一次挂完：逐个 append 每个都是一次 AwaitMount，children 会 lag
+        lv.extend(items)
+        self._archive_n = len(items)      # 记住这次真的 extend 了几条
+        if items:
+            want = self.archive_idx
+            if prev_index is not None and 0 <= prev_index < len(items):
+                want = prev_index
+            want = max(0, min(want, len(items) - 1))
             try:
-                lv.index = self.archive_idx
+                lv.index = want
             except Exception:
                 pass
+            self.archive_idx = want
+        if had_focus and items:
+            lv.focus()          # 把焦点还回去，否则刷新后键盘失灵
 
     # ---- 动作 ----
     def action_cycle_target(self) -> None:
@@ -553,7 +636,7 @@ class BoardApp(App):
         self._set_status(f"发送目标 → {self._target()}", "info")
 
     def action_refresh_now(self) -> None:
-        self._collect()
+        self._collect(self.active_team)
 
     def action_archive_down(self) -> None:
         if self.archive:
@@ -577,18 +660,18 @@ class BoardApp(App):
         self.push_screen(DocsScreen("项目文档", files))
 
     def action_next_team(self) -> None:
-        if len(self.teams) < 2:
-            return
-        i = [t["name"] for t in self.teams].index(self.active_team)
-        self.active_team = self.teams[(i + 1) % len(self.teams)]["name"]
-        self._set_status(f"看 team {self.active_team}", "info")
+        self._switch_team(1)
 
     def action_prev_team(self) -> None:
+        self._switch_team(-1)
+
+    def _switch_team(self, step: int) -> None:
         if len(self.teams) < 2:
             return
         i = [t["name"] for t in self.teams].index(self.active_team)
-        self.active_team = self.teams[(i - 1) % len(self.teams)]["name"]
-        self._set_status(f"看 team {self.active_team}", "info")
+        self.active_team = self.teams[(i + step) % len(self.teams)]["name"]
+        self._set_status(f"看 team {self.active_team}（重采中）", "info")
+        self._collect(self.active_team)
 
     def action_cheat_sheet(self) -> None:
         self.push_screen(CheatSheet(self._cheat_rows()))
@@ -697,7 +780,30 @@ class BoardApp(App):
             if 0 <= event.list_view.index < len(self.archive):
                 self.archive_idx = event.list_view.index
 
+    def _jump_to_pane(self, role: str) -> None:
+        """跳到这个角色的 pane 前面来（herdr agent focus）。"""
+        if self._focus_pane is None:
+            self._set_status(f"这台机器没有 focus 回调；命令行：herdr agent focus {role}",
+                             "warn")
+            return
+        self._set_status(f"正在把 {role} 的 pane 调到前面…", "info")
+
+        def _do() -> None:
+            try:
+                ok, msg = self._focus_pane(role)
+            except Exception as exc:                  # noqa: BLE001
+                ok, msg = False, str(exc)
+            self.call_from_thread(self._set_status,
+                                  f"{'✓' if ok else '⚠'} {msg}",
+                                  "success" if ok else "warn")
+
+        self.run_worker(_do, thread=True, exclusive=True, group="jump")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid.startswith("jump_"):
+            self._jump_to_pane(bid[5:])
+            return
         if event.button.id == "push":
             self._push_note()
         elif event.button.id == "note_save":
@@ -806,9 +912,10 @@ class BoardApp(App):
         # 鼠标点角色卡 = 把它设为发送目标（点两下正是用户想要的）。
         # 用 event.widget 而不是坐标反查：坐标是相对屏幕的，反查要先做偏移换算，
         # Pilot 与真终端给的坐标语义还不一样，一换就全点歪。
+        # 按 class 找卡片，别按类型：卡片是 Vertical 容器（文本 + 跳转钮），
+        # 写死 isinstance(Static) 会在重构后静默失效 —— 点卡片没反应。
         card = getattr(event, "widget", None)
-        while card is not None and not (isinstance(card, Static)
-                                        and "role_card" in card.classes):
+        while card is not None and "role_card" not in (card.classes or ()):
             card = card.parent
         if card is not None and card.id and card.id.startswith("card_"):
             name = card.id[5:]
@@ -847,10 +954,11 @@ class BoardApp(App):
 def run_board(root: Path, proto, herdr, label: str, role_map: dict,
               refresh_secs: float = 2.0, collector=None, dispatcher=None,
               qa_runner=None, rotator=None, note_writer=None,
-              bring_up=None, respawn=None, teams=None) -> bool:
+              bring_up=None, respawn=None, teams=None, focus_pane=None) -> bool:
     """起板子（textual 已由调用方确认可 import）。"""
     BoardApp(root=root, proto=proto, herdr=herdr, label=label, role_map=role_map,
              refresh_secs=refresh_secs, collector=collector, dispatcher=dispatcher,
              qa_runner=qa_runner, rotator=rotator, note_writer=note_writer,
-             bring_up=bring_up, respawn=respawn, teams=teams).run()
+             bring_up=bring_up, respawn=respawn, teams=teams,
+             focus_pane=focus_pane).run()
     return True

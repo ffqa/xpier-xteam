@@ -114,6 +114,8 @@ from xteam_lib import (  # noqa: E402
     read_teams,
     write_teams,
     team_of,
+    team_digest,
+    team_digest_lines,
     DEFAULT_TEAM,
     detect_choice_prompt,
 )
@@ -4113,13 +4115,13 @@ def test_render_board_and_choice_detector() -> None:
           "（没有在跑的角色" in render_role_board({"roles": []}, term_width=90), True)
     check("空档案有话说", "（还没有闭合的切片）" in render_role_board({}, term_width=90), True)
 
-    # 2. 档案选择：只有被选中的那行带 ▶
+    # 2. 档案按索引渲染：两行都在屏上（行内不带 ▶ 标记 —— 选中光标由 TUI 的
+    #    ListView 自己画，行里再画一份会在刷新时和 index 打架）
     console = {"target": "pm", "input": "", "cursor_pos": 0, "cursor": True,
                "nav": True, "archive_idx": 1}
     frame_sel = render_role_board(state, color=False, console=console, term_width=100)
-    lines_with_mark = [l for l in frame_sel.splitlines() if "▶" in l]
-    check("档案选中行带 ▶", len(lines_with_mark), 1)
-    check("▶ 落在被选中的那片", "board-nav" in lines_with_mark[0], True)
+    check("档案两行都渲染", len([l for l in frame_sel.splitlines()
+                                 if "auth-api" in l or "board-nav" in l]), 2)
     check("档案态提示牌换成 [档案]", "[档案] ❯" in frame_sel, True)
     check("档案态底栏给的是翻页键", "Enter 翻阅 spec" in frame_sel, True)
     check("输入态底栏给的是发送键", "Enter 发送" in render_role_board(
@@ -4602,6 +4604,7 @@ def test_fullscreen_board_tui() -> None:
         if str(_cli_dir) not in sys.path:
             sys.path.insert(0, str(_cli_dir))
         import xteam_board
+        from textual.containers import Vertical
         from textual.widgets import Button, Label, ListView, MarkdownViewer, Static, TextArea
     except ImportError as exc:
         print(f"  ⊘ 跳过：textual 不可用（{exc}）—— 全屏看板组不参与判定")
@@ -4662,7 +4665,8 @@ def test_fullscreen_board_tui() -> None:
 
         app = xteam_board.BoardApp(
             root=tmp, proto=_Proto(), herdr=None, label="demo", role_map={},
-            refresh_secs=0.05, collector=lambda: HOLDER["st"],
+            # collector 收一个 team 参数：多 team 时看板切组要按组重采
+            refresh_secs=0.05, collector=lambda team="": HOLDER["st"],
             dispatcher=_disp,
             qa_runner=lambda name: (True, "冷读完 120 字"),
             rotator=lambda role: (True, "已轮换"),
@@ -4825,6 +4829,20 @@ def test_fullscreen_board_tui() -> None:
                 await pilot.pause()
                 await asyncio.sleep(0.4)
                 check("菜单里选派活真的投了", bool(SENT) and SENT[-1][0] == "dev", True)
+                # 每张卡都有「跳到 pane」按钮，且点完不抢焦点（抢了焦点 j/k 就失灵）
+                check("三角色卡各有跳到 pane 钮",
+                      len(list(app.query(".role_card .jump"))), 3)
+                before_focus = app.focused
+                await pilot.click("#jump_pm")
+                await pilot.pause()
+                check("点跳转钮不抢焦点（焦点还在原处）", app.focused, before_focus)
+                lv.focus()
+                await pilot.pause()
+                await pilot.press("j")
+                await pilot.pause()
+                check("点过按钮之后 j 照样能选片", app.archive_idx, 1)
+                await pilot.press("k")
+                await pilot.pause()
                 # 鼠标点角色卡 = 切目标
                 await pilot.click("#card_dev")
                 await pilot.pause()
@@ -4834,7 +4852,7 @@ def test_fullscreen_board_tui() -> None:
                 STATE["roles"][1]["pane"] = ""
                 HOLDER["st"] = STATE
                 await asyncio.sleep(0.4)
-                tl_card = app.query_one("#card_tl", Static)
+                tl_card = app.query_one("#card_tl", Vertical)
                 check("pane 挂了的卡有 dead 标识", "dead" in tl_card.classes, True)
                 check("副标题说明点它拉起", "拉起" in str(tl_card.border_subtitle), True)
                 await pilot.click("#card_tl")
@@ -4940,7 +4958,27 @@ def test_multi_team_registry() -> None:
         check("teams.json 缺 main 时自动补", [t["name"] for t in back], ["main", "api"])
         check("补的 main 用项目 workspace", back[0]["label"], "demo")
 
-        # 4) 坏文件不当机
+        # 5) 组摘要：机器算，不靠 agent 自觉写（PM 盯 N 组的关键）
+        write_teams(root, [{"name": "main", "label": "d"}, {"name": "api", "label": "d-api"}])
+        ta = proto.tasks / "api-side"
+        ta.mkdir(parents=True, exist_ok=True)
+        (ta / "spec.md").write_text("# 需求\n", encoding="utf-8")
+        (ta / "spec.json").write_text('{"round": 1}', encoding="utf-8")
+        (ta / "assessment.json").write_text('{"spec_round": 1, "verdict": "agree"}',
+                                            encoding="utf-8")
+        (ta / "agreement.json").write_text('{"spec_round": 1}', encoding="utf-8")
+        (ta / "task.json").write_text('{"team": "api"}', encoding="utf-8")
+        (ta / "request.md").write_text("# r\n\n## 验收标准\n- 可跑\n", encoding="utf-8")
+        d = team_digest(root, "api")
+        check("摘要有这个组在飞的片", [r["name"] for r in d["inflight"]], ["api-side"])
+        check("摘要算出 dev 欠 implement", d["inflight"][0]["owes"], "dev:implement")
+        check("main 组摘要为空（片不归它）", team_digest(root, "main")["inflight"], [])
+        lines = team_digest_lines(d)
+        check("摘要行里带阶段与欠账",
+              any("api-side" in l and "implement" in l for l in lines), True)
+        check("摘要带计数", d["counts"]["open"], 1)
+
+        # 6) 坏文件不当机
         teams_path(root).write_text("{ 坏 json", encoding="utf-8")
         check("teams.json 坏了退回单 team", [t["name"] for t in read_teams(root, "d")],
               ["main"])
