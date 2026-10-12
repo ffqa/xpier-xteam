@@ -1787,6 +1787,21 @@ class Herdr:
             args += ["--env", f"{key}={value}"]
         return self._run(*args)
 
+    def split_pane(self, pane_id: str, direction: str = "right") -> str:
+        """把一个 pane 拆成两半，返回**新** pane 的 id。
+
+        herdr 的用法：`pane split --pane <ID> --direction right|down`，
+        返回体把新 pane 嵌在 `result.pane` 里。**不传 --pane 只传方向是聚焦邻居**，
+        完全是另一件事（v0.2.26 刚在这里栽过）。
+        """
+        res = self._run("pane", "split", "--pane", pane_id,
+                        "--direction", direction)
+        pane = (res.get("pane") or res)
+        new_id = str(pane.get("pane_id") or "")
+        if not new_id:
+            die(f"pane split 返回异常（没找到 pane_id）：{res}")
+        return new_id
+
     def panes_of_tab(self, workspace_id: str, tab_id: str) -> list[str]:
         panes = self._run("pane", "list", "--workspace", workspace_id).get("panes", [])
         return [p["pane_id"] for p in panes if p.get("tab_id") == tab_id]

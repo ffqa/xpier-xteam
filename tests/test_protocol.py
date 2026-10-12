@@ -5058,6 +5058,91 @@ def test_human_intake_to_pm() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_team_split_one_pane() -> None:
+    """[106] 非 main 组 split：一个 team 只占一个 tab，tl/dev 是同一个 pane 区的两半。"""
+    print("\n[106] team split：一个组一个 pane 区（tl/dev 同 tab 不同 pane）")
+
+    calls: list = []
+
+    class FakeHerdr:
+        """只记调用序列：split 模式必须「建一个 tab → 第一个角色占根 pane →
+        之后每个角色 split 一次」，且 main 组一次 split 都不做。"""
+
+        def __init__(self, scope: str = "") -> None:
+            self.scope = scope
+            self.n = 0
+
+        def find_workspace(self, label):
+            return None
+
+        def create_workspace(self, cwd, label):
+            calls.append(("create_workspace", label))
+            return {"workspace": {"workspace_id": "w1"}}
+
+        def role_map(self, ws_id):
+            return {}
+
+        def create_tab(self, ws_id, cwd, label, env=None):
+            calls.append(("create_tab", label))
+            self.n += 1
+            return {"tab": {"tab_id": f"w1:t{self.n}"}}
+
+        def panes_of_tab(self, ws_id, tab_id):
+            return [f"w1:p{self.n}"]
+
+        def split_pane(self, pane_id, direction="right"):
+            calls.append(("split", pane_id, direction))
+            self.n += 1
+            return f"w1:p{self.n}"
+
+        def start_agent(self, pane_id, tab_id, spec):
+            calls.append(("start", spec.role, pane_id, tab_id))
+
+        def send_initial_prompt(self, pane_id, intro, wait_s=15):
+            calls.append(("intro", pane_id))
+            return "ok"
+
+        def close_workspace(self, ws_id):
+            calls.append(("close", ws_id))
+
+    specs = {"tl": RoleSpec("tl", "omp", "团队负责人", ""),
+             "dev": RoleSpec("dev", "devin", "开发", "")}
+    orig_herdr = _cli.Herdr
+    _cli.Herdr = FakeHerdr          # 不注入就真起 workspace（第一版就这么栽的）
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+
+        # 1) main 组：不 split，一个角色一个 tab（原行为一字节不变）
+        out = _cli.bring_up_roles(root, proto, "demo", specs,
+                                  only=["tl", "dev"], say=lambda *_a, **_k: None)
+        check("main 组一个角色一个 tab（不 split）",
+              [c for c in calls if c[0] == "create_tab"],
+              [("create_tab", "tl"), ("create_tab", "dev")])
+        check("main 组没有 split 调用", [c for c in calls if c[0] == "split"], [])
+        check("返回不带 split 标记", out.get("split"), False)
+
+        # 2) 非 main 组：split —— 一个 tab，根 pane 给第一个，其余 split 出来
+        calls.clear()
+        out = _cli.bring_up_roles(root, proto, "demo-api", specs,
+                                  only=["tl", "dev"], say=lambda *_a, **_k: None,
+                                  team="api", split=True)
+        check("split 组只建一个 tab",
+              [c for c in calls if c[0] == "create_tab"], [("create_tab", "api")])
+        check("第二个角色靠 split 拿到 pane",
+              [c for c in calls if c[0] == "split"], [("split", "w1:p1", "right")])
+        starts = [c for c in calls if c[0] == "start"]
+        check("tl 占根 pane，dev 占 split 出来的 pane",
+              [(s[1], s[2]) for s in starts], [("tl", "w1:p1"), ("dev", "w1:p2")])
+        check("两个角色在同一个 tab（一个 team 一个 pane 区）",
+              {s[3] for s in starts}, {"w1:t1"})
+        check("返回带 split 标记", out.get("split"), True)
+    finally:
+        _cli.Herdr = orig_herdr
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -5166,6 +5251,7 @@ def main() -> int:
         test_mermaid_and_markdown_preview,
         test_multi_team_registry,
         test_human_intake_to_pm,
+        test_team_split_one_pane,
     ):
         fn()
     print()

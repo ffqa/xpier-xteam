@@ -1,5 +1,35 @@
 # 变更记录
 
+## 0.2.27
+
+### 非 main 组 split：一个 team 只占一个 tab，tl/dev 是同一个 pane 区的两半
+
+用户选的方向（0.2.26 后确认）：「只把 tl/dev split 进 team 的 pane」+「接受可视面积变小」。
+
+- `Herdr.split_pane(pane_id, direction)` —— `herdr pane split --pane <ID> --direction right`，
+  返回新 pane 的 id。**必须带 `--pane`**：不传 pane 只传方向是「聚焦邻居」，另一件事。
+- `bring_up_roles(..., team=..., split=True)`：非 main 组只建**一个** tab，第一个角色占根
+  pane，其余角色依次 split 出来；main 组与 `xteam up` 的行为一字节不变（一组一 tab）。
+- `xteam team add <名字>` 走 split 路径。`say --team <名字> <角色>` / `role_map` /
+  board / status 全都不用改 —— agent 名仍是 `role-<slug>`，寻址只认 pane_id。
+- session.json 的 `tabs` 记录里同组的两个角色指向**同一个 tab_id**（如实反映布局）。
+
+实测（真起 pm/tl/dev + 第二组）：
+```
+workspace 'xteam-api'  panes=3  tabs=2      ← 一个 workspace、一个 team tab
+  w24:p2 tab=w24:t2 working                ← tl（根 pane）
+  w24:p3 tab=w24:t2 idle                   ← dev（split 出来的右半）
+role_map: {'tl': 'w24:p2', 'dev': 'w24:p3'}
+门铃 → dev (w24:p3)  已送达
+```
+
+测试：[106] 组 8 条 —— main 组一个角色一个 tab 且零 split；split 组一个 tab、
+第二个角色靠 split、两个角色同 tab、返回带 split 标记。**fake Herdr 必须注入
+`_cli.Herdr`**，否则 `bring_up_roles` 内部自己构造真 Herdr，会真起 workspace
+（第一版就这么栽的，跑完在机器上留下两个野 workspace）。
+
+门禁：静态 ✓ · 单测 1060 条断言 ✓ · e2e 369/369 ✓ · 端到端 ✓
+
 ## 0.2.26
 
 ### 修「跳到 pane」按钮点了没反应

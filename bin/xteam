@@ -1702,7 +1702,8 @@ def cmd_swap(args: argparse.Namespace) -> int:
 
 
 def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
-                   only: list[str] | None = None, say=print) -> dict:
+                   only: list[str] | None = None, say=print,
+                   team: str = "", split: bool = False) -> dict:
     """把缺的角色拉起来。workspace 已存在就复用，不在就建。
 
     `cmd_up` 和看板的「拉起 <角色>」必须走同一条路：分叉的后果是板子上拉起的
@@ -1747,6 +1748,10 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
     tabs_of: dict[str, str] = {}
     used: dict[str, str] = {}
     identity_of: dict[str, str] = {}
+    # split 模式（非 main 组）：**一个 team 只占一个 tab**，tl/dev 是同一个 pane 区
+    # 的左右两半 —— 一眼看完一组，切窗口也少一次。代价是每个 agent 的可视面积减半。
+    split_pane = ""
+    split_tab = ""
     for role in todo:
         if role not in specs:
             say(f"[{now()}] ⚠ 跳过 {role}：team.json 里没有这个角色")
@@ -1755,7 +1760,23 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         spec = _with_identity(spec, root, label)
         say(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
             flush=True)
-        pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
+        if split and split_pane:
+            pane_id = herdr.split_pane(split_pane, "right")
+            tab_id = split_tab
+            herdr.start_agent(pane_id, tab_id, spec)
+        elif split:
+            # 这一组的第一个角色：建唯一的 tab，根 pane 归它
+            tab = herdr.create_tab(ws_id, str(root), team or label,
+                                   env={"XTEAM_ROLE": role})
+            split_tab = (tab.get("tab") or tab).get("tab_id", "")
+            panes = herdr.panes_of_tab(ws_id, split_tab)
+            if not panes:
+                die(f"tab {split_tab} 下找不到 pane")
+            split_pane = panes[0]
+            pane_id, tab_id = split_pane, split_tab
+            herdr.start_agent(pane_id, tab_id, spec)
+        else:
+            pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
         started[role] = pane_id
         tabs_of[role] = tab_id
         used[role] = spec.describe() or "CLI 默认模型"
@@ -1795,7 +1816,8 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
     # 之后 status 才能提醒「改了没生效 / 该更新了」
     _save_sync_state(root)
     return {"started": started, "tabs": tabs_of, "agents": used,
-            "identity": identity_of, "ws_id": ws_id, "created": existing is None}
+            "identity": identity_of, "ws_id": ws_id, "created": existing is None,
+            "split": bool(split and split_tab)}
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -2996,7 +3018,7 @@ def cmd_team(args: argparse.Namespace) -> int:
         if not herdr.find_workspace(label):
             # 只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）
             out = bring_up_roles(root, proto, label, load_roles(root),
-                                 only=["tl", "dev"])
+                                 only=["tl", "dev"], team=name, split=True)
             print(f"  team {name!r} 的 tl/dev 已起：{out['started']}")
         else:
             print(f"  workspace {label!r} 已存在，直接收编")
