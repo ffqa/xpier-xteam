@@ -464,7 +464,10 @@ class BoardApp(App):
                     nm = t["name"]
                     mark = "◀" if nm == self.active_team else " "
                     n_flight = sum(1 for c in self.slices_by_team.get(nm, []))
-                    parts.append(f"{mark}{nm}({n_flight})")
+                    # split 组带 ▤：tl/dev 在同一个 pane 区的两半（`xteam team add`
+                    # 建的组都是这种），标出来人才知道这组的布局。
+                    glyph = "▤" if t.get("split") else ""
+                    parts.append(f"{mark}{glyph}{nm}({n_flight})")
                 strip = " ┃ team: " + " ".join(parts)
             self.query_one("#top", Static).update(
                 Text(f" xteam Board · {self.label} ┃ {hud}{strip}"))

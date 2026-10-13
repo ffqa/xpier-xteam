@@ -1703,7 +1703,8 @@ def cmd_swap(args: argparse.Namespace) -> int:
 
 def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
                    only: list[str] | None = None, say=print,
-                   team: str = "", split: bool = False) -> dict:
+                   team: str = "", split: bool = False,
+                   base_tab: str = "", base_pane: str = "") -> dict:
     """把缺的角色拉起来。workspace 已存在就复用，不在就建。
 
     `cmd_up` 和看板的「拉起 <角色>」必须走同一条路：分叉的后果是板子上拉起的
@@ -1752,6 +1753,10 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
     # 的左右两半 —— 一眼看完一组，切窗口也少一次。代价是每个 agent 的可视面积减半。
     split_pane = ""
     split_tab = ""
+    # base_pane：同组还活着的那个 pane。补起挂掉的角色时**从它身上裂**，
+    # 而不是新开一个 tab —— 否则一个组会从「一个 tab 两半」漂移成「两个 tab」，
+    # 而那是 split 本来要消灭的东西。
+    split_pane_busy = False
     for role in todo:
         if role not in specs:
             say(f"[{now()}] ⚠ 跳过 {role}：team.json 里没有这个角色")
@@ -1760,21 +1765,28 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         spec = _with_identity(spec, root, label)
         say(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
             flush=True)
-        if split and split_pane:
-            pane_id = herdr.split_pane(split_pane, "right")
-            tab_id = split_tab
-            herdr.start_agent(pane_id, tab_id, spec)
-        elif split:
-            # 这一组的第一个角色：建唯一的 tab，根 pane 归它
-            tab = herdr.create_tab(ws_id, str(root), team or label,
-                                   env={"XTEAM_ROLE": role})
-            split_tab = (tab.get("tab") or tab).get("tab_id", "")
-            panes = herdr.panes_of_tab(ws_id, split_tab)
-            if not panes:
-                die(f"tab {split_tab} 下找不到 pane")
-            split_pane = panes[0]
+        if split:
+            if not split_tab:
+                if base_tab and base_pane:
+                    # 同组还有存活的 pane：接着用它，保持一个 tab
+                    split_tab, split_pane, split_pane_busy = base_tab, base_pane, True
+                else:
+                    tab = herdr.create_tab(ws_id, str(root), team or label,
+                                           env={"XTEAM_ROLE": role})
+                    split_tab = (tab.get("tab") or tab).get("tab_id", "")
+                    panes = herdr.panes_of_tab(ws_id, split_tab)
+                    if not panes:
+                        die(f"tab {split_tab} 下找不到 pane")
+                    split_pane, split_pane_busy = panes[0], False
+            # 这个 pane 已经被同组的 agent 占了（复用的存活 pane，或上一个角色
+            # 刚起的）—— 先裂一半出来再用。**少了这一步，第二个角色会起在同一个
+            # pane 上**：测试先抓到（tl/dev 都落在 w1:p1），真机上就是两个 agent
+            # 挤同一个 shell。
+            if split_pane_busy:
+                split_pane = herdr.split_pane(split_pane, "right")
             pane_id, tab_id = split_pane, split_tab
             herdr.start_agent(pane_id, tab_id, spec)
+            split_pane_busy = True      # 这个 pane 现在有主了
         else:
             pane_id, tab_id = _boot_role(herdr, root, ws_id, role, spec)
         started[role] = pane_id
@@ -2853,15 +2865,40 @@ def _board_bring_up(root: Path, proto: Protocol, label: str, role: str) -> tuple
 
     走 bring_up_roles()（和 `xteam up` 同一条路），并打到工作线程里 ——
     起 pane + 投章程要几十秒，不能卡住界面。
+
+    **split 组（非 main）从同组还活着的 pane 上裂**，不新开 tab：否则补一次角色，
+    这一组就从「一个 tab 两半」漂移成「两个 tab」，split 的意義也就没了。
     """
     try:
         specs = load_roles(root)
         if role not in specs:
             return False, f"team.json 里没有角色 {role!r}"
-        out = bring_up_roles(root, proto, label, specs, only=[role], say=lambda *_a, **_k: None)
+        base_tab = base_pane = ""
+        main_label, _ = resolve_ws_label(root, None)
+        teams = read_teams(root, main_label)
+        hit = [t for t in teams if (t.get("label") or main_label) == label]
+        if hit and hit[0].get("name") != DEFAULT_TEAM:
+            # 从 herdr 问同组还活着谁 —— session.json 可能是旧的（那个 pane 也许刚死）
+            try:
+                th = Herdr(scope=label)
+                ws = th.find_workspace(label)
+                rm = th.role_map(ws["workspace_id"]) if ws else {}
+                for r, a in rm.items():
+                    if r != role and a.get("pane_id"):
+                        base_tab = str(a.get("tab_id") or "")
+                        base_pane = str(a["pane_id"])
+                        break
+            except Exception:                          # noqa: BLE001
+                base_tab = base_pane = ""
+        out = bring_up_roles(root, proto, label, specs, only=[role],
+                             say=lambda *_a, **_k: None,
+                             split=bool(hit and hit[0].get("name") != DEFAULT_TEAM),
+                             team=(hit[0].get("name") if hit else ""),
+                             base_tab=base_tab, base_pane=base_pane)
         panes = out.get("started") or {}
         if role in panes and panes[role]:
-            return True, f"已拉起 {role}（pane={panes[role]}）"
+            how = "从同组 pane 裂出" if base_pane else "已起"
+            return True, f"{how} {role}（pane={panes[role]}）"
         return False, f"{role} 没有起来（可能已在跑）"
     except Exception as exc:                          # noqa: BLE001
         return False, str(exc)
@@ -2967,7 +3004,14 @@ def cmd_team(args: argparse.Namespace) -> int:
     """多 team：一个 PM 底下挂 N 套 tl/dev。单 team 时这条命令只是查看。"""
     root = Path(args.project).resolve()
     proto = Protocol(root)
-    main_label, _ = resolve_ws_label(root, args.workspace)
+    # main 组的 label 用**目录名**兜底，不用 resolve_ws_label 的「按 session.json
+    # 记录」分支：那条记录可能是别的项目留下的（实测：在 /tmp/sb 里 up 过之后，
+    # team add 把 main 组写成了仓库的 'xteam'，于是那个项目的 teams.json 从第一行
+    # 起就是错的，后续 say/board 全 routing 到别人的 workspace 上）。
+    main_label, _why = resolve_ws_label(root, args.workspace)
+    if _why != "没找到覆盖本目录的 workspace，用目录名":
+        # 记录来自别处：宁可退回目录名，也不拿一个可能不属于本项目的 label 当主组
+        main_label = root.name
     teams = read_teams(root, main_label)
 
     if args.team_action == "list":
@@ -3022,7 +3066,8 @@ def cmd_team(args: argparse.Namespace) -> int:
             print(f"  team {name!r} 的 tl/dev 已起：{out['started']}")
         else:
             print(f"  workspace {label!r} 已存在，直接收编")
-        teams.append({"name": name, "label": label})
+        # split 记下来：board 组带要靠它标出「这组是分屏的」，人一眼能看到布局。
+        teams.append({"name": name, "label": label, "split": True})
         write_teams(root, teams)
         print(f"  已记入 {teams_path(root).relative_to(root)}"
               f"（切片写 team: {name} 就归这组干）")
@@ -3098,7 +3143,10 @@ def cmd_board(args: argparse.Namespace) -> int:
     color = sys.stdout.isatty() and not args.plain
 
     # 脚本、管道或显式 --once：只读静态打印（默认角色视图，--kanban 输出瀑布）
+    # 管道/--once 拿到的是**静态一屏**，不是 UI —— 别让人以为装错了。
     if args.once or not sys.stdin.isatty() or getattr(args, "kanban", False):
+        if not sys.stdin.isatty() and not args.once:
+            print(f"[{now()}]  stdin 不是终端 —— 打的是静态一屏；交互式全屏看板要在终端里跑：xteam board")
         state = _board_state(root, proto, herdr, label, role_map, tracker)
         fn = render_kanban_board if getattr(args, "kanban", False) else render_role_board
         frame = fn(state, color=color)
@@ -3122,6 +3170,13 @@ def cmd_board(args: argparse.Namespace) -> int:
         note_writer=lambda note: wiki_append(root, "decision", "看板笔记", note, by="board"),
     )
     if not started:
+        # **装不上 textual 就明说，别静默退回旧版**。退回旧版时人和新版看到的是两个
+        # 界面，而他不知道自己少了一份 —— 会在旧版上找一个只有新版才有的按钮
+        # （外部反馈：另一台机器跑 xteam，「并没有出现本机的 UI」，查下来就是
+        # 那台没装 textual，板子静默降级成了 cbreak 版）。
+        print(f"[{now()}] ⚠ 没装 textual —— 全屏看板不可用，先用标准库版顶着。")
+        print("  装上一句就行：python3 -m pip install --user textual")
+        print("  （装完重开 xteam board 就是全屏那版；其余子命令不受影响）")
         _board_cbreak_loop(root, proto, herdr, label, role_map, tracker, args, color)
     return 0
 

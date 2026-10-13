@@ -5238,6 +5238,97 @@ def test_external_review_fixes() -> None:
         check("textual 不可用，跳过草稿回归", True, True)
 
 
+def test_split_bring_up_from_surviving_pane() -> None:
+    """[108] split 组补角色：从同组还活着的 pane 上裂，不新开 tab。"""
+    print("\n[108] split 组补角色从同组 pane 裂出（不新开 tab）")
+
+    calls: list = []
+
+    class FakeHerdr:
+        """base_pane 已被同组另一个角色占用：必须先 split 再起 agent。"""
+
+        def __init__(self, scope: str = "") -> None:
+            self.scope = scope
+            self.n = 0
+
+        def find_workspace(self, label):
+            return {"workspace_id": "w1"}
+
+        def role_map(self, ws_id):
+            # 同组还有一个活着的 tl（dev 挂了，要补 dev）
+            return {"tl": {"pane_id": "w1:p9", "tab_id": "w1:t1"}}
+
+        def create_tab(self, ws_id, cwd, label, env=None):
+            calls.append(("create_tab", label))
+            self.n += 1
+            return {"tab": {"tab_id": f"w1:t{self.n}"}}
+
+        def panes_of_tab(self, ws_id, tab_id):
+            return ["w1:p1"]
+
+        def split_pane(self, pane_id, direction="right"):
+            calls.append(("split", pane_id, direction))
+            return "w1:pNEW"
+
+        def start_agent(self, pane_id, tab_id, spec):
+            calls.append(("start", spec.role, pane_id, tab_id))
+
+        def send_initial_prompt(self, pane_id, intro, wait_s=15):
+            return "ok"
+
+    specs = {"tl": RoleSpec("tl", "omp", "团队负责人", ""),
+             "dev": RoleSpec("dev", "devin", "开发", "")}
+    orig = _cli.Herdr
+    _cli.Herdr = FakeHerdr
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        # 补 dev：同组 tl 还活着（pane w1:p9, tab w1:t1）
+        out = _cli.bring_up_roles(root, proto, "demo-api", specs,
+                                  only=["dev"], say=lambda *_a, **_k: None,
+                                  team="api", split=True,
+                                  base_tab="w1:t1", base_pane="w1:p9")
+        check("不新开 tab（同组已有 tab）",
+              [c for c in calls if c[0] == "create_tab"], [])
+        check("从同组存活 pane 上裂", [c for c in calls if c[0] == "split"],
+              [("split", "w1:p9", "right")])
+        check("新角色起在裂出来的 pane 上",
+              [c for c in calls if c[0] == "start"],
+              [("start", "dev", "w1:pNEW", "w1:t1")])
+        check("仍然是一个 tab", out["tabs"]["dev"], "w1:t1")
+        check("pane 是裂出来的那个", out["started"]["dev"], "w1:pNEW")
+    finally:
+        _cli.Herdr = orig
+        shutil.rmtree(root, ignore_errors=True)
+
+    # 组里一个都不剩：退回「建 tab + 根 pane 归第一个」
+    calls.clear()
+
+    class FreshHerdr(FakeHerdr):
+        def role_map(self, ws_id):
+            return {}
+
+    _cli.Herdr = FreshHerdr
+    root = Path(tempfile.mkdtemp())
+    try:
+        proto = Protocol(root)
+        proto.ensure()
+        out = _cli.bring_up_roles(root, proto, "demo-api", specs,
+                                  only=["tl", "dev"], say=lambda *_a, **_k: None,
+                                  team="api", split=True)
+        check("全组死光时建新 tab",
+              [c for c in calls if c[0] == "create_tab"], [("create_tab", "api")])
+        check("第一个角色占根 pane（不用裂）",
+              [c for c in calls if c[0] == "split"], [("split", "w1:p1", "right")])
+        check("tl 在根 pane、dev 在裂出的 pane",
+              [(s[1], s[2]) for s in calls if s[0] == "start"],
+              [("tl", "w1:p1"), ("dev", "w1:pNEW")])
+    finally:
+        _cli.Herdr = orig
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -5348,6 +5439,7 @@ def main() -> int:
         test_human_intake_to_pm,
         test_team_split_one_pane,
         test_external_review_fixes,
+        test_split_bring_up_from_surviving_pane,
     ):
         fn()
     print()
