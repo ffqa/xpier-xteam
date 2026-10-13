@@ -23,11 +23,17 @@ from textual.widgets import (Button, Footer, Header, Input, Label,
                              ListItem, ListView, Static, TextArea)
 from rich.text import Text
 
-try:                                     # 单测里直接 import 本模块时给个友好失败
+# 两种布局：仓库（xteam_lib 在同级目录）与安装（lib/xteam_board.py + lib/xteam_lib.py）。
+# **两个分支导入的名字必须完全一致** —— 漏一个，安装布局下 import 那一刻不报错，
+# 等到真用那个名字时才 NameError，而那时板子已经起来了，人看到的是「按 o 没反应」
+# 而不是「装错了」。外部评审（qoderclicn）抓到这个，实测确认：原 except 分支只带了
+# 2 个名字，模块里实际用 6 个。
+try:
     from xteam_lib import (_box_state_text, wrap_display, read_doc,
                            doc_files_in, project_doc_files, render_doc_markdown)
-except ImportError:                      # pragma: no cover - 装在 lib/ 布局下
-    from .xteam_lib import _box_state_text, _spec_view_lines  # type: ignore
+except ImportError:                      # pragma: no cover - 安装布局（lib/）
+    from .xteam_lib import (_box_state_text, wrap_display, read_doc,  # type: ignore
+                            doc_files_in, project_doc_files, render_doc_markdown)
 
 
 class ArchiveList(ListView):
@@ -673,8 +679,12 @@ class BoardApp(App):
     def _switch_team(self, step: int) -> None:
         if len(self.teams) < 2:
             return
-        i = [t["name"] for t in self.teams].index(self.active_team)
-        self.active_team = self.teams[(i + step) % len(self.teams)]["name"]
+        names = [t["name"] for t in self.teams]
+        # active_team 可能来自采集数据里某个没登记的 team 名（task.json 写了
+        # teams.json 里没有的组）—— 那时 index() 会 ValueError 把整块板子带崩。
+        # 找不到就回到第一个组，绝不让一个拼错的 team 名变成界面崩溃。
+        i = names.index(self.active_team) if self.active_team in names else 0
+        self.active_team = names[(i + step) % len(names)]
         self._set_status(f"看 team {self.active_team}（重采中）", "info")
         self._collect(self.active_team)
 
@@ -848,8 +858,10 @@ class BoardApp(App):
         if not note:
             self._set_status("左边是空的，没什么可推", "warn")
             return
-        self._dispatch(note)
-        self.query_one("#note", TextArea).text = ""
+        # 投递是后台线程，**不在这里猜结果**。原来是同步清空草稿：pane 没起来或
+        # 输入框有草稿时，人写的一段话只剩状态行一句「没收到」，原文找不回来。
+        # 现在草稿由 _dispatch 在**确认送达后**才清。外部评审（qoderclicn）抓到。
+        self._dispatch(note, clear_note_on_success=True)
 
     def _make_intake(self) -> None:
         note = self.query_one("#note", TextArea).text.strip()
@@ -885,7 +897,7 @@ class BoardApp(App):
         except Exception as exc:                  # noqa: BLE001
             self._set_status(f"存 note 失败: {exc}", "error")
 
-    def _dispatch(self, msg: str) -> None:
+    def _dispatch(self, msg: str, clear_note_on_success: bool = False) -> None:
         role = self._target()
         self._set_status(f"正在推给 {role}…", "info")
 
@@ -894,9 +906,17 @@ class BoardApp(App):
                 ok, reason = self._dispatcher(role, msg)
             except Exception as exc:              # noqa: BLE001
                 ok, reason = False, str(exc)
+            # 只有确认送达才清草稿：失败时原文留在左边，改一遍就能重发。
+            # 手写的东西不该因为一次投递失败就消失。
+            if ok and clear_note_on_success:
+                try:
+                    self.query_one("#note", TextArea).text = ""
+                except Exception:
+                    pass
             self.call_from_thread(
                 self._set_status,
-                (f"✓ 已推给 {role}: {reason}" if ok else f"⚠ {role} 没收到: {reason}"),
+                (f"✓ 已推给 {role}: {reason}" if ok
+                 else f"⚠ {role} 没收到: {reason}（原文留在左边，可改后重发）"),
                 "success" if ok else "warn")
 
         # **不能用嵌套的 @work** —— 那个装饰器只在类定义期生效，运行时套在内层

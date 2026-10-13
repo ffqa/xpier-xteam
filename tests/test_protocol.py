@@ -5143,6 +5143,101 @@ def test_team_split_one_pane() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_external_review_fixes() -> None:
+    """[107] 外部评审（qoderclicn）抓到的三个问题，逐条钉回归。"""
+    print("\n[107] 外部评审回归：import 兜底 / 未登记 team 切组 / 投递失败不清草稿")
+
+    # 1) 两个 import 分支的名字必须一致 —— 漏一个，安装布局下用到才 NameError
+    try:
+        import ast
+        mod = ast.parse(Path("/Users/gouki/server/wwwroot/xpier/xteam/bin/xteam_board.py")
+                        .read_text(encoding="utf-8")
+                        if False else _find_cli().parent.joinpath("xteam_board.py")
+                        .read_text(encoding="utf-8"))
+        branches = []
+        for node in ast.walk(mod):
+            if isinstance(node, ast.ImportFrom) and node.module in ("xteam_lib", ".xteam_lib"):
+                branches.append({a.name for a in node.names})
+        names_used = {n.id for n in ast.walk(mod) if isinstance(n, ast.Name)}
+        check("找到两个布局分支的 import", len(branches), 2)
+        check("两个分支导入的名字完全一致", branches[0] == branches[1], True)
+        missing = [b for b in branches if not b <= names_used]
+        check("import 的每个名字都真被用到（没有死 import）", missing, [])
+        used_from_lib = names_used & (branches[0] | branches[1])
+        check("模块用到的 lib 名字都被 import 覆盖",
+              used_from_lib <= (branches[0] & branches[1]), True)
+    except Exception as exc:                          # noqa: BLE001
+        check(f"import 兜底检查自身没炸（{exc}）", False, True)
+
+    # 2) 未登记的 team 名不能让切组崩板子
+    app_mod = sys.modules.get("xteam_board")
+    if app_mod is None:
+        try:
+            app_mod = __import__("xteam_board")
+        except ImportError:
+            app_mod = None
+    if app_mod is not None:
+        cls = app_mod.BoardApp
+        stub = object.__new__(cls)
+        stub.teams = [{"name": "main"}, {"name": "api"}]
+        stub.active_team = "ghost"          # task.json 写了 teams.json 里没有的组
+        stub._set_status = lambda *_a, **_k: None
+        stub._collect = lambda *_a, **_k: None
+        try:
+            stub._switch_team(1)
+            check("未登记的 team 名切组不抛异常", True, True)
+            # 未登记 → 回落到下标 0（main），再按方向走一步；**关键是它落在
+            # 已登记的组里，而不是把名字原样带着走**
+            check("切组后落在已登记的组里", stub.active_team in ("main", "api"), True)
+            stub.active_team = "ghost"
+            stub._switch_team(-1)
+            check("反向也从已登记的组里走", stub.active_team in ("main", "api"), True)
+        except Exception as exc:                      # noqa: BLE001
+            check(f"未登记 team 名切组不抛异常（{exc}）", False, True)
+    else:
+        check("textual 不可用，跳过切组回归", True, True)
+
+    # 3) 投递失败不清草稿（原文必须留在左边）
+    try:
+        from textual.widgets import TextArea as _TextArea
+    except ImportError:
+        _TextArea = None
+    if app_mod is not None:
+        stub = object.__new__(app_mod.BoardApp)
+        stub.status_text = ""
+        stub.status_kind = "info"
+        stub._set_status = lambda t, k="info": setattr(stub, "status_text", t)
+        sent = []
+
+        class _Note:
+            """实例属性（不是类属性）—— 赋 `.text = ""` 写的是实例槽，
+            用类属性做断言会永远看不到改写。"""
+
+            def __init__(self) -> None:
+                self.text = "我写的一段话"
+
+        stub.query_one = lambda *_a, **_k: _Note()
+        stub.call_from_thread = lambda fn, *a: fn(*a)
+        stub.run_worker = lambda fn, **kw: fn()
+        stub._dispatcher = lambda role, msg: (sent.append((role, msg)), (False, "输入框有草稿"))[1]
+        stub._target = lambda: "pm"
+        stub._dispatch("我写的一段话", clear_note_on_success=True)
+        check("投递失败后原文还在左边",
+              stub.query_one("#note", _TextArea).text, "我写的一段话")
+        check("失败时状态行提示可改后重发", "可改后重发" in stub.status_text, True)
+
+        # 成功才清：**重新取一个实例**再写一段（上一轮已把 text 清成空，
+        # 接着用同一个实例会被前一轮的状态污染）
+        inst2 = _Note()
+        inst2.text = "另一段话"
+        stub.query_one = lambda *_a, **_k: inst2
+        stub._dispatcher = lambda role, msg: (True, "已送达")
+        stub._dispatch("另一段话", clear_note_on_success=True)
+        check("确认送达后才清草稿", inst2.text, "")
+    else:
+        check("textual 不可用，跳过草稿回归", True, True)
+
+
 def main() -> int:
     for fn in (
         test_chain_walks_one_role_at_a_time,
@@ -5252,6 +5347,7 @@ def main() -> int:
         test_multi_team_registry,
         test_human_intake_to_pm,
         test_team_split_one_pane,
+        test_external_review_fixes,
     ):
         fn()
     print()

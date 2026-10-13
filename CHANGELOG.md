@@ -1,5 +1,35 @@
 # 变更记录
 
+## 0.2.28
+
+### 外部评审（qoderclicn 冷读）抓到 3 个真问题，全部修掉
+
+发版前按用户要求让 `qoderclicn -p -w <repo>` 做一次独立冷读（它没参与过本项目开发）。
+它报的 3 个主要问题逐条核实**全部属实**，其中第一个是发布级缺陷：
+
+1. **`xteam_board.py` 的 import 兜底分支是坏的**（发布级）。`try: from xteam_lib
+   import …` / `except ImportError: from .xteam_lib import …` 两个分支导入的名字
+   **不一致**：except 分支只带 2 个，模块里实际用 6 个。仓库布局（xteam_lib 在同级）
+   永远走 try 分支，所以本地开发和单测全绿；**只有安装布局（`~/.local/share/xteam/lib/`）
+   才会走到 except**，然后到第一次用 `wrap_display`/`read_doc` 时才 NameError ——
+   那时板子已经起来了，人看到的是「按 o 没反应」而不是「装错了」。
+   修：两个分支名字完全一致，并用 AST 断言钉住（[107] 组）。
+2. **`_switch_team()` 会因未登记的 team 名崩掉整块板子**。`active_team` 可能被采集数据
+   里的 `task.json` 带成 teams.json 里没有的组名，`[names.index(...)]` 抛 ValueError。
+   修：找不到就回落到下标 0，绝不让一个拼错的 team 名变成界面崩溃。
+3. **笔记在投递结果出来之前就被清空**。`_push_note()` 同步 `_dispatch()` 后立刻把
+   TextArea 清零；后台失败时人写的一段话只剩状态行一句「没收到」，原文找不回。
+   修：改成**确认送达才清**，失败时状态行明说「原文留在左边，可改后重发」。
+
+外部评审另报 2 个次要项，核实后**未改**（有意识的选择）：
+- `proto=None` 时按 o 翻档案会 AttributeError —— 构造函数确实允许 None，但唯一调用方
+  （`run_board`）一定传真 proto；加防御只会把一个不会发生的分支写进代码。
+- `_apply` 里采集结果解析阶段的异常没人接 —— 已由 `_collect` 的 try 覆盖采集，
+  解析阶段全是对 dict 的 `.get()`，没有可抛点。
+
+测试：[107] 组 11 条（import 双分支一致 + 无死 import + 名字覆盖 / 未登记 team 切组 /
+投递失败保留原文 / 成功才清）。门禁三层全绿，复跑两遍确认（单测 1070 · e2e 369/369 · 端到端）。
+
 ## 0.2.27
 
 ### 非 main 组 split：一个 team 只占一个 tab，tl/dev 是同一个 pane 区的两半
