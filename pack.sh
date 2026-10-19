@@ -264,7 +264,10 @@ gzip -9 "$DIST/$NAME.tar"
 CONTENTS="$(tar tzf "$DIST/$NAME.tar.gz")"
 for must in "$NAME/bin/xteam" "$NAME/bin/xteam_lib.py" "$NAME/bin/xteam_board.py" \
             "$NAME/install.sh" \
-            "$NAME/roles/pm.md" "$NAME/templates/PROTOCOL.md" \
+            "$NAME/roles/pm.md" "$NAME/roles/pm.core.md" \
+            "$NAME/roles/tl.md" "$NAME/roles/tl.core.md" \
+            "$NAME/roles/dev.md" "$NAME/roles/dev.core.md" \
+            "$NAME/templates/PROTOCOL.md" \
             "$NAME/skills/ste/SKILL.md" \
             "$NAME/README.md" "$NAME/INSTALL.md" "$NAME/VERSION" \
             "$NAME/LICENSE" "$NAME/CHANGELOG.md" "$NAME/tests/smoke.sh" \

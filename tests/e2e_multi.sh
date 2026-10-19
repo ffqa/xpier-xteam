@@ -735,7 +735,7 @@ printf '%s' "$STALE_LINE" | grep -qF '重启' \
 # 新一轮不再新增 SELF-STALE（不许常驻误报）。
 # **先撤冷却武装**：MP-18.2 刚为 nag:self-stale 关闸 30min，不删 idle.state
 # 的话本轮无论指纹一致与否都 0 新增——断言恒真、测了个寂寞（F-10 的
-# 修复前失败证据）。与 MP-19 的 zero_recap_ts 同一个「主动绕冷却」套路。
+# 修复前失败证据）。
 CUR="$(python3 -c 'import hashlib,os,sys
 print(hashlib.sha256(open(os.path.realpath(sys.argv[1]),"rb").read()).hexdigest())' \
   "$REPO/bin/xteam")"
@@ -754,7 +754,7 @@ assert_rc "MP-18.3 once rc=0" 0
 # MP-18.4 回归：MP-12~MP-17 断言继续全过即自动满足（末行 N/N）。
 
 # ---------------------------------------------------------------- MP-19
-step "MP-19" "recap 问询收敛：每片各问一次，问完静默（不再 s1→s2 震荡）"
+step "MP-19" "不再自动索要 recap：巡检不产生 RECAP-ASK"
 
 T="$BASE/mp19"
 mkrepo "$T" fe api admin
@@ -772,57 +772,24 @@ for s in s1 s2 s3; do
   printf 'closed\n'     > "$d/closed.md"
 done
 EVLOG="$T/.xteam/watch/events.log"
-IDLE="$T/.xteam/watch/idle.state"
+npc() { grep -cF 'RECAP-ASK' "$EVLOG" 2>/dev/null || true; }
 
-# 每轮跑前把 pm.recap_asked_at 归零：绕 30min 冷却，否则测不到多轮
-# （spec §2.1 的手法；冷却入口位置不许动，是 [57] 钉的）。
-zero_recap_ts() {
-  mkdir -p "$(dirname "$1")"
-  python3 -c '
-import json, sys
-p = sys.argv[1]
-try:
-    d = json.load(open(p, encoding="utf-8"))
-except (OSError, json.JSONDecodeError):
-    d = {}
-d.setdefault("pm", {})["recap_asked_at"] = 0
-json.dump(d, open(p, "w", encoding="utf-8"))
-' "$1"
-}
-npc() { grep -cF 'RECAP-ASK pm ' "$EVLOG" 2>/dev/null || true; }
-
-zero_recap_ts "$IDLE"
 run xin13 "$T" mp19 "$T" watch once
 assert_rc "MP-19.1 第1轮 rc=0" 0
 grep -qF 'SAMPLE' "$EVLOG" \
   && ok  "MP-19.0 events.log 有 SAMPLE（布景没空转）" \
   || bad "MP-19.0 无 SAMPLE——布景空转" "$(tail -5 "$EVLOG" 2>/dev/null)"
-[ "$(npc)" = "1" ] \
-  && ok  "MP-19.1 第1轮恰新增 1 条 RECAP-ASK pm" \
-  || bad "MP-19.1 第1轮计数不对" "$(npc)"
+[ "$(npc)" = "0" ] \
+  && ok  "MP-19.1 巡检未发 RECAP-ASK" \
+  || bad "MP-19.1 仍在自动索要 recap" "$(grep -F 'RECAP-ASK' "$EVLOG")"
 
-for round in 2 3; do
-  zero_recap_ts "$IDLE"
-  run xin13 "$T" mp19 "$T" watch once
-  assert_rc "MP-19.2 第 ${round} 轮 rc=0" 0
-done
-[ "$(npc)" = "3" ] \
-  && ok  "MP-19.2 三轮累计恰 3 条（每轮各问一片）" \
-  || bad "MP-19.2 三轮累计不对" "$(npc)"
-for s in s1 s2 s3; do
-  grep -F 'RECAP-ASK pm ' "$EVLOG" | grep -qF "切片 $s 闭合" \
-    && ok  "MP-19.2 reasons 覆盖 $s" \
-    || bad "MP-19.2 没问过 $s" "$(grep -F 'RECAP-ASK' "$EVLOG")"
-done
-
-zero_recap_ts "$IDLE"
 run xin13 "$T" mp19 "$T" watch once
-assert_rc "MP-19.3 第4轮 rc=0" 0
-[ "$(npc)" = "3" ] \
-  && ok  "MP-19.3 第4轮零新增（收敛）" \
-  || bad "MP-19.3 第4轮还在问（不收敛）" "$(grep -F 'RECAP-ASK' "$EVLOG")"
+assert_rc "MP-19.2 第2轮 rc=0" 0
+[ "$(npc)" = "0" ] \
+  && ok  "MP-19.2 第2轮仍为零" \
+  || bad "MP-19.2 第2轮又出现 RECAP-ASK" "$(grep -F 'RECAP-ASK' "$EVLOG")"
 
-# MP-19.4 回归：MP-12~MP-18 断言继续全过即自动满足（末行 N/N）。
+# MP-19.3 回归：MP-12~MP-18 断言继续全过即自动满足（末行 N/N）。
 
 # ---------------------------------------------------------------- MP-20
 step "MP-20" "队列项已开工不催 PM；未开工（无 spec.md / 目录缺失）仍催（双向）"

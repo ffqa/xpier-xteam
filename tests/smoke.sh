@@ -228,7 +228,7 @@ step 2b "swap：中途把 tl 换成另一个 agent（交接 + 配置落盘 + 映
 OLD_TL=$(printf '%s\n' "$ROWS" | grep '^tl ' | awk '{print $3}')
 # tl 刚被投完章程，可能 working 也可能 idle/blocked —— 都合法，强断会 flaky。
 # 安全阀本身由单测用桩固定验证；这里验证「换完之后映射/tab/配置都对得上」。
-if swapout=$("$BIN" --project "$WORK" --workspace "$WS" swap tl devin --no-recap --force 2>&1); then
+if swapout=$("$BIN" --project "$WORK" --workspace "$WS" swap tl devin --force 2>&1); then
   ok "swap 执行成功（--force）"
   NEW_TL=$(python3 -c "
 import json

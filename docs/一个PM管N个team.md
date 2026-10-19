@@ -40,8 +40,9 @@
    串行。能并行的是**实现**。冻结粒度要从「项目」降到「组」：A 组待判时不冻 B 组，只冻
    与 A 的 touches 冲突的片。**这把并行度上限暴露出来了：1/(PM gate 时长)** —— 想再快只能
    多个 PM，那是下一个议题，不是这个。
-3. **一个 PM 盯 N 组，上下文怎么办？** PM 的 context 会被 N 组同时拉扯。每组一份
-   `memory/<team>-snapshot.md`（现成机制），PM 只看「组摘要 + 欠什么」，细节按需读。
+3. **一个 PM 盯 N 组，上下文怎么办？** PM 的 context 会被 N 组同时拉扯。用
+   `xteam team digest <组名>` 现算每组摘要（`whoami` 在多组时自动附上），PM 只看
+   「组摘要 + 欠什么」，细节按需读；进度事实在 `QUEUE.md` 与任务工件里，不另写 snapshot。
    **这是这套东西能不能长跑的关键**，比 pane 数量重要得多。
 
 ## 4. 会被波及的面（这就是它贵的原因）
@@ -54,13 +55,39 @@
 
 只做「1 个 PM + 2 组」的骨架，把上面三个问题里最短的那条先立起来：
 
-1. `xteam team add <名字>` / `xteam up --teams 2`：起 PM + 每组一套 tl/dev。
+1. `xteam team add <名字>`：起 PM + 每组一套 tl/dev。（`xteam up --teams 2` 这种按数量起
+   的没做：**声明比计数准** —— `teams.json` 写清有哪几组，组名才是派活时要用的东西，而
+   「2」到了 `say` / `task.json` 那里还得再翻译一次。`up` 改成把已声明的每一组都起来。）
 2. `task.json` 加 `team`；`debts()` / `slice_order()` 认它；待 gate 按组分开数。
 3. `board` 顶部加一条「组状态带」（每组 working/idle/blocked + 手上那片），点进去看那组
    的 tl/dev —— 现在看板已经是分区渲染，加这一层是自然的。
 4. `status` / `say` 支持 `--team`。
 
 明确**不做**的：PM 的自动派组、跨组负载均衡、多 PM。
+
+## 5b. increment 1 已落地（2026-10-16）
+
+上面四条都实现了（`xteam team add|start|stop|list|rm`；`task.json` / spec front-matter 的
+`team`；`say --team`；`team list` 的组摘要），并补了两处设计里没写、但用户一上手就撞到的：
+
+1. **组里的 agent 得知道自己属于哪一组。** 原来 workspace 只由 `--workspace` /
+   `session.json` / cwd 反查 / 目录名决定，`XTEAM_TEAM` 完全不被认。于是子 team 的 pane
+   里跑 `xteam say dev` 会算成主组，门铃投给 **main 的 dev**，那组的 dev 永远收不到派工，
+   最后 tl 自己动手 —— 这正好解释了「任务很少派给 quick-dev，大多是 quick-tl 自己在折腾」。
+   现在起 pane 时注入 `XTEAM_TEAM=<组名>`（tab 级 env 只管第一个 pane，所以 split 出来的
+   那个要自己再带一遍 —— herdr 实测），只对 agent 自述类命令生效。**把「记得加 `--team`」
+   这条人工纪律换成机器保证**：人都会忘，何况上下文随时被清空的 agent。
+2. **「声明了就该回来」。** `teams.json` 是「这个项目该有哪些组」，`team rm` 才是撤销动作；
+   但原来 `up` 只起 main，`team add` 撞名言就硬失败 —— workspace 被外部关掉后**没有任何
+   命令能把它拉回来**（这就是「关闭 sub team 后无法重启该 team」）。现在 `add`/`start` 走同
+   一条幂等 bring-up，`up` 遍历 `teams.json` 把每组都恢复。
+
+**踩过的坑（写下来免得复发）**：
+
+- 切片漏写 `team` ⇒ 算成 main ⇒ 那组 dev 空转。一个项目里因此复发过两次（#52、#56）。
+  所以构建切片时就写，别事后补。
+- `team add` 曾经硬失败在「已存在」—— 而这个组还在 `teams.json` 里、workspace 却没了，
+  于是「重启」这件事当时是无路可走的。
 
 ## 6. 判断
 

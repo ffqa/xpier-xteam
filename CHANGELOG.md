@@ -1,5 +1,25 @@
 # 变更记录
 
+## 0.2.32
+
+### 移除 recap：PM 用 QUEUE.md 管理按序看板
+
+`recap` 会在每条门铃、每次 swap/reopen 时重复注入，既烧 token 又是第二份真相。
+现在砍掉：
+
+- 巡检不再自动索要 recap；门铃不再附带 recap 尾巴。
+- swap/reopen 的交接底稿从 `QUEUE.md`（按序）+ 各切片工件 + `overall_debts()` 现算。
+- `whoami` 直接列出按序队列（序号 / 切片 / 状态 / 推荐项），不再读 recap。
+- 状态视图按角色限流：PM 看完整队列与所有欠账；TL 只看队列头部 + 自己的活；
+  dev 只看自己的活 —— 不把整份项目状态塞给每个角色。
+- **system prompt 换成核心卡**：常驻的从 `roles/<角色>.md` 全文（PM 7629 字 /
+  TL 5603 / dev 4289）换成 `roles/<角色>.core.md`（约 1.7–1.9k 字），完整章程只留路径、
+  按需读；生成的身份文件 PM 2539 / TL 2473 / dev 2311 字（含固定引导）。
+- **调度提示**：`whoami` 对 PM/TL 列出「可立即派给 dev」的片（`request.md` 在、
+  `delivered.json` 不在）和现成门铃命令；PM/TL 先派活、再讨论，dev 做 N 时准备 N+1。
+- 三角色章程删除「自驱快照」硬规则；`QUEUE.md` 由 PM 维护，TL 只提议切片。
+- 切片闭合且角色 idle 时仍自动轮换会话，但不再等待 recap 落地。
+
 ## 0.2.28
 
 ### 外部评审（qoderclicn 冷读）抓到 3 个真问题，全部修掉

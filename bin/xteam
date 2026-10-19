@@ -61,8 +61,6 @@ from xteam_lib import (  # noqa: E402
     save_verified_agent,
     die,
     fmt_duration,
-    latest_recap,
-    RECAP_CONTEXT_COOLDOWN,
     SAY_RECHECK_S,
     context_hint,
     roles_touched_task,
@@ -85,8 +83,6 @@ from xteam_lib import (  # noqa: E402
     DEFAULT_TEAM,
     parse_context_pct,
     XTEAM_DIRNAME,
-    recap_path,
-    snapshot_path,
     fmt_epoch,
     HERDR_KINDS,
     VERIFIED_TUI_MODEL,
@@ -1202,15 +1198,29 @@ def cmd_restore(args: argparse.Namespace) -> int:
         for l in lines[-5:]:
             print(f"    {l[:110]}")
     print()
-    recaps = sorted((proto.dir / "memory").glob("*-recap.md")) \
-        if (proto.dir / "memory").is_dir() else []
-    if recaps:
-        print("  已有 recap（派活时会自动附给对方）:")
-        for r in recaps:
-            print(f"    {r.name}  {r.stat().st_mtime and '存在'}")
-    else:
-        print("  尚无 recap —— 下次切片闭合时 xteam 会主动要求写")
+    print("  队列（按序执行，PM 维护）:")
+    for line in _queue_lines(proto, limit=20):
+        print(line)
+    dispatch = _dispatch_lines(proto, "pm")
+    if dispatch:
+        print()
+        for line in dispatch:
+            print(line)
     print()
+    # 子 team 是「声明了就该回来」的东西：workspace 关掉之后要有一条明确的路，
+    # 否则人只能猜（实测就是「关闭 sub team 后无法重启」）。
+    subs = [t for t in read_teams(root, label) if t["name"] != DEFAULT_TEAM]
+    if subs:
+        print("  子 team（teams.json 里声明的）:")
+        for t in subs:
+            tlabel = str(t.get("label") or f"{label}-{t['name']}")
+            tws = Herdr(scope=tlabel).find_workspace(tlabel)
+            state_t = (f"运行中（{len(Herdr(scope=tlabel).role_map(tws['workspace_id']))} 个 agent）"
+                       if tws else "没在跑")
+            print(f"    {t['name']:<10} {tlabel:<16} {state_t}")
+        print(f"  拉起某一组：xteam --project {root} team start <组名>"
+              f"（或 xteam up . 一次全起）")
+        print()
     if not ws:
         print("  恢复现场：xteam up . --watch")
     return 0
@@ -1274,6 +1284,60 @@ def resolve_ws_label(root: Path, explicit: str | None,
     return hits[0][0], f"cwd 反查命中（{hits[0][0]}）"
 
 
+# 这些子命令是**agent 在 pane 里替自己说话**用的（门铃 / 打卡 / 自述 / 看状态）——
+# 它们必须落在「我这个 pane 属于哪一组」上。项目级生命周期命令（up/down/restore/
+# watch/sync）不进这张表：它们是整套现场的命令，不该因为人在哪个 pane 里而变。
+TEAM_SCOPED_CMDS = frozenset({"say", "stamp", "whoami", "status", "board",
+                              "reopen", "swap"})
+
+
+def _team_env_label(root: Path, team: str) -> str:
+    """`XTEAM_TEAM` 指的组在 teams.json 里的 workspace label（查不到返回空串）。"""
+    if not team or not root.is_dir():
+        return ""
+    try:
+        hit = [t for t in read_teams(root, "") if t["name"] == team]
+    except Exception:                            # noqa: BLE001
+        return ""
+    if not hit:
+        return ""
+    return str(hit[0].get("label") or f"{root.name}-{team}")
+
+
+def default_workspace(args: argparse.Namespace) -> str:
+    """**本次要用哪个 workspace**（返回值即最终值，不含「已给就不覆盖」的半条规则）。
+
+    三条来源，顺序即优先级：
+
+    0. **显式 `--workspace`**。人说了算，永远最大 —— 这条必须在这里，不能只留在
+       `main()` 的 `if not args.workspace` 里：规则的唯一住处才是不会漂的地方，
+       而多一处调用点忘了加判断，就会把人明确指定的 workspace 悄悄覆盖成目录名。
+
+    1. **`XTEAM_TEAM`：pane 里注入的「我属于哪一组」**。子 team 的 pane 起的 agent
+       必须能找到自己那一组，否则它说的每一句话都落到主组：quick 的 tl 跑
+       `xteam say dev`，workspace 由 cwd 反查/目录名算出来 = 主组，门铃投给
+       **main 的 dev**，而 quick 的 dev 永远收不到派工，最后只能 tl 自己动手
+       （apartment 实测就是这么空转的）。README 里的「派活：xteam say --team X dev」
+       要求 agent 自己记得加 --team —— 人都会忘，何况上下文随时被清空的 agent。
+       环境变量是 pane 自己的事实，不靠它自觉。
+
+    2. **项目目录名**。`--project` 指到哪就用哪个目录名。原来除 `up` 之外一律取
+       **当前 shell 的 cwd**，于是 `xteam --project /a/b status` 在别的目录里跑会
+       去解析 cwd 那个项目的 workspace，直接报「不属于本项目」（实测可复现）。
+    """
+    if args.workspace:
+        return args.workspace
+    project = Path(args.project or ".")
+    team = os.environ.get("XTEAM_TEAM", "").strip()
+    if team and args.cmd in TEAM_SCOPED_CMDS:
+        env_label = _team_env_label(project, team)
+        if env_label:
+            return env_label
+    # `up` 的目录参数在 parse 之后才合并进 args.project，所以这里读到的仍是
+    # 显式 --project 或默认值 —— 与改动前的行为逐字相同。
+    return project.resolve().name
+
+
 def started_order(args: argparse.Namespace) -> list[str]:
     """本次要拉起的角色，按启动顺序。reviewer 默认不启动。"""
     return [r for r in BOOT_ORDER if r != "reviewer" or args.reviewer]
@@ -1319,19 +1383,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
     for role in targets:
         # **只重投真的变了的。** 原来每次 sync 都把三份章程全推一遍，agent 得
         # 重读没变的内容——既噪音，又把真正的变更淹掉。
-        charter_changed = role in stale
+        charter_changed = role in stale or f"{role}.core" in stale
         # 三类都要算进来。漏掉 new_cmds 的后果是：**只新增了子命令时一个角色都
         # 不会被通知** —— 而 agent 不知道新命令存在，就永远不会去用。
         if not charter_changed and not shared and not new_cmds:
             continue
         parts = []
         if charter_changed:
-            # 章程变了要重投全文，但明确禁止 agent 产生冗长的分析回复（节约 Token）
+            # 章程变了只需重投**核心卡**：完整章程留在文件里按需读，
+            # 把几千字全文塞进对话是重复烧 token。
+            core, full = _role_core_text(role)
             parts.append(
-                f"【协议更新】你的角色章程已更新（已落盘 .xteam/identity/{role}.md）。"
+                f"【协议更新】你的角色核心规则已更新（已落盘 .xteam/identity/{role}.md）。"
                 f"请吸收新规则并继续当前工作。这是一条单向系统通知，无需回复任何确认、总结或分析，请直接继续当前工作：\n"
-                + (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
-                + "\n\n（单向系统通知，无需回复确认，请直接继续当前工作。）")
+                + core
+                + f"\n\n完整章程：{full}（需要细节时读相关章节）\n"
+                + "（单向系统通知，无需回复确认，请直接继续当前工作。）")
             # 身份文件同步刷新：正在跑的 pane 改不了自己的系统提示词（那要重开），
             # 但**下一次 up / swap / reopen 起的 pane 必须拿到新版** —— 否则旧身份
             # 文件会一直把旧章程喂给新会话，而人以为已经同步过了。
@@ -1466,8 +1533,7 @@ def _swap_block_reason(state: str, force: bool) -> str:
     if state in ("idle", "done", "blocked", "unknown", "absent") or force:
         return ""
     return (f"{state}：换掉会丢掉它正在做的上下文。\n"
-            "  等它 idle 再换；或先 `xteam say <角色> \"停下并写 recap\"`；"
-            "确实要强换加 --force。")
+            "  等它 idle 再换；确实要强换加 --force。")
 
 
 def _persist_role(root: Path, role: str, spec: RoleSpec) -> None:
@@ -1486,60 +1552,159 @@ def _persist_role(root: Path, role: str, spec: RoleSpec) -> None:
     write_json(path, {"roles": roles, "_updated": now()}, indent=2)
 
 
-def _handover_brief(root: Path, proto: Protocol, role: str) -> str:
-    """换 agent 的交接底稿：新 agent 靠这段文字接上旧 agent 的班。
+def _queue_lines(proto: Protocol, limit: int = 12) -> list[str]:
+    """QUEUE.md 的按序视图 —— PM 的看板就是这些行。
 
-    直接关掉旧 pane 会丢掉整个对话上下文 —— 新 agent 面对一个「已经在进行中」
-    的活却不知道进行到哪。所以必须带上三样：旧 agent 的 recap、别人的 recap
-    尾巴（它在链路上游，刚跟谁沟通过）、协议现状（谁欠什么义务）。
+    只列未完成项。队列是派活的唯一顺序来源；不再需要 agent 另写一份 recap。
     """
-    parts: list[str] = []
-    # **自己的 recap 也要限长。** 以前只有「别人的」限 600 字，自己的完整注入；
-    # 实测 20 万字的 recap 会让交接 prompt 同样变成 20 万字。
-    mine = latest_recap(root, role)[-RECAP_INJECT_CHARS * 4:]
-    parts.append(f"【你之前（{role}）写的 recap】\n{mine}"
-                 if mine else
-                 f"【{role} 之前没有留下 recap —— 接手时以 .xteam/ 下的工件为准，"
-                 f"别凭空假设进度】")
-    # **别人的 recap 只带尾部，且限长。** recap 是给「接手的人扫一眼」用的，
-    # 不是上下文主体 —— 两个角色各贴 1200 字会把交接提示撑到几千 token，
-    # 而新 agent 大概率只看得到最前面那几行。
-    for other in DEFAULT_ROLES:
-        if other == role:
+    pending = [i for i in proto.queue_items()
+               if i["state"] not in ("done", "已闭合")]
+    if not pending:
+        return ["  （空 —— 没有排队的活；先向人类收集功能点）"]
+    lines: list[str] = []
+    for i in pending[:limit]:
+        mark = "  ← 推荐" if i.get("recommended") else ""
+        note = str(i.get("note") or "").strip()
+        if i.get("recommended"):
+            note = note.replace("推荐", "").strip()
+        note_s = f"  {note}" if note else ""
+        lines.append(f"  #{i['order']} {i['slice']} [{i['state']}]{mark}{note_s}")
+    if len(pending) > limit:
+        lines.append(f"  … 还有 {len(pending) - limit} 项")
+    return lines
+
+
+def _role_open_tasks(proto: Protocol, role: str, limit: int = 8) -> list[str]:
+    """这个角色真正要看的未闭合切片：它欠活的，或它留下过工件的。"""
+    out: list[str] = []
+    for t in proto.open_tasks():
+        if role in proto.debts(t) or role in roles_touched_task(t):
+            out.append(t.name)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _ready_tasks(proto: Protocol, team: str = "") -> list[Path]:
+    """已拆解、还没交付的片：request.md 在，delivered.json 不在。
+
+    这就是「可以立刻派给 dev」的缓冲区。PM/TL 在开始新一轮讨论前先看它：
+    dev 有活干，讨论才不会变成互相等待。
+    """
+    out: list[Path] = []
+    for t in proto.open_tasks():
+        if not (t / "request.md").exists():
             continue
-        tail = latest_recap(root, other)[-RECAP_INJECT_CHARS:]
-        if tail:
-            parts.append(f"【{other} 最近的 recap（尾部 {RECAP_INJECT_CHARS} 字）】\n{tail}")
+        if (t / "delivered.json").exists():
+            continue
+        # 义务判据而不是「request 文件在」：缺验收标准 / 等前置 / 触碰冲突时
+        # dev 并不欠 implement，这时候派活等于让它猜或撞车。
+        d = proto.debts(t)
+        if d.get("dev") != "implement" or d.get("pm") == "unblock":
+            continue
+        if team and team_of(t) != team:
+            continue
+        out.append(t)
+    return out
+
+
+def _dispatch_lines(proto: Protocol, role: str) -> list[str]:
+    """PM/TL 的调度提示：哪些片已经可以派给 dev，命令是什么。"""
+    if role not in ("pm", "tl"):
+        return []
+    team = "" if role == "pm" else (os.environ.get("XTEAM_TEAM") or DEFAULT_TEAM)
+    ready = _ready_tasks(proto, team)
+    if not ready:
+        return []
+    lines = ["【可立即派给 dev（先派活，再讨论）】"]
+    for t in ready[:5]:
+        tn = team_of(t)
+        target = f"--team {tn} " if tn != DEFAULT_TEAM else ""
+        lines.append(f"  · {t.name}（team={tn}）")
+        lines.append(f'     xteam say {target}dev "{t.name} 已拆解：'
+                     f'看 .xteam/tasks/{t.name}/request.md"')
+        if not (t / "touches.json").exists():
+            lines.append("     ⚠ touches.json 未写：并行开工时视为与所有片冲突")
+    if len(ready) > 5:
+        lines.append(f"  … 还有 {len(ready) - 5} 片")
+    return lines
+
+
+def _handover_brief(root: Path, proto: Protocol, role: str) -> str:
+    """换 agent / 重开时的交接底稿：从 QUEUE.md 与任务工件现算。
+
+    不再向旧 agent 索要 recap，也不再注入 recap：那份摘要既重复又容易过期。
+    新 agent 需要的事实（按序队列、谁欠什么、哪些片未闭合）都在文件里，现算是
+    唯一的真相。
+
+    **按角色限流**：PM 需要完整队列与所有欠账；TL 只看队列头部 + 自己的活；
+    dev 只看自己的活。把整份项目状态塞给每个角色，等于每换一次人就把 token
+    预算烧在它不需要的信息上。
+    """
+    if role == "pm":
+        q_limit = 20
+    elif role == "tl":
+        q_limit = 5
+    else:
+        q_limit = 0
+
+    parts: list[str] = []
+    dispatch = _dispatch_lines(proto, role)
+    if dispatch:
+        parts.append("\n".join(dispatch))
+    if q_limit:
+        parts.append("【队列：按序执行，PM 维护】\n"
+                     + "\n".join(_queue_lines(proto, limit=q_limit)))
+
     debts = proto.overall_debts()
-    if debts:
-        parts.append("【协议现状：谁欠什么义务】\n"
-                     + "\n".join(f"  {r} 欠 {ob}" for r, ob in sorted(debts.items())))
-    opens = [t.name for t in proto.open_tasks()]
+    mine = debts.get(role) or []
+    if mine:
+        parts.append("【你欠的义务】\n"
+                     + "\n".join(f"  {ob}" for ob in mine))
+    if role == "pm":
+        others = {r: v for r, v in debts.items() if r != role and v}
+        if others:
+            parts.append("【别人欠的义务】\n"
+                         + "\n".join(f"  {r} 欠 {'、'.join(v)}"
+                                     for r, v in sorted(others.items())))
+
+    opens = ([t.name for t in proto.open_tasks()] if role == "pm"
+             else _role_open_tasks(proto, role))
     if opens:
         parts.append("【未闭合切片】" + "、".join(opens))
+    if not parts:
+        parts.append("【当前没有欠活】按章程待命，等 PM 派下一项。")
     return "\n\n".join(parts)
+
+
+def _role_core_text(role: str) -> tuple[str, Path]:
+    """常驻核心卡正文 + 完整章程路径；核心卡缺失时回退全文。"""
+    full = ROLES_DIR / f"{role}.md"
+    core = ROLES_DIR / f"{role}.core.md"
+    src = core if core.exists() else full
+    return src.read_text(encoding="utf-8"), full
 
 
 def _restart_intro(root: Path, proto: Protocol, role: str, kind: str, why: str,
                    with_charter: bool | None = None) -> str:
     """agent 刚被拉起 / 重开 / 换掉时投给它的那段话：先自检，别先开口问。
 
-    章程在不在段里，取决于这个 kind 的身份在不在系统提示词里：
-      · 支持注入的（如 omp）—— 身份文件已带章程全文，这里再抄一遍只是重复烧
+    核心规则在不在段里，取决于这个 kind 的身份在不在系统提示词里：
+      · 支持注入的（如 omp）—— 身份文件已带核心卡，这里再抄一遍只是重复烧
         token，而且两处一旦漂移（sync 改了章程）反而多一个矛盾源；
-      · 不支持的 —— 身份只能靠这段话带，必须带全文。
+      · 不支持的 —— 身份只能靠这段话带，必须带核心卡 + 全文路径。
     with_charter 显式覆盖：up 补起**已在跑的老 pane** 时不知道它当初是怎么投的
-    （可能是升级前起的、系统提示词里没有身份），那种情况一律带章程。
+    （可能是升级前起的、系统提示词里没有身份），那种情况一律带核心卡。
     """
     include = (kind not in SYSTEM_PROMPT_ARG) if with_charter is None else with_charter
     brief = _handover_brief(root, proto, role)
     if include:
-        charter_block = ("## 角色章程\n"
-                         + (ROLES_DIR / f"{role}.md").read_text(encoding="utf-8")
-                         + "\n\n")
+        core, full = _role_core_text(role)
+        charter_block = ("## 角色核心规则\n" + core
+                         + f"\n完整章程：{full}（需要细节时读相关章节）\n\n")
     else:
-        charter_block = ("## 角色章程\n"
-                         "你的角色章程全文已在系统提示词里"
+        charter_block = ("## 角色核心规则\n"
+                         "你的角色核心卡已在系统提示词里"
                          f"（身份文件 {identity_path(root, role)}）——"
                          "从现在起按它工作，不用再问你是谁。\n\n")
     return (
@@ -1562,8 +1727,8 @@ def cmd_swap(args: argparse.Namespace) -> int:
     必然要重建 pane。**但也因此 model 可以在启动时精确指定**，绕开了运行中用
     方向键盲选模型的风险（列表无稳定编号，实测盲按会落到 openrouter 上）。
 
-    代价：旧 agent 的对话上下文随 pane 一起消失。所以先要它写 recap 交接，
-    再把 recap + 协议现状注入新 agent。
+    代价：旧 agent 的对话上下文随 pane 一起消失。交接只靠 `.xteam/` 里的
+    队列与任务工件现算，不再让旧 agent 另写一份 recap。
     """
     root = Path(args.project).resolve()
     label, _ws_why = resolve_ws_label(root, args.workspace)
@@ -1604,20 +1769,9 @@ def cmd_swap(args: argparse.Namespace) -> int:
 
     print(f"[{now()}] {role}：{old_state} → {spec.describe() or 'CLI 默认模型'}")
 
-    # ---- 交接：先要旧 agent 留下 recap，再拆 ----
-    if not args.no_recap:
-        if old_pane:
-            print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
-            herdr.doorbell(old_pane,
-                           f"你要被换掉了。请把当前进展、已确认的结论、"
-                           f"下一步该做什么写进 {proto.dir}/memory/{role}-recap.md "
-                           f"（15 行以内，只写这四节：做完什么 / 验证结果 / 关键决定与理由 / "
-                           f"下一步遗留，不得加节），"
-                           f"然后停下。",
-                           wait_s=args.recap_wait)
-        print(f"[{now()}] recap："
-              f"{'已拿到' if latest_recap(root, role) else '没有（以 .xteam/ 工件为准）'}"
-              f"（{proto.dir}/memory/{role}-recap.md）")
+    # ---- 交接底稿在拆旧 tab 前现算；不再先要 recap ----
+    # 旧 agent 的对话随 pane 消失，但队列、义务、未闭合切片都在文件里。
+    # 让它再写一份摘要只会重复烧 token，而且写完也未必比现算的准确。
 
     # ---- 两阶段替换：新 agent 先起来，成功了才关旧的 ----
     #
@@ -1718,6 +1872,12 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
     """
     herdr = Herdr(scope=label)
     existing = herdr.find_workspace(label)
+    # 我们自己刚建的 workspace 里，herdr 会**顺手附一个 tab**（一个裸 shell）。
+    # 那个 tab 我们永远不用：split 模式另外建组自己的 tab，非 split 模式每个
+    # 角色一个 tab —— 于是它留在屏幕上就是一块没人用的空白面板（人看到会问
+    # 「这是什么」）。记下它，等角色就位后收掉。**只在「这个 workspace 是我们
+    # 刚建的」时记**：别人的 workspace、或既有 tab 一律不动。
+    blank_tabs: list[str] = []
     if existing:
         # **复用 workspace，不要再开一个。** 反复 up 会在屏幕上堆一堆同名
         # workspace，而它们指向同一个项目 —— 既浪费终端空间，又让人搞不清
@@ -1733,6 +1893,12 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         if not ws_id:
             die(f"workspace 创建返回异常（未找到 workspace_id）：{ws}")
         say(f"[{now()}] workspace {label!r} → {ws_id}")
+        try:
+            blank_tabs = [str(t.get("tab_id") or "") for t in
+                          herdr._run("tab", "list",
+                                     "--workspace", ws_id).get("tabs", [])]
+        except Exception:                        # noqa: BLE001
+            blank_tabs = []      # 问不到就不收：宁留一块空白，也不猜着关 tab
 
     live_roles = {r: a for r, a in
                   herdr.role_map(ws_id).items() if r in BOOT_ORDER}
@@ -1766,13 +1932,20 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         say(f"[{now()}] 启动 {role}（{spec.cn}）：{spec.describe() or 'CLI 默认模型'}",
             flush=True)
         if split:
+            # 这一组的 pane 都要带上 XTEAM_TEAM：`xteam say dev` 靠它认出「我在
+            # 哪一组」，否则子 team 的门铃会按 cwd/目录名落到主组去（见
+            # default_workspace）。tab 级 env 只作用于 tab 的第一个 pane，所以
+            # 下面分割出来的 pane 必须自己再带一遍。
+            pane_env = {"XTEAM_ROLE": role}
+            if team:
+                pane_env["XTEAM_TEAM"] = team
             if not split_tab:
                 if base_tab and base_pane:
                     # 同组还有存活的 pane：接着用它，保持一个 tab
                     split_tab, split_pane, split_pane_busy = base_tab, base_pane, True
                 else:
                     tab = herdr.create_tab(ws_id, str(root), team or label,
-                                           env={"XTEAM_ROLE": role})
+                                           env=pane_env)
                     split_tab = (tab.get("tab") or tab).get("tab_id", "")
                     panes = herdr.panes_of_tab(ws_id, split_tab)
                     if not panes:
@@ -1783,7 +1956,7 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
             # pane 上**：测试先抓到（tl/dev 都落在 w1:p1），真机上就是两个 agent
             # 挤同一个 shell。
             if split_pane_busy:
-                split_pane = herdr.split_pane(split_pane, "right")
+                split_pane = herdr.split_pane(split_pane, "right", env=pane_env)
             pane_id, tab_id = split_pane, split_tab
             herdr.start_agent(pane_id, tab_id, spec)
             split_pane_busy = True      # 这个 pane 现在有主了
@@ -1804,6 +1977,20 @@ def bring_up_roles(root: Path, proto: Protocol, label: str, specs: dict,
         used.setdefault(role, agent_rec.get("agent") or
                         (specs[role].describe() if role in specs else "") or
                         "CLI 默认模型")
+
+    # 收掉 workspace 创建时附带的空 tab。**只在它确实没被我们用上时**才关：
+    # own_tabs 为空说明这个 workspace 里一个自己的 tab 都没有，那就留着那块
+    # 空白（宁可难看，也不能把一个 workspace 关成零个 tab）。
+    own_tabs = {t for t in tabs_of.values() if t}
+    if own_tabs:
+        for tab_id in blank_tabs:
+            if not tab_id or tab_id in own_tabs:
+                continue
+            try:
+                herdr.close_tab(tab_id)
+                say(f"[{now()}] 收掉 workspace 自带的空 tab（{tab_id}）")
+            except Exception as exc:             # noqa: BLE001
+                say(f"[{now()}] ⚠ 收空 tab {tab_id} 失败（不影响角色）：{exc}")
 
     # 角色章程：PM 先收到（它是入口），再 TL，最后 dev。
     #
@@ -1935,7 +2122,33 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"\n[{now()}] 启动完成。角色：{', '.join(boot['started'])}")
     for role, agent in boot["agents"].items():
         print(f"  {role:<6} → {agent}")
-    print(f"  看状态：xteam status    门铃：xteam say <role> \"...\"")
+
+    # **已声明的子 team 一起恢复。** teams.json 就是「这个项目该有哪些组」这一
+    # 声明，`team rm` 才是撤销它的动作——所以关掉之后再 up 一次就该全回来。
+    # 原来 up 只起 main：子 team 的 workspace 被关之后**没有任何命令能把它拉回来**
+    # （team add 硬失败在「已存在」），这就是「关闭 sub team 后无法重启」。
+    # 单 team 项目这里空转，输出与以前逐字相同。
+    subteams = [t for t in read_teams(root, label) if t["name"] != DEFAULT_TEAM]
+    for t in subteams:
+        tname = str(t["name"])
+        tlabel = str(t.get("label") or f"{label}-{tname}")
+        print(f"\n[{now()}] 子 team {tname!r}（{tlabel}）")
+        # 一个组起不来（agent 没装、pane 起不来）不该把已经起好的 main 也算失败，
+        # 更不该在 main 已就位后让整个 up 回滚——所以这里就地接住，逐组报。
+        try:
+            t_out = _bring_up_team(root, proto, tname, tlabel)
+        except (RuntimeError, SystemExit) as exc:
+            print(f"  ⚠ 起不来：{exc}", file=sys.stderr)
+            print(f"    单组重试：xteam --project {root} team start {tname}",
+                  file=sys.stderr)
+            continue
+        for role, pane_id in t_out["started"].items():
+            print(f"  {role:<6} → {pane_id}")
+
+    print(f"\n  看状态：xteam status    门铃：xteam say <role> \"...\"")
+    if subteams:
+        print(f"  多 team 的派活：xteam say --team <组名> dev \"...\""
+              f"（切片要写 task.json 的 team 才归那组）")
     if args.watch:
         print(f"[{now()}] 拉起巡检 …")
         # workspace 必须一起传：cmd_watch 靠它定位 pidfile 和给子进程拼参数，
@@ -2013,15 +2226,7 @@ def cmd_say(args: argparse.Namespace) -> int:
         # team.json 坏了不该让门铃哑掉 —— 退回默认 kind，顶多多贴或少贴一行提示。
         kind = DEFAULT_ROLES.get(args.role, ("", ""))[0]
     hint = context_hint(args.role, kind)
-    # 把对方最近的 recap 附在门铃里：上下文被清空后，它靠这个想起自己做过什么。
-    # 只带 tail——recap 可能很长，全塞进去会把门铃变成噪音。
-    recap = latest_recap(root, args.role)
-    if recap:
-        tail = recap.strip().splitlines()[-8:]
-        head = "（你上次的 recap 摘要）\n" + "\n".join(tail) + "\n\n"
-    else:
-        head = ""
-    status = herdr.doorbell(pane, hint + head + args.message, wait_s=args.settle,
+    status = herdr.doorbell(pane, hint + args.message, wait_s=args.settle,
                             kind=kind, wait_empty_s=args.wait_empty)
     log_event(proto.dir / "watch" / "doorbell.log", f"-> {args.role}: {args.message[:80]}")
     # 返回码不是送达判据，所以把状态和时刻一起打出来：用户要靠这个判断
@@ -2129,7 +2334,12 @@ def cmd_whoami(args: argparse.Namespace) -> int:
             print(f"  · {item}")
     else:
         print("  （无 —— idle 且不欠活是合法终态：做完了，在等下一项）")
-    others = {r: _uniq(v) for r, v in merged.items() if r != role and v}
+    dispatch = _dispatch_lines(proto, role)
+    if dispatch:
+        for line in dispatch:
+            print(line)
+    others = ({r: _uniq(v) for r, v in merged.items() if r != role and v}
+              if role == "pm" else {})
     if others:
         print("别人欠的：")
         for r in sorted(others):
@@ -2137,41 +2347,39 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
     # 多 team 时给 PM 一份**机器算的组摘要**：PM 一个人盯 N 组，不能把每组的切片
     # 目录都读一遍（那等于把 N 组细节全塞进它一个人的上下文）。摘要只答三件事：
-    # 这组手上有哪些片、各自卡在谁手上、最近发生了什么。单 team 时这一段不出现。
+    # 这组手上有哪些片、各自卡在谁手上、最近发生了什么。单 team / 非 PM 不出现。
     teams = read_teams(root, _read_label(root))
-    if len(teams) > 1:
+    if role == "pm" and len(teams) > 1:
         print("\n各组摘要（机器算的，随时最新）：")
         for t in teams:
             for line in team_digest_lines(team_digest(root, t["name"])):
                 print(f"  {line}")
         print("  细看某一组：xteam team digest <组名>")
 
-    opens = proto.open_tasks()
+    opens = ([t for t in proto.open_tasks()]
+             if role == "pm" else
+             [t for t in proto.open_tasks()
+              if role in proto.debts(t) or role in roles_touched_task(t)])
     print("\n未闭合切片：")
     if opens:
         for t in opens:
             # _stage 是私有方法但同包直用：它只做「工件存在性 → 阶段」的纯映射，
             # 重写一遍等于把阶段定义分叉成两份。
-            owes = "、".join(f"{r}:{o}" for r, o in proto.debts(t).items()) \
+            d = proto.debts(t)
+            if role != "pm":
+                d = {r: o for r, o in d.items() if r == role}
+            owes = "、".join(f"{r}:{o}" for r, o in d.items()) \
                 or "无（等新需求）"
             print(f"  · {t.name}  [{Protocol._stage(t)}]  {owes}")
     else:
         print("  （无）")
-    pending, total = proto.queue_counts()
-    if total:
-        rec = next((i for i in proto.queue_items()
-                    if i["recommended"] and i["state"] not in ("done", "已闭合")),
-                   None)
-        print(f"\n队列：{pending} 项未完成 / 共 {total} 项"
-              + (f"（推荐下一个：{rec['slice']}）" if rec else ""))
-
-    recap = latest_recap(root, role)
-    print(f"\n你的 recap（{recap_path(root, role)}）：")
-    if recap:
-        for line in recap.strip().splitlines()[-15:]:
-            print(f"  {line}")
-    else:
-        print("  （还没有 —— 切片闭合或 context 偏高时 xteam 会提醒你写）")
+    q_limit = 12 if role == "pm" else (3 if role == "tl" else 0)
+    if q_limit:
+        pending, total = proto.queue_counts()
+        label = "队列（按序执行，PM 维护）" if role == "pm" else "队列头部（PM 排的）"
+        print(f"\n{label}：{pending} 项未完成 / 共 {total} 项")
+        for line in _queue_lines(proto, limit=q_limit):
+            print(line)
 
     tl = proto.dir / "watch" / "timeline.log"
     if tl.exists():
@@ -2226,9 +2434,8 @@ def _wait_reset_ok(herdr: Herdr, pane: str, session_before: str,
 
 
 def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
-              no_recap: bool = False, recap_wait: int = 10,
               herdr: Herdr | None = None, verbose: bool = True) -> tuple[bool, str]:
-    """原地重开一个角色：先要 recap → 会话重置 → 身份与现状重新投回。
+    """原地重开一个角色：会话重置 → 身份与现状重新投回。
 
     与 swap 的分工（两者丢的都只是**对话**，协作状态在文件里，丢不掉）：
       · swap 换的是**进程**（kind / model 都能换，两阶段重建 pane）——任何 kind 都行；
@@ -2247,7 +2454,7 @@ def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
     reset = reset_command(spec.kind)
     if not reset:
         return False, (f"{spec.kind} 没有「原地开新会话」的命令 —— 用 `xteam swap {role}`：\n"
-                      f"  同 kind 重建 pane，效果一样（recap + 现状都会带上），只多花几秒。")
+                      f"  同 kind 重建 pane，效果一样（队列 + 现状都会带上），只多花几秒。")
     label, _ws_why = resolve_ws_label(root, workspace)
     if herdr is None:
         _require_herdr()
@@ -2264,7 +2471,7 @@ def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
     if blocked:
         return False, f"{role} {blocked}"
     # blocked 对 swap 是放行的（重建 pane，不需要旧 agent 回应），对 reopen 不行：
-    # 它整条路都靠门铃（先要 recap、再投 /new），而 **agent prompt 对 blocked 会被拒**。
+    # 它整条路都靠门铃投 /new，而 **agent prompt 对 blocked 会被拒**。
     if state == "blocked" and not force:
         return False, (f"{role} 停在权限/选项框上 —— 门铃投不进去，重开会卡在半路。\n"
                       f"  先清掉那个框（去 pane 里作答，或 `xteam watch once` 让巡检代答），\n"
@@ -2276,23 +2483,7 @@ def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
     if verbose:
         print(f"[{now()}] 重开 {role}（{spec.kind}，{state}）：{reset} → 新会话")
 
-    # 1) 先要 recap —— 会话还在，这是最后一个能问到它的窗口
-    if not no_recap:
-        if verbose:
-            print(f"[{now()}] 请 {role} 写 recap 交接 …", flush=True)
-        herdr.doorbell(
-            pane,
-            f"你要被原地重开（换一个干净的会话，同一个 pane、同一个进程）。"
-            f"请把当前进展、已确认的结论、下一步该做什么写进 "
-            f"{proto.dir}/memory/{role}-recap.md（15 行以内，只写这四节："
-            f"做完什么 / 验证结果 / 关键决定与理由 / 下一步遗留，不得加节），"
-            f"然后停下。",
-            wait_s=recap_wait)
-        if verbose:
-            print(f"[{now()}] recap："
-                  f"{'已拿到' if latest_recap(root, role) else '没有（以 .xteam/ 工件为准）'}")
-
-    # 2) 重置会话。**判据是「重置真的生效了」**，不是「命令投出去了」——
+    # 1) 重置会话。**判据是「重置真的生效了」**，不是「命令投出去了」——
     #    投送与生效是两件事（和门铃的送达判据同一条纪律）。
     before = herdr.agent_session(pane)
     receipts_before = _reset_receipt_count(herdr, pane)
@@ -2314,7 +2505,7 @@ def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
                       f"  pane 尾部：\n{tail}\n"
                       f"  兜底：`xteam swap {role}`（重建 pane，任何 kind 都行）")
 
-    # 3) 身份与现状重新投回。章程在不在话里，看**这个 pane 当初是怎么起的**：
+    # 2) 身份与现状重新投回。章程在不在话里，看**这个 pane 当初是怎么起的**：
     #    带过身份文件（系统提示词里有身份，/new 清不掉）就不重复抄一遍；
     #    升级前起的老 pane 没有 —— 那它的身份只能靠这段话带，必须带全文。
     have_identity = bool(_session_identity(session, role))
@@ -2336,7 +2527,7 @@ def do_reopen(root: Path, role: str, workspace: str = "", force: bool = False,
 
 
 def cmd_reopen(args: argparse.Namespace) -> int:
-    """原地重开一个角色：先要 recap → 会话重置 → 身份与现状重新投回。
+    """原地重开一个角色：会话重置 → 身份与现状重新投回。
 
     与 swap 的分工（两者丢的都只是**对话**，协作状态在文件里，丢不掉）：
       · swap 换的是**进程**（kind / model 都能换，两阶段重建 pane）——任何 kind 都行；
@@ -2344,7 +2535,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         所以只有支持「原地开新会话」的 kind 能做（见 RESET_COMMAND）。
 
     什么时候用：巡检在 context ≥ 75% 时提醒你；或人自己在 pane 里 /new 完，
-    想让 xteam 把现场接回来（那种情况加 --no-recap：已经没上下文可写了）。
+    想让 xteam 把现场接回来。
     """
     root = Path(args.project).resolve()
     role = args.role
@@ -2353,8 +2544,6 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         role=role,
         workspace=args.workspace,
         force=args.force,
-        no_recap=args.no_recap,
-        recap_wait=args.recap_wait,
         verbose=True,
     )
     if not ok:
@@ -2699,7 +2888,7 @@ def _board_state(root: Path, proto: Protocol, herdr: Herdr, label: str,
     ev = proto.dir / "watch" / "events.log"
     if ev.exists():
         keys = ("ALERT", "NUDGE-SKIPPED", "ESCALATE", "NEEDS-HUMAN", "STUCK",
-                "BLOCKED-ANSWER", "QA ", "RECAP-ASK")
+                "BLOCKED-ANSWER", "QA ")
         try:
             lines = ev.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
@@ -3000,6 +3189,18 @@ def cmd_intake(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _bring_up_team(root: Path, proto: Protocol, name: str, label: str) -> dict:
+    """把一个**已声明**的子 team 的 tl/dev 拉起来（workspace 在就复用、在跑的 pane 不动）。
+
+    `team add`（首次）与 `team start`（关掉之后重启）走同一条路——分叉的后果是
+    「新建的组」与「重启的组」行为迟早不一致，而那种不一致只在出事时才显形。
+
+    只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）。
+    """
+    return bring_up_roles(root, proto, label, load_roles(root),
+                          only=["tl", "dev"], team=name, split=True)
+
+
 def cmd_team(args: argparse.Namespace) -> int:
     """多 team：一个 PM 底下挂 N 套 tl/dev。单 team 时这条命令只是查看。"""
     root = Path(args.project).resolve()
@@ -3017,6 +3218,7 @@ def cmd_team(args: argparse.Namespace) -> int:
     if args.team_action == "list":
         print(f"[{now()}] {len(teams)} 个 team（项目 {main_label!r}）")
         herdr = Herdr(scope=main_label)
+        down: list[str] = []
         for t in teams:
             name, label = t["name"], t.get("label") or main_label
             roles = []
@@ -3027,16 +3229,20 @@ def cmd_team(args: argparse.Namespace) -> int:
                     a = rm.get(r)
                     if a:
                         roles.append(f"{r}={a.get('agent_status', '?')}")
-            open_slices = [x.name for x in proto.open_tasks()
-                           if team_of(x) == name]
+            if not ws:
+                down.append(name)
             note = " · ".join(roles) if roles else "（tl/dev 没在跑）"
             d = team_digest(root, name)
-        print(f"  {name:<10} {note}"
+            print(f"  {name:<10} {note}"
                   + f" · 在飞 {d['counts']['open']} 片"
                   + (f"（实现中 {d['counts']['inflight']} · 待 gate {d['counts']['gate']}）"
                      if d["counts"]["open"] else ""))
         if len(teams) == 1:
             print("  （单 team —— `xteam team add <名字>` 起第二套 tl/dev）")
+        elif down:
+            # 只在**真有组没在跑**时才提这条。无条件印的话，两组都活着的人会被
+            # 支去敲一条没有必要的 team start（文档里的人是被文案领着走路的）。
+            print(f"  （{('、'.join(down))} 没在跑：`xteam team start <名字>` 拉回来）")
         return 0
 
     if args.team_action == "digest":
@@ -3047,31 +3253,42 @@ def cmd_team(args: argparse.Namespace) -> int:
             print(line)
         return 0
 
-    if args.team_action == "add":
+    if args.team_action in ("add", "start"):
         name = (args.name or "").strip()
         if not name:
-            die("team 名不能空：xteam team add <名字>")
+            die("要给组名：xteam team add <名字> / xteam team start <名字>")
         if name == DEFAULT_TEAM:
-            die(f"{DEFAULT_TEAM!r} 是默认组，不用 add")
-        if any(t["name"] == name for t in teams):
-            die(f"team {name!r} 已存在")
+            die(f"{DEFAULT_TEAM!r} 是默认组：起它用 `xteam up .`，不走 team add/start")
         if not name.replace("-", "").replace("_", "").isalnum():
             die(f"team 名只能用字母数字和 -_：收到 {name!r}")
-        label = f"{main_label}-{name}"
-        herdr = Herdr(scope=label)
-        if not herdr.find_workspace(label):
-            # 只拉 tl/dev：PM 仍然只有一个（它是唯一裁决者，也是人的替身）
-            out = bring_up_roles(root, proto, label, load_roles(root),
-                                 only=["tl", "dev"], team=name, split=True)
-            print(f"  team {name!r} 的 tl/dev 已起：{out['started']}")
+        declared = [t for t in teams if t["name"] == name]
+        if args.team_action == "start" and not declared:
+            die(f"没有 team {name!r}。现有：{'、'.join(t['name'] for t in teams)}"
+                f"（要新建：xteam team add {name}）")
+        label = ((declared[0].get("label") if declared else "")
+                 or f"{main_label}-{name}")
+        # **已声明的组不再当错误。** 「关掉之后想重启」的人敲的往往就是 add：
+        # 原来它硬失败在「已存在」，于是这个组再也起不回来（teams.json 里还在，
+        # workspace 却没了 —— 实测就是用户报的那个「关闭 sub team 后无法重启」）。
+        # 现在两条路都落到同一条幂等的 bring-up：还在跑的 pane 不动，缺的补起。
+        if declared:
+            print(f"  team {name!r} 已声明（{label}）—— 把它拉起来")
+        out = _bring_up_team(root, proto, name, label)
+        if not declared:
+            # split 记下来：board 组带要靠它标出「这组是分屏的」，人一眼能看到布局。
+            teams.append({"name": name, "label": label, "split": True})
+            write_teams(root, teams)
+            print(f"  已记入 {teams_path(root).relative_to(root)}"
+                  f"（切片写 team: {name} 就归这组干）")
         else:
-            print(f"  workspace {label!r} 已存在，直接收编")
-        # split 记下来：board 组带要靠它标出「这组是分屏的」，人一眼能看到布局。
-        teams.append({"name": name, "label": label, "split": True})
-        write_teams(root, teams)
-        print(f"  已记入 {teams_path(root).relative_to(root)}"
-              f"（切片写 team: {name} 就归这组干）")
-        print(f"  派活：xteam say --team {name} dev \"…\"")
+            declared[0]["label"] = label
+            declared[0]["split"] = True
+            write_teams(root, teams)
+        print(f"  tl/dev：{out['started']}")
+        # 「切片写 team 才归这组干」这句是踩过的坑（#52）：漏写的切片会算成 main，
+        # 于是这组的 dev 空转，活最后砸在 tl 自己身上。两条都点出来。
+        print(f"  派活：xteam say --team {name} dev \"…\""
+              f"（切片必须先写 task.json 的 team: {name}）")
         return 0
 
     if args.team_action == "rm":
@@ -3093,6 +3310,35 @@ def cmd_team(args: argparse.Namespace) -> int:
             print(f"  已关 workspace {label!r}")
         write_teams(root, [t for t in teams if t["name"] != name])
         print(f"  已从 {teams_path(root).relative_to(root)} 移除")
+        return 0
+
+    if args.team_action == "stop":
+        name = (args.name or "").strip()
+        if name == DEFAULT_TEAM:
+            die(f"{DEFAULT_TEAM!r} 组停不得（那是整个项目：用 xteam down）")
+        hit = [t for t in teams if t["name"] == name]
+        if not hit:
+            die(f"没有 team {name!r}")
+        label = hit[0].get("label") or f"{main_label}-{name}"
+        herdr = Herdr(scope=label)
+        ws = herdr.find_workspace(label)
+        if not ws:
+            print(f"[{now()}] {label!r} 没在跑（声明还在，`team start {name}` 拉回来）")
+            return 0
+        ws_id = ws["workspace_id"]
+        closed = []
+        for role, agent in herdr.role_map(ws_id).items():
+            tab = agent.get("tab_id")
+            if tab and _alive_pane_exists(herdr, ws_id, tab):
+                try:
+                    herdr.close_tab(tab)
+                    closed.append(role)
+                except Exception as exc:            # noqa: BLE001
+                    print(f"[{now()}] ⚠ 关 {role} 的 tab 失败：{exc}", file=sys.stderr)
+        print(f"[{now()}] 已停 {label!r}：关了 {len(closed)} 个角色 pane"
+              f"（{'、'.join(sorted(closed)) or '无'}）")
+        print(f"  workspace {label!r} ({ws_id}) **保留着**，声明也保留 ——"
+              f" 重启：xteam team start {name}")
         return 0
 
     die(f"未知 team 动作：{args.team_action}")
@@ -4106,109 +4352,25 @@ def _watch_cycle(root: Path, herdr: Herdr, tracker: IdleTracker, logf: Path) -> 
         proto.write_index()          # 单文件快照，别让人挨个翻 task 目录
     except OSError:
         pass
-    _maybe_request_recap(root, herdr, role_map, tracker, logf)
     _maybe_rotate_sessions(root, herdr, role_map, tracker, logf)
     _maybe_advise_reopen(root, herdr, role_map, tracker, logf)
     log_event(logf, "SAMPLE " + "  ".join(samples))
 
 
-# 一个切片做完后 context 就该瘦身：让 agent 自己写 recap 存档，再由新任务带上它。
-# 不用 `/compact`——实测 opencode 的斜杠命令里没有它（只有 /review /update），
-# devin 也没有对应 flag。agent 自己写摘要反而更可靠：文件可被 PM 检索、跨会话存活、
-# 出问题能回看它当时是怎么想的。
-RECAP_HIGH_PCT = 60          # 超过这个占用就催 recap
-SLICE_JUST_CLOSED = "closed"
-
-
-def _maybe_request_recap(root: Path, herdr, role_map: dict, tracker, logf: Path) -> None:
-    """切片刚闭合、或 context 偏高时，向**真正参与了那个切片**的角色要一份 recap。
-
-    三处改动，都是冲着「省 token + 别再坏」去的：
-
-    1. **路径修正**：原来提示里写 `.pm/memory/...`，而代码读 `.xteam/memory/...`
-       —— `.pm` 是改名前的残留，于是每份 recap 都写进了黑洞，
-       `latest_recap()` 永远读不到，handover 里注入的「别人的 recap」一直是空的。
-    2. **不再动 `alerted`**：原来用 `set_alerted(role, "recap")` 记账，污染了
-       0/1/2 的告警阶梯，最严重的一处是 `alerted < 1` 抛 TypeError 而那行在
-       working 分支里 —— agent 转 working 后巡检直接崩。改用独立的
-       `recap_asked` 字段。
-    3. **按需 + 限长**：原先任何切片闭合都让三个角色各写一份结构化长文档。
-       现在只问在这个切片里**留下过工件**的角色，并明确要求 15 行内、覆盖写。
-    """
-    proto = Protocol(root)
-    mem = proto.dir / "memory"
-    for role, agent in role_map.items():
-        if role not in ("pm", "tl", "dev"):
-            continue
-        pane = agent["pane_id"]
-        if agent.get("agent_status") == "working":
-            continue                       # 别打断正在干活的
-        try:
-            text = herdr.read_pane(pane, 10)
-        except Exception:                  # noqa: BLE001
-            continue
-        pct = parse_context_pct(text)
-
-        # **冷却在最前面，涵盖所有触发原因。**
-        # 之前冷却只挂在 context 分支上，而记账有两种写法：切片分支写切片名、
-        # context 分支写空串。于是 context 触发过一次后，记账是 ""，
-        # 下一轮切片分支的判据「recap_asked_for == 切片名」永远不成立 → 又命中，
-        # 而此时 need 已是 True、挂在其后的冷却根本没被检查 —— **每 60 秒问一遍，
-        # 跑一夜就是几百次**（用户实测 696 次）。两个分支各修各的堵不住，
-        # 因为记账格式和判据格式本来就对不上；统一在入口拦才对。
-        if tracker.recap_asked_ago(role) < RECAP_CONTEXT_COOLDOWN:
-            continue
-
-        # 刚闭合的切片：只问真正参与过的角色，且每个切片只问一次
-        need, why = False, ""
-        for t in proto.all_tasks():
-            if not (t / "closed.md").exists():
-                continue
-            if role not in roles_touched_task(t):
-                continue                    # 没参与就别凭空编一段
-            if t.name in tracker.recap_asked_all(role):
-                continue                    # 这个切片已经问过了
-            need, why = True, f"切片 {t.name} 闭合"
-            break
-        if not need and pct is not None and pct >= RECAP_HIGH_PCT:
-            need, why = True, f"context {pct}% 偏高"
-
-        if not need:
-            continue
-        mem.mkdir(parents=True, exist_ok=True)
-        target = mem / f"{role}-recap.md"
-        msg = (
-            f"【收尾】请写一份 recap 到 {target}（**覆盖写，不要追加**）。\n"
-            f"原因：{why}。这份文件跨会话保留，之后给你派活或换人时会带上它。\n"
-            f"只要 15 行以内，**只写这四节，不得加节**：\n"
-            f"  ## 做完什么\n  ## 验证结果（实测命令 + 数字）\n"
-            f"  ## 关键决定与理由\n  ## 下一步 / 遗留\n"
-            f"不要写「这份 recap 存在的原因」、不要写工具观察笔记、不要复述队列——"
-            f"那些在 .xteam/ 里本来就有，重写一遍只是烧 token。\n"
-            f"写完就停下，别展开叙述 —— 它是给下一个接手的人扫一眼用的，不是作文。"
-        )
-        if pct:
-            msg += f"（当前 context {pct}%）"
-        result = herdr.doorbell(pane, msg, wait_s=5)
-        log_event(logf, f"RECAP-ASK {role} reason={why} -> {result}")
-        tracker.set_recap_asked(role, why.split()[1] if why.startswith("切片") else "")
-
-
 def _maybe_rotate_sessions(root: Path, herdr, role_map: dict, tracker,
                            logf: Path) -> None:
-    """切片闭合且 recap 落地后，对支持原地重置的角色执行切片级会话轮换。
+    """切片闭合后，对支持原地重置的角色执行切片级会话轮换。
 
     吸取 Kander 经验：
     - 斩断长上下文雪球：切片做完（closed.md 产生）后，旧切片庞大的编译错误、
       测试日志、过程调试对话在当前会话里已无保留价值，不仅严重消耗 token，
       还可能干扰下一片。
-    - 状态已外部化：代码已 commit/snap、进度在 QUEUE.md、交接在 <role>-recap.md、
+    - 状态已外部化：代码已 commit/snap、进度在 QUEUE.md、工件在 tasks/<slug>/、
       章程在 identity/<role>.md，原地重开后新会话直接读取外部工件，恢复纯净。
     - 安全门禁：
       1. 角色当前必须是 idle（绝不打断 working 或 blocked）；
       2. 角色 agent kind 必须支持 reset_command（如 omp/pi 的 /new）；
-      3. recap 已落地（或已请求且已过去缓冲时间）；
-      4. 每个切片只轮换一次（rotated_all 记账防抖）。
+      3. 每个切片只轮换一次（rotated_all 记账防抖）。
     """
     proto = Protocol(root)
     specs = load_roles(root)
@@ -4234,16 +4396,9 @@ def _maybe_rotate_sessions(root: Path, herdr, role_map: dict, tracker,
                 continue
             if t.name in tracker.rotated_all(role):
                 continue
-            # 必须等待 recap 已经请求过或 recap 文件已存在
-            mem_file = proto.dir / "memory" / f"{role}-recap.md"
-            if not mem_file.exists() and t.name not in tracker.recap_asked_all(role):
-                continue
-            # 若刚好这一轮刚催 recap 且文件还没写入，留出时间
-            if not mem_file.exists() and tracker.recap_asked_ago(role) < 15:
-                continue
 
             ok, msg = do_reopen(root, role, workspace="", force=False,
-                                no_recap=True, herdr=herdr, verbose=False)
+                                herdr=herdr, verbose=False)
             if ok:
                 tracker.set_rotated(role, t.name)
                 log_event(logf, f"AUTO-ROTATE {role} task={t.name} -> {msg}")
@@ -4257,9 +4412,6 @@ def _maybe_rotate_sessions(root: Path, herdr, role_map: dict, tracker,
             break
 
 
-
-# 注入别人 recap 时的最大字符数。够看清「做到哪、下一步是什么」就行。
-RECAP_INJECT_CHARS = 600
 
 RECOMMEND_WORDS = ("推荐", "建议", "默认", "prefer", "recommend", "default")
 
@@ -5205,8 +5357,10 @@ def main() -> int:
     p.set_defaults(func=cmd_intake)
 
     p = sub.add_parser("team", help="多 team：一个 PM 挂 N 套 tl/dev（单 team 时只是查看）")
-    p.add_argument("team_action", choices=["list", "add", "rm", "digest"])
-    p.add_argument("name", nargs="?", default="", help="add/rm 的 team 名")
+    p.add_argument("team_action",
+                   choices=["list", "add", "start", "stop", "rm", "digest"])
+    p.add_argument("name", nargs="?", default="",
+                   help="add/start/stop/rm 的 team 名")
     p.set_defaults(func=cmd_team)
 
     p = sub.add_parser("wiki", help="翻 wiki 沉淀（默认看最近的几条 → show 读全文）")
@@ -5269,10 +5423,6 @@ def main() -> int:
     p.add_argument("--model", help="同时指定模型（启动时精确指定，不盲选）")
     p.add_argument("--force", action="store_true",
                    help="即使它还在 working 也强换（会丢上下文）")
-    p.add_argument("--no-recap", action="store_true",
-                   help="不向旧 agent 索要 recap 交接（省时间，但新 agent 会更瞎）")
-    p.add_argument("--recap-wait", type=int, default=60,
-                   help="等旧 agent 写 recap 的秒数（默认 60）")
     p.add_argument("--allow-openrouter", action="store_true",
                    help="显式授权使用 openrouter 模型（默认只提示不拦）")
     p.set_defaults(func=cmd_swap)
@@ -5287,10 +5437,6 @@ def main() -> int:
                        help="原地重开一个角色的会话（身份与现状自动带回）")
     p.add_argument("role", choices=[r for r in BOOT_ORDER if r != "reviewer"],
                    help="要重开的角色")
-    p.add_argument("--no-recap", action="store_true",
-                   help="不索要 recap（上下文已经丢了的时候用）")
-    p.add_argument("--recap-wait", type=int, default=60,
-                   help="等它写 recap 的秒数（默认 60）")
     p.add_argument("--force", action="store_true",
                    help="即使它还在 working 也重开（会丢掉它正在做的上下文）")
     p.set_defaults(func=cmd_reopen)
@@ -5359,11 +5505,11 @@ def main() -> int:
 
     check_assets()
     args = ap.parse_args()
-    # workspace 名只有一个来源：全局 --workspace，或项目目录名。子命令不再重复定义
+    # workspace 名只有一个来源：全局 --workspace，或（子 team 的 pane 里）
+    # 注入的 XTEAM_TEAM，或项目目录名。三者的优先级全在 default_workspace 里，
+    # 这里不再判「有没有给」—— 判两次就会有两份会漂的规则。子命令也不重复定义
     # 它，否则 `xteam --workspace foo up .` 会被子解析器的默认值静默覆盖成目录名。
-    if not args.workspace:
-        base = args.project if args.cmd == "up" and args.project else "."
-        args.workspace = Path(base).resolve().name
+    args.workspace = default_workspace(args)
     if args.version:
         print(f"xteam {_version()}")
         try:
@@ -5451,7 +5597,7 @@ EPILOG = """\
   status                  谁在干什么、谁欠着活、每个状态从几点开始
   say/stamp <角色> "<消息>"  门铃 / 记时间线
   whoami                  我这个角色是谁、欠什么、上次做到哪（上下文被清空后先跑它）
-  reopen <角色>           原地重开：recap -> 新会话 -> 身份与现状投回（context 快满时）
+  reopen <角色>           原地重开：新会话 -> 身份与现状投回（context 快满时）
   projects                治理了哪些项目、依赖关系、各自未闭合的活
   swap <角色> <agent>      中途换 agent（不用重启整套）
   qa run                  第三方冷读评审（不是裁判，verdict 仍只有 pm 写）

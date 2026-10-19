@@ -27,9 +27,9 @@ xteam swap tl devin --model swe-2-max
 方向键盲选模型的风险：那个列表没有稳定编号，实测盲按 5 下会落到
 `Free Models Router OpenRouter`（真金白银）。所以换 agent 比换 model 干净。
 
-**代价：旧 agent 的对话上下文随 pane 一起消失。** 所以 swap 会先让旧 agent
-写一份 recap，再把「它自己的 recap + 别人的 recap 尾巴 + 协议现状（谁欠什么
-义务）+ 未闭合切片」注入新 agent。不想要交接加 `--no-recap`，但新 agent 会更瞎。
+**代价：旧 agent 的对话上下文随 pane 一起消失。** 交接不再向旧 agent 索要 recap；
+新 agent 拿到的是从 `QUEUE.md`、任务工件和 `overall_debts()` 现算的现状
+（按序队列 + 谁欠什么 + 未闭合切片）。
 
 **安全阀**：旧 agent 还在 `working` 时直接拒绝——此刻关 pane 等于把没做完的活
 连同上下文一起扔掉。确实要强换才加 `--force`。
@@ -95,7 +95,6 @@ xteam up . --watch    # 用新模型重起
 - 欠活 → 门铃催办（两轮后升级到人类）
 - **假 working**（声称在干活但 seq 不动）→ 告警
 - **blocked 停在选项上** → 按推荐项自动代答
-- 切片收尾 / context > 60% → 要求写 recap
 
 **不会发的**：周期性催办。没义务就安静——`owes: none` + `idle` 是合法终态，
 反复催只会变成噪音，还会降低信号的效力。

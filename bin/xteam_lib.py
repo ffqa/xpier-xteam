@@ -40,13 +40,8 @@ from pathlib import Path
 
 # 工作目录名。**整个项目只此一处定义。**
 # 之前 `root / ".xteam"` 散落 10 处（lib 9 + CLI 19），`.pm` → `.xteam` 改名时
-# 漏掉了 _maybe_request_recap 里手拼的 f-string —— recap 全写进黑洞，
-# latest_recap() 永远读不到，agent 们为绕过去改成「双写」，token 成本翻倍。
-# 字面量散落各处 = 下次改名必然再漏一处，所以收敛成常量。
+# 漏掉了一处手拼的 f-string。字面量散落各处 = 下次改名必然再漏一处，所以收敛成常量。
 XTEAM_DIRNAME = ".xteam"
-
-# context 偏高触发的 recap 冷却（秒）—— 没有它，巡检每 60 秒问一遍。
-RECAP_CONTEXT_COOLDOWN = 1800
 
 # say 送达复核窗口（秒）：第 1 轮非 working 且尾巴无排队占位符时，隔这么久
 # 再查第 2 轮。mid-turn 的目标把门铃文本排进 TUI 队列、回合结束才提交，
@@ -1502,14 +1497,18 @@ IDENTITY_TEMPLATE = """\
 身份不会丢 —— 它就在这条系统提示词里；重置清掉的是对话，不是它。
 但**现状必须重新读**：你是进行中的项目里的 {role}，不是今天才接手。
 新会话的第一条消息处理之前：
-  1. 跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、你上次的 recap、时间线尾部
-  2. 还不够就读 `.xteam/PROTOCOL.md`（协议全文）与 `.xteam/memory/*-recap.md`
+  1. 跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、按序队列、时间线尾部
+  2. 还不够就读 `.xteam/PROTOCOL.md`（协议全文）与 `.xteam/tasks/<切片>/` 工件
   3. **不要问「现在该做什么」** —— 答案在 whoami 的输出里
-你会真的丢掉的只有对话细节。要紧的结论一律先落文件（工件 / recap / stamp），
+你会真的丢掉的只有对话细节。要紧的结论一律先落文件（工件 / stamp / git），
 别只留在对话里 —— 对话是易失的，.xteam/ 不是。
 
-## 角色章程（全文，长期有效）
-{charter}
+## 角色核心规则（常驻，长期有效）
+{core}
+
+## 完整章程
+需要细节时读 `{charter_path}`（只读相关章节）。不要凭印象补规则；
+本卡与全文冲突时，以全文为准。
 """
 
 
@@ -1518,17 +1517,21 @@ def write_identity(root: Path, role: str, roles_dir: Path, label: str = "") -> P
 
     up / swap / reopen 都往这里写一份，再把路径挂进 agent 的启动参数
     （SYSTEM_PROMPT_ARG），让身份常驻系统提示词。与 roles/<role>.md 的关系：
-    章程全文一字不动地附在后面，前面那段引导**只有这份文件才有** ——
-    告诉一个刚被清空上下文的 agent「你是谁、先跑 whoami、别问该做什么」。
+    `roles/<role>.core.md` 是**常驻核心卡**（短，覆盖日常规则）；完整章程只留
+    路径，agent 需要细节时自己读。这样 system prompt 不再每 turn 背着几千字
+    的全文证据。核心卡缺失时回退到全文，保证老安装包仍能启动。
 
     roles_dir 由调用方给（和 stale_rules 一样）：资源目录的解析只有一个来源
     （bin/xteam 的 `_find_root()`），这里不自己再推一遍。
     """
     charter_path = roles_dir / f"{role}.md"
-    charter = charter_path.read_text(encoding="utf-8") if charter_path.exists() else ""
+    full = charter_path.read_text(encoding="utf-8") if charter_path.exists() else ""
+    core_path = roles_dir / f"{role}.core.md"
+    core = core_path.read_text(encoding="utf-8") if core_path.exists() else full
     cn = ROLES.get(role, ("", ""))[1]           # 未知角色给空中文名，不炸
     text = IDENTITY_TEMPLATE.format(label=label or root.name, role=role,
-                                    cn=cn, root=root, charter=charter)
+                                    cn=cn, root=root, core=core,
+                                    charter_path=charter_path)
     path = identity_path(root, role)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -1787,15 +1790,22 @@ class Herdr:
             args += ["--env", f"{key}={value}"]
         return self._run(*args)
 
-    def split_pane(self, pane_id: str, direction: str = "right") -> str:
+    def split_pane(self, pane_id: str, direction: str = "right",
+                   env: dict[str, str] | None = None) -> str:
         """把一个 pane 拆成两半，返回**新** pane 的 id。
 
         herdr 的用法：`pane split --pane <ID> --direction right|down`，
         返回体把新 pane 嵌在 `result.pane` 里。**不传 --pane 只传方向是聚焦邻居**，
         完全是另一件事（v0.2.26 刚在这里栽过）。
+
+        env 必须在新 pane 上再传一次：`tab create --env` 只作用于 tab 的**第一个**
+        pane，拆出来的 pane 拿不到（实测：tab 级 TABONLY=1 在分割 pane 里不存在）。
+        少了这一步，一个组的 dev 会继承不到本该属于它的身份变量。
         """
-        res = self._run("pane", "split", "--pane", pane_id,
-                        "--direction", direction)
+        args = ["pane", "split", "--pane", pane_id, "--direction", direction]
+        for key, value in (env or {}).items():
+            args += ["--env", f"{key}={value}"]
+        res = self._run(*args)
         pane = (res.get("pane") or res)
         new_id = str(pane.get("pane_id") or "")
         if not new_id:
@@ -2460,7 +2470,7 @@ class Protocol:
         if not queue.exists():
             queue.write_text(
                 "# 队列\n\n"
-                "> 唯一待办真相。TL 追加，PM 改状态，dev 只读。\n"
+                "> 唯一待办真相，也是按序看板。PM 维护顺序与状态，TL 只提议切片，dev 只读。\n"
                 "> 状态：`todo` → `spec` → `doing` → `review` → `gate` → `done`\n\n"
                 "| 序 | 切片 | 状态 | 备注 |\n|---|---|---|---|\n",
                 encoding="utf-8")
@@ -2635,7 +2645,7 @@ class Protocol:
         # 判据是「**没有待办**」（pending == 0），不是「队列里一行都没有」
         # （total == 0）。原来写的是 `queue_counts() == (0, 0)`，于是只在
         # 「队列从没被用过」时才成立 —— 而 Protocol.ensure() 一上来就建出
-        # QUEUE.md，TL 追加切片后 total 永远 > 0。结果：**真实项目里这条义务
+        # QUEUE.md，队列里有项后 total 永远 > 0。结果：**真实项目里这条义务
         # 一次都不会触发**，结项报告永远没人催。PR 的测试没抓到，是因为它用的
         # Bench 根本不写 QUEUE.md（total 恰好为 0），正好落在唯一能过的那个分支上。
         # 「空项目不该催报告」由下面 `any(_is_closed(...))` 负责，与 total 无关。
@@ -3255,15 +3265,14 @@ OBLIGATIONS: dict[str, str] = {
     "consume": "verdict 已出但你还没取 —— 读 verdict.json，FAIL 就修，"
                "PASS 就问 TL 要下一项。",
     "start-next": "**队列里还有没做的项，而你现在不欠任何活 —— 这不是「做完了」，"
-                  "是停住了。** 立刻打开 QUEUE.md 取下一项（或按 depends_on 挑一个"
-                  "前置已就绪的），写 spec、派给 TL。不要问人类要不要开始 ——"
-                  "「明显该做下一件」正是 PM 该自己判断的事，为它停下来等于把链条"
-                  "的推进责任推给了人。**只有队列真的空了才问人类**，而且要一次问清"
-                  "接下来几件，别一件一件地问。",
-    "next-slice": "本切片已闭合 —— 别停。**先自己看 QUEUE.md / backlog 里有没有"
-                  "下一项**，有就直接开工（写 spec → 派 TL）；遇选择题默认选推荐项"
-                  "继续。只有那里也空了，才**一次性**问人类要接下来几件 ——"
-                  "别问「可以开始下一件吗」，也别一件一件地问。",
+                  "是停住了。** 先看有没有 `request.md` 已就绪、`delivered.json` 还没"
+                  "出现的片：有就**先门铃 dev 派出去**，让实现和讨论并行；没有才打开 "
+                  "QUEUE.md 取下一项（或按 depends_on 挑前置已就绪的），写 spec、派给 "
+                  "TL。不要问人类要不要开始 ——「明显该做下一件」正是 PM 该自己判断的事。",
+    "next-slice": "本切片已闭合 —— 别停。**先看有没有已拆解、未交付的片**：有就先派/"
+                  "盯 dev，不要让 dev 等讨论；没有再看 QUEUE.md / backlog 的下一项"
+                  "（写 spec → 派 TL）；遇选择题默认选推荐项。只有那里也空了，才"
+                  "**一次性**问人类要接下来几件 —— 别问「可以开始下一件吗」。",
     "report": "全部切片已闭合但 `.xteam/REPORT.md` 还没有 —— 写结项报告，写完才算"
               "真正交付。按 `templates/REPORT-TEMPLATE.md` 的节写（目标 / 进度与完成情况 / "
               "部署启动测试 / 默认账号信息 / 边界与疑问点），每节都要有可验证的内容，"
@@ -3352,12 +3361,11 @@ def agent_catalog(installed: set[str] | None = None,
 #                实测 2026-10-07 omp 18.4.9。小数会出现：新会话显示 "-0.7%"）
 #   pi:        "… $0.025 (sub) 2.6%/500k (auto)"      （占用 / 窗口上限）
 # herdr 的 agent list **不暴露 token 字段**，只能从 pane 可见文本解析；
-# 而 pane read 对 working 中的 agent 会拒绝——所以只在 idle 时采样，正好符合
-# 「一个切片做完了才想 recap」的使用场景。
+# 而 pane read 对 working 中的 agent 会拒绝——所以只在 idle 时采样。
 #
 # omp / pi 这两条是补的：前两条（opencode/devin）都要求**带括号**，而它们不带，
-# 于是 `_maybe_request_recap` 的 context 分支在默认 agent 上从来不触发 ——
-# 一个只在别的 kind 上工作的阈值等于没有。
+# 于是 context 高位提醒在默认 agent 上从来不触发 —— 一个只在别的 kind 上工作的
+# 阈值等于没有。
 CONTEXT_PCT_PATTERNS = (
     re.compile(r"([0-9.]+[KMG]?)\s*\(\s*([0-9]+)%\s*\)"),
     re.compile(r"([0-9.]+[kKmM]?)\s*/\s*([0-9.]+[kKmM]?)\s*tokens\s*\(\s*([0-9]+)%\s*\)"),
@@ -3378,47 +3386,6 @@ def parse_context_pct(pane_text: str) -> int | None:
             except ValueError:
                 continue
     return None
-
-
-def recap_path(root: Path, role: str) -> Path:
-    return root / XTEAM_DIRNAME / "memory" / f"{role}-recap.md"
-
-
-def snapshot_path(root: Path, role: str) -> Path:
-    return root / XTEAM_DIRNAME / "memory" / f"{role}-snapshot.md"
-
-
-# recap 的**读取**上限。实测有人写过 20 万字的 recap，交接 prompt 也跟着变成
-# 20 万字 —— up/swap 时白烧 token，甚至直接撑爆上下文。别人的 recap 注入时有
-# 限长，自己的却没有，这是漏的一环。
-#
-# 为什么只在**读取**端截：recap 是 agent 用自己的工具写的，xteam 拦不到写入；
-# 请求文案里已经要求 15 行以内，但那是请求不是保证。读取端截断是唯一可靠的位置。
-# 保留尾部：recap 的结论在最后（前面是过程），交接时新 agent 看的也是尾部。
-RECAP_STORE_CHARS = 8000
-
-
-def latest_recap(root: Path, role: str) -> str:
-    """读该角色最近一次 recap 或自驱快照的正文；没有就返回空串。
-
-    **读取时也限长** —— 文件可能是本次截断规则之前写的，也可能被手工改过，
-    不能假设磁盘上的东西一定是短的。若存在自驱 snapshot.md 且更新，优先采纳。
-    """
-    p_recap = recap_path(root, role)
-    p_snap = snapshot_path(root, role)
-    target = None
-    if p_snap.exists() and p_recap.exists():
-        target = p_snap if p_snap.stat().st_mtime >= p_recap.stat().st_mtime else p_recap
-    elif p_snap.exists():
-        target = p_snap
-    elif p_recap.exists():
-        target = p_recap
-    else:
-        return ""
-    try:
-        return target.read_text(encoding="utf-8")[-RECAP_STORE_CHARS:]
-    except OSError:
-        return ""
 
 
 # ---------------------------------------------------------------- 模型查询
@@ -4369,47 +4336,6 @@ class IdleTracker:
         write_json(tmp, self.state, indent=1)
         tmp.replace(self.path)
 
-    def recap_asked_for(self, role: str) -> str:
-        """已经向这个角色要过哪一轮的 recap（切片名）。空串=还没要过。
-
-        **必须独立于 `alerted`。** `alerted` 是 0/1/2 的告警阶梯，往里塞字符串
-        会污染它：`alerted == 0` 不成立 → 再也不门铃催活；
-        `isinstance(level, int)` 不成立 → 升级分支被跳过；
-        `alerted < 1` 直接抛 `TypeError: '<' not supported between 'str' and 'int'`，
-        而那行在 `status == "working"` 分支里 —— agent 从 idle 转 working 之后，
-        下一轮巡检就崩，整个看门狗死掉。实测确认，不是理论风险。
-        """
-        return str(self.state.get(role, {}).get("recap_asked", ""))
-
-    def recap_asked_all(self, role: str) -> set[str]:
-        """已经向这个角色要过 recap 的**所有**切片名。
-
-        `recap_asked` 单槽位只能记一个切片：问完 s1 再问 s2，s1 就被冲掉，
-        下一轮判据以为 s1 没问过 → s1→s2→s1→s2 震荡，第三个切片永远轮不到。
-        判据必须读集合；单槽位只留作「最近一次问的对象」兼容读法（既有
-        用例与 context 空串语义都靠它），不再参与判据。
-        """
-        v = self.state.get(role, {}).get("recap_asked_all") or []
-        return {str(x) for x in v}
-
-    def set_recap_asked(self, role: str, task: str) -> None:
-        rec = self.state.setdefault(role, {})
-        rec["recap_asked"] = task            # 单槽位仍写「最近一次」（兼容读法）
-        if task:                           # context 触发的空串不进集合
-            asked = rec.setdefault("recap_asked_all", [])
-            if task not in asked:
-                asked.append(task)
-        rec["recap_asked_at"] = int(time.time())
-        self.flush()
-
-    def recap_asked_ago(self, role: str) -> int:
-        """距上次要 recap 过了多少秒。没有记录返回很大值（= 可以问）。"""
-        v = self.state.get(role, {}).get("recap_asked_at")
-        try:
-            return int(time.time()) - int(v) if v else 10 ** 9
-        except (TypeError, ValueError):
-            return 10 ** 9
-
     def rotated_for(self, role: str) -> str:
         """最近一次为哪个切片执行了会话轮换。空串=还没轮换过。"""
         return str(self.state.get(role, {}).get("rotated_for", ""))
@@ -4442,10 +4368,7 @@ class IdleTracker:
 def roles_touched_task(task: Path) -> set[str]:
     """这个切片里，哪些角色真的产出过东西。
 
-    用来决定「该不该要这个角色的 recap」。原先一律要 —— 任何切片闭合都让三个
-    角色各写一份结构化长文档：既费 token，又让没参与的人凭空编一段。
-
-    判据是工件本身（谁写的它就是谁干的），不靠猜：
+    用来决定会话轮换该等谁停手。判据是工件本身（谁写的它就是谁干的），不靠猜：
       · verdict.json / spec.md   → pm
       · request.md / ready.json → tl
       · delivered.json          → dev

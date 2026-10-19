@@ -137,6 +137,42 @@ xteam review-tree <slug>  # TL/PM 在交付提交的只读快照树里 review/ga
 `sync` 存在的理由：角色章程是 `up` 时一次性投进 pane 的。你之后改了 xteam 的规则，
 正在跑的 pane 拿到的还是旧的——`sync` 重投并刷新 `.xteam/PROTOCOL.md`，不必重启整套。
 
+## 一个 PM 管 N 组（多 team）
+
+默认一个项目 = 一套 pm/tl/dev，实现只能串行。加一组就多一套 tl/dev，实现能并行 ——
+**PM 仍然只有一个**（它是唯一裁决者，`verdict.json` 只有一个作者，门禁天然串行）。
+设计与取舍见 [一个 PM 管 N 个 team](docs/一个PM管N个team.md)。
+
+```bash
+xteam team add quick       # 起 quick 组（幂等：已声明就只补起缺的角色）
+xteam team list            # 每组在飞几片、tl/dev 在不在跑
+xteam team start quick     # 这一组被关掉之后，把它拉回来
+xteam team stop quick      # 只关角色 pane，workspace 与声明都留着
+xteam team rm quick        # 撤销这个组（手上有在飞的片就不许删）
+```
+
+**切片归哪一组，写 `task.json` 的 `team`**（`spec.md` 的 front-matter 也认）：
+
+```json
+{"team": "quick"}
+```
+
+漏写就是 `main` —— 派给 quick 的活会落进 main 的队列，quick 的 dev 一直空转，最后活砸在
+它的 tl 自己身上。**这个错在真实项目里复发过两次，别靠记得，靠一开始就写。**
+
+派活指名到组，组名你也可以不写：
+
+```bash
+xteam say --team quick dev "新任务：…"   # 在人这个 pane 里：要指名
+xteam say dev "新任务：…"                # 在 quick 的 pane 里：XTEAM_TEAM 已注入，自动落回本组
+```
+
+组里的 pane 都带 `XTEAM_TEAM=<组名>`，所以组里的 agent 说 `say dev` / `whoami` / `status`
+时自动落在自己那一组 —— 不靠它记得加 `--team`。项目级命令（`up`/`down`/`restore`）不受它影响。
+
+`xteam up .` 会把 `teams.json` 里声明的每一组都拉起来（声明 = 「这个项目该有哪些组」，
+撤销用 `team rm`），所以一组被关掉之后，`team start` 或再 `up` 一次都能回来。
+
 ## 解锁重叠：dev 交付后不等 gate
 
 原来「交付 → 判定」之间整棵产品树是冻结的：gate 必须判在一棵可归因的树上，于是
@@ -190,13 +226,21 @@ dev 交付完只能干等（本仓 24 片实测：这段每片 3–12m、中位 
 两件事没变：**看板不新增事实来源**（状态只在 `.xteam/` 与 pane 里），**`verdict.json`
 仍只有 PM 一个作者**—— 外部评审只是给 PM 多一个视角。
 
+**队列顺序就是执行顺序**：`QUEUE.md` 的 `序` 是 PM 维护的看板，TL 只提议切片，
+入列/排序/改状态都归 PM。切片闭合后 PM 直接取队首，不再让 agent 另写 recap 交接 ——
+现状由 `QUEUE.md`、`tasks/<slug>/` 工件和 `git log` 现算。
+
+**PM/TL 讨论时，dev 不应该空转**：开始写 spec / 评估前先跑 `xteam whoami`，
+看到「可立即派给 dev」就先门铃派出去，再进入讨论。dev 做切片 N 时，PM/TL 准备
+N+1 的 spec / request；ready 缓冲至少保持一片。
+
 ## 升级 xteam 之后，正在跑的 agent 怎么跟上
 
 xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己变了。于是三件事分开做：
 
 | 谁变了 | 怎么让正在跑的 agent 知道 |
 |---|---|
-| 角色章程 | `sync` **重投全文** —— 规则要重新通读，摘一句摘要等于让它拿旧理解做事 |
+| 角色核心卡 | `sync` **重投核心卡**；完整章程只给路径，需要细节时再读 |
 | 协议 / 输出规范（`skills/`） | `sync` **只给文件路径**，让它自己重读。全文很长，塞进来只会把真正的变更淹掉 |
 | 新增子命令（工具能力） | `sync` **只告知有哪几个新命令**，不重投章程 —— 它跑 `xteam <cmd> --help` 就拿得到 |
 
@@ -210,21 +254,23 @@ xteam **不是常驻进程**，所以它不会在任何时刻「知道」自己�
 ## 上下文重置（/new、/clear）之后，身份不丢
 
 长跑里 context 一定会满，而 `/new` / `/clear` 之后 agent **不该变成陌生人**。
-xteam 把两件事分开存：**身份**放系统提示词，**现状**放文件。
+xteam 把两件事分开存：**身份核心卡**放系统提示词，**现状**放文件。
 
 | 你可能做的事 | 会发生什么 |
 |---|---|
 | 在 pane 里敲 `/new` 或 `/clear` | 身份仍在（见下）；下一条消息它会先跑 `xteam whoami` 把现状读回来 |
-| `xteam reopen pm` | 计划内的重开：先要 recap → `/new` → 身份与现状自动投回，**pane 和进程都不换** |
+| `xteam reopen pm` | 计划内的重开：`/new` → 按 `QUEUE.md` 与工件现算的现状自动投回，**pane 和进程都不换** |
 | `xteam swap pm` | 换的是**进程**（能换 kind/model）；任何 kind 都能用，代价是重建 pane |
 | context 涨到 75% | 巡检落事件 + 响通知，建议你 `xteam reopen <角色>`（**不自动重开**：丢不丢对话里没落文件的推理，由你判断） |
 
 身份为什么清不掉（omp / pi，实测 2026-10-07）：xteam 起 agent 时带上
-`--append-system-prompt .xteam/identity/<角色>.md`（章程全文 + 一段「重置后先 whoami」
-的引导）。`/new` 换的是**会话**、`/clear` 丢的是**消息**，两者都动不了进程的系统提示词。
-其余 kind 没有这个 flag 时照旧把章程投进对话，并在每条门铃前自带一句身份与自检提醒。
+`--append-system-prompt .xteam/identity/<角色>.md`。这份文件放的是**核心卡**
+（`roles/<角色>.core.md`，约千字）和完整章程的路径；完整章程不再每个 turn 常驻
+system prompt，agent 需要细节时自己读相关章节。`/new` 换的是**会话**、`/clear`
+丢的是**消息**，两者都动不了进程的系统提示词。
+其余 kind 没有这个 flag 时，首次投递也只带核心卡 + 全文路径，不再抄全文。
 
-`xteam whoami` 是 agent 的看板视图：你欠什么义务、哪些切片没闭合、你上次的 recap 尾巴、
+`xteam whoami` 是 agent 的看板视图：你欠什么义务、哪些切片没闭合、按序队列、
 时间线尾部、该读哪些文件 —— 不依赖 herdr，pane 全关着也能看。
 
 ## 默认跑在 omp 上，不是 opencode
@@ -307,7 +353,7 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam status` | 谁在干什么、谁欠着活、每个状态从几点开始 |
 | `xteam stamp <角色> "…"` | 记一条共享时间线（`--waiting` 声明在等人类） |
 | `xteam whoami` | 我这个角色是谁、欠什么、上次做到哪（一屏）—— 上下文被清空后第一件事 |
-| `xteam reopen <角色>` | **原地重开**：recap → 新会话 → 身份与现状自动投回（context 快满时用） |
+| `xteam reopen <角色>` | **原地重开**：新会话 → 按 `QUEUE.md` 与工件现算的现状自动投回（context 快满时用） |
 | `xteam watch status\|once\|stop` | 巡检：状态 / 手动跑一轮 / 停 |
 | `xteam projects` | 治理了哪些项目、依赖关系、各自未闭合的活 |
 | `xteam swap <角色> <agent>` | 中途换 agent，不用重启整套 |
@@ -319,6 +365,7 @@ agent 干活常停在「要授权吗」的框上（写 /tmp、跑测试、开端
 | `xteam update` | 查上游有没有新版本（**不自动升级**） |
 | `xteam restore` | 关掉后从 `.xteam` 恢复现场（数据从不删除） |
 | `xteam down` | 收摊：**只关角色 pane，workspace 保留**（下次 up 直接复用） |
+| `xteam team list\|add\|start\|stop\|rm` | 一个 PM 管 N 组 tl/dev：加组 / 关掉后重启 / 停 / 撤销 |
 
 每个子命令都有 `--help`。下面几篇讲清楚各自的取舍：
 

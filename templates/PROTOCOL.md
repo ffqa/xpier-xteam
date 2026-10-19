@@ -1,14 +1,14 @@
 # xteam 协作协议
 
-三个 pane（pm / tl / dev）之间的全部协作协议。**没有看板，没有卡，没有分支。**
-状态就是文件的存在性。唯一的 worktree 是 `xteam review-tree` 临时钉出的交付快照
-（`--detach`，片闭合即清）：它钉的是「第几次交付」，不是开发分支。
+三个 pane（pm / tl / dev）之间的全部协作协议。**没有独立看板/数据库；`QUEUE.md`
+就是按序看板。** 状态就是文件的存在性。唯一的 worktree 是 `xteam review-tree` 临时
+钉出的交付快照（`--detach`，片闭合即清）：它钉的是「第几次交付」，不是开发分支。
 
 ## 目录
 
 ```
 .xteam/
-  QUEUE.md              队列：唯一待办真相
+  QUEUE.md              队列：唯一待办真相。PM 维护顺序与状态，TL 只提议切片
   PROTOCOL.md           本文件
   tasks/
     <slug>/
@@ -34,7 +34,8 @@
   rt/                   review-tree 钉出来的快照树（交付提交的只读副本，片闭合自动清）
   session.json         xteam up 写的会话记录（workspace / pane 映射）
   team.json            角色用的 agent / model（可选，up 自动落盘）
-  identity/            <角色>.md：身份文件（挂进系统提示词，重置清不掉）
+  teams.json           这个项目有哪些 team（没有它就是单 team）
+  identity/            <角色>.md：身份文件（核心卡 + 完整章程路径，挂进系统提示词）
   watch/               巡检状态与事件
 ```
 
@@ -216,25 +217,76 @@ xteam say <role> "<短消息，一两句话指路>"
   明说「已投但没提交」并返回非 0（别当成功）。
 - 角色名（`pm`/`tl`/`dev`）是唯一寻址物，**不要用 pane_id**——它跨 workspace 会重复。
 
+## 一个 PM 管 N 组（多 team）
+
+默认是「一个项目 = 一套 pm/tl/dev」。`team add` 之后，一个 PM 底下可以挂 N 套 tl/dev，
+实现就能并行（设计取舍见 xteam 仓库的 `docs/一个PM管N个team.md`）。
+
+```bash
+xteam team add quick      # 起 quick 组的 tl/dev（幂等：已声明就只补起缺的角色）
+xteam team start quick    # 这一组被关掉之后，把它拉回来
+xteam team stop quick     # 只关角色 pane，workspace 与声明都留着
+xteam team list           # 每组在飞几片、tl/dev 在不在跑
+xteam team rm quick       # 撤销这个组（手上还有在飞的片就不许删）
+```
+
+**切片归哪一组，写在 `task.json` 的 `team` 里**（`spec.md` 的 front-matter
+`team: quick` 也认；两处都没写就算 `main`）：
+
+```json
+{"team": "quick"}
+```
+
+**漏写 `team` 的切片会算成 main 组。** 于是派给 quick 的活落在 main 的队列里，quick 的
+dev 一直收不到活、空转到最后 tl 自己动手 —— 这个错在同一个项目里复发过两次。所以
+**建切片时就把 `team` 写上，不要事后补**。
+
+派活指名到组：
+
+```bash
+xteam say --team quick dev "新任务：…"
+```
+
+**在子 team 的 pane 里，`--team` 可以不写。** xteam 起这些 pane 时注入了
+`XTEAM_TEAM=<组名>`，组里的 agent 跑 `xteam say dev` / `whoami` / `status` 时自动落在
+自己那一组。这比「要求 agent 记得加 `--team`」可靠 —— 人都会忘，何况上下文随时被清空
+的 agent。
+
+`xteam up .` 会把 `teams.json` 里声明的**每一组都拉起来**：声明就是「这个项目该有哪些
+组」，撤销它用 `team rm`。所以一组被关掉之后，`team start <组名>` 或再 `up` 一次都能回来。
+
+**PM 仍然只有一个，`verdict.json` 也只有一个作者** —— 能并行的是实现，门禁天然串行。
+
 ## 会话被重置之后（/new、/clear、压缩）
 
 身份**不在对话里，在系统提示词里**：omp 由 xteam 起进程时挂上
-`.xteam/identity/<你的角色>.md`（章程全文 + 重置后的自检引导）；没有这个 flag 的
-kind 由 xteam 投在对话里，且每条门铃自带一句身份提醒。重置清掉的是对话，
+`.xteam/identity/<你的角色>.md`（**核心卡** + 完整章程路径 + 重置后的自检引导）；
+没有这个 flag 的 kind 由 xteam 投在对话里，首次也只投核心卡。重置清掉的是对话，
 清不掉身份 —— 但重置**会**让你丢掉现状。
 
 所以任何一次「感觉上下文是新的」（刚 `/new`、刚 `/clear`、被压缩过、被换人重开）：
 
-1. 先跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、你上次的 recap、时间线尾部；
-2. 还不够再读 `.xteam/PROTOCOL.md` 与 `.xteam/memory/*-recap.md`；
+1. 先跑 `xteam whoami` —— 你欠什么义务、哪些切片未闭合、按序队列、时间线尾部；
+2. 还不够再读 `.xteam/PROTOCOL.md`、`roles/<角色>.md` 的相关章节；
 3. **不要问「现在该做什么」** —— 答案在 whoami 的输出里，读完直接接手。
 
-人也可以让 xteam 把这件事做成流程：`xteam reopen <角色>` = 先要一份 recap →
-换一个干净的会话（**同一个 pane、同一个进程**）→ 身份与现状重新投回。
+人也可以让 xteam 把这件事做成流程：`xteam reopen <角色>` = 换一个干净的会话
+（**同一个 pane、同一个进程**）→ 按 `QUEUE.md` 与任务工件现算的现状重新投回。
 context 涨到 75% 时巡检会提醒人做这件事（**不会自动做** —— 丢掉对话里还没落文件的
 推理值不值得，由人判断）。换 kind / 换 model 用 `xteam swap <角色>`。
 
-**要紧的结论先落文件**（工件 / recap / stamp），别只留在对话里 —— 对话是易失的。
+**不要再写 recap / snapshot。** 进度事实只有 `QUEUE.md`、任务工件和 `git log`；
+摘要会重复烧 token，而且写得越多越容易和文件漂移。
+
+**要紧的结论先落文件**（工件 / stamp / git），别只留在对话里 —— 对话是易失的。
+
+## 调度：PM/TL 讨论时，dev 不要空转
+
+- 开始写 spec / 评估 / 拆解前，先跑 `xteam whoami`。看到「可立即派给 dev」
+  （`request.md` 已就绪、`delivered.json` 还没出现）就**先门铃 dev 派出去**，再讨论。
+- dev 做切片 N 时，PM/TL 准备 N+1：至少保持一片已拆解的 ready 缓冲。
+- 判断标准：dev 的 `owes` 里没有能立刻开工的 `implement`，而 ready / 队列里有活，
+  就是调度失败 —— 不是「dev 在休息」。
 
 ## 输出写法（STE 精简版）
 
